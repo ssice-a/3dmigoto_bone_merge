@@ -1,0 +1,72 @@
+"""Bone Merge Capture plugin entrypoint."""
+
+bl_info = {
+    "name": "Bone Merge Capture",
+    "author": "OpenAI Codex",
+    "version": (0, 2, 0),
+    "blender": (4, 0, 0),
+    "location": "View3D > Sidebar > Bone Merge Capture",
+    "description": "Build global bone remaps and standalone BoneStore capture configs from a target object list.",
+    "category": "Animation",
+}
+
+try:
+    import bpy  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - unavailable outside Blender
+    bpy = None
+
+
+REGISTERED_CLASSES = ()
+_PROPERTIES_MODULE = None
+
+
+def register():
+    if bpy is None:
+        raise RuntimeError("Bone Merge Capture can only be registered inside Blender")
+
+    from . import operators, panel, properties
+
+    global REGISTERED_CLASSES, _PROPERTIES_MODULE
+    REGISTERED_CLASSES = (
+        properties.BMC_TargetItem,
+        properties.BMC_AliasItem,
+        panel.BMC_UL_target_items,
+        panel.BMC_UL_alias_items,
+        operators.BMC_OT_add_selected_targets,
+        operators.BMC_OT_create_target_collection,
+        operators.BMC_OT_sync_targets_from_collection,
+        operators.BMC_OT_create_export_collection,
+        operators.BMC_OT_add_selected_export_objects,
+        operators.BMC_OT_prepare_export_collection,
+        operators.BMC_OT_remove_target,
+        operators.BMC_OT_clear_targets,
+        operators.BMC_OT_scan_targets,
+        operators.BMC_OT_analyze_duplicate_bones,
+        operators.BMC_OT_apply_vertex_group_remap,
+        operators.BMC_OT_merge_duplicate_bones,
+        operators.BMC_OT_alias_add,
+        operators.BMC_OT_alias_remove,
+        operators.BMC_OT_save_preset,
+        operators.BMC_OT_load_preset,
+        operators.BMC_OT_delete_preset,
+        panel.VIEW3D_PT_bone_merge_capture,
+    )
+    _PROPERTIES_MODULE = properties
+
+    for blender_class in REGISTERED_CLASSES:
+        bpy.utils.register_class(blender_class)
+    properties.register_addon_properties()
+
+
+def unregister():
+    if bpy is None:
+        return
+
+    if _PROPERTIES_MODULE is not None:
+        _PROPERTIES_MODULE.unregister_addon_properties()
+    for blender_class in reversed(REGISTERED_CLASSES):
+        bpy.utils.unregister_class(blender_class)
+
+
+if __name__ == "__main__":
+    register()

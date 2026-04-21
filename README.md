@@ -81,13 +81,27 @@
 
 第一版不直接导出完整 3Dmigoto 网格缓冲。现有 3Dmigoto Blender 导出插件应对 `Export Collection` / 对应子集合里的 mesh 导出 `Position/Texcoord/Blend/Index` 等 mesh buffer。
 
-注意：导出准备现在是**就地修改顶点组**，不是复制一份。插件会在物体自定义属性里保存上一次的 `palette`，下次重新 Prepare 时可以把当前本地顶点组解释回全局骨号再重新计算。如果你新增物体、移动物体到另一个子集合，或改了权重/顶点组，重新运行 `Prepare Export / Palette` 即可。
+注意：导出准备现在是**严格全局骨输入**。`Prepare Export / Palette` 不再兼容旧的 export-local 对象，也不会尝试读取上一次导出的 `palette` 来恢复全局骨号。请始终从重新导入/重新重映射后的全局顶点组对象开始导出；如果对象已经被旧版本本地化过，请重新导入或重新构建。
 
 面板中的导出相关按钮在 `Export Preparation` 区域：
 
 - `Create Export Collection`：创建导出源集合，并自动创建当前 Target 列表对应的 `<ib>-<count>-0` 子集合
 - `Add Selected To Export`：把当前选中的 mesh 放入一个宿主子集合；默认使用 active mesh 的 IB 信息创建 `<ib>-<count>-0`
 - `Prepare Export / Palette`：按子集合生成 `Palette.buf`，并就地本地化顶点组
+
+## Preset Cache
+
+`Save Preset` 不只保存目标列表和同骨 alias，也会把已经生成好的工程缓存复制到插件的 `presets/<preset_name>/` 文件夹：
+
+- `capture_manifest.json`
+- `export_manifest.json`
+- `BoneStore.ini`
+
+选择 preset 下拉框时会自动恢复这些缓存副本路径，但 `Output Dir` 继续表示真正的 3Dmigoto 文件导出目录。`Load Preset` 只作为手动刷新/报错入口保留。这样同一个工程后续只需要选中 preset，就能继续 `Prepare Export / Palette` 或 `Generate Shadow Split`，不需要每次重新选择旧的 FrameAnalysis 文件夹或重新 `Scan`。
+
+`Prepare Export / Palette` 只会把运行时需要的文件写入 `Output Dir`：`BoneStore.ini`、`hlsl/`、`Buffer/*-Palette.buf`。`export_manifest.json` 是插件内部给阴影分流用的缓存，会写到 preset 文件夹，不再混进 3Dmigoto 导出目录。
+
+只有在换角色、换目标 IB、游戏更新、draw 顺序/hash 变化，或需要重新自动检测最后 `vs == 200` 阴影宿主时，才需要重新跑 `Scan and Generate`。
 
 ## `cb1` 使用约定
 

@@ -9,7 +9,7 @@ import struct
 from collections import OrderedDict
 
 from ..constants import GLOBAL_RESERVED_ROWS
-from .models import BoneAlias, DrawRecord, LoggedDraw, PartRecord, TargetObjectSpec
+from .models import BoneAlias, DrawRecord, LoggedDraw, PartRecord, ShadowHostRecord, TargetObjectSpec
 
 
 _DRAW_VS_RE = re.compile(r"^(?P<draw>\d{6}) VSSetShader\(.* hash=(?P<hash>[0-9a-fA-F]+)\s*$")
@@ -18,7 +18,11 @@ _DRAW_CB_INFO_RE = re.compile(
     r"^\s+1: resource=.* hash=(?P<hash>[0-9a-fA-F]+) first_constant=(?P<first>\d+) num_constants=(?P<count>\d+)\s*$"
 )
 _DRAW_INDEXED_RE = re.compile(r"^(?P<draw>\d{6}) DrawIndexedInstanced\(IndexCountPerInstance:(?P<count>\d+),")
+_OM_SET_RENDER_TARGETS_RE = re.compile(r"^(?P<draw>\d{6}) OMSetRenderTargets\(NumViews:(?P<num>\d+),")
 _IB_DUMP_FILE_RE = re.compile(r"^\d{6}-ib=(?P<hash>[0-9a-fA-F]{8})")
+_TEXTURE_OVERRIDE_IB_RE = re.compile(
+    r"^(?P<draw>\d{6}) 3DMigoto\s+\[TextureOverride\\.*?_IB_(?P<hash>[0-9a-fA-F]{8})_merge\]"
+)
 _OBJECT_NAME_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)")
 
 
@@ -95,16 +99,17 @@ def find_draw_records_for_targets(
     extra_warnings: list[str] = list(warnings)
     draw_records: list[DrawRecord] = []
     ib_dump_files = _index_ib_dump_files(frameanalysis_dir)
+    override_draws_by_ib_hash = _index_textureoverride_ib_draws(frameanalysis_dir)
 
     for target_spec in target_specs:
-        candidate_files = sorted(
-            ib_dump_files.get(target_spec.ib_hash.lower(), []),
-            key=_parse_draw_index_from_path,
-        )
+        candidate_draw_indices = {
+            _parse_draw_index_from_path(candidate_path)
+            for candidate_path in ib_dump_files.get(target_spec.ib_hash.lower(), [])
+        }
+        candidate_draw_indices.update(override_draws_by_ib_hash.get(target_spec.ib_hash.lower(), ()))
         chosen_draw: DrawRecord | None = None
         candidate_errors: list[str] = []
-        for candidate_path in candidate_files:
-            draw_index = _parse_draw_index_from_path(candidate_path)
+        for draw_index in sorted(candidate_draw_indices):
             logged_draw = logged_draws.get(draw_index)
             if logged_draw is None:
                 continue
@@ -144,11 +149,26 @@ def _index_ib_dump_files(frameanalysis_dir: str) -> dict[str, list[str]]:
     return files_by_ib_hash
 
 
+def _index_textureoverride_ib_draws(frameanalysis_dir: str) -> dict[str, list[int]]:
+    log_path = os.path.join(frameanalysis_dir, "log.txt")
+    if not os.path.exists(log_path):
+        return {}
+
+    draws_by_ib_hash: dict[str, set[int]] = {}
+    with open(log_path, "r", encoding="utf-8", errors="replace") as file_handle:
+        for raw_line in file_handle:
+            match = _TEXTURE_OVERRIDE_IB_RE.match(raw_line.rstrip("\n"))
+            if not match:
+                continue
+            draws_by_ib_hash.setdefault(match.group("hash").lower(), set()).add(int(match.group("draw")))
+    return {ib_hash: sorted(draw_indices) for ib_hash, draw_indices in draws_by_ib_hash.items()}
+
+
 def _finalize_draw_record(frameanalysis_dir: str, target_spec: TargetObjectSpec, logged_draw: LoggedDraw) -> DrawRecord:
     draw_prefix = f"{logged_draw.draw_index:06d}"
-    vb2_matches = glob.glob(os.path.join(frameanalysis_dir, f"{draw_prefix}-vb2=*.txt"))
-    vs_t0_matches = glob.glob(os.path.join(frameanalysis_dir, f"{draw_prefix}-vs-t0=*.buf"))
-    vs_cb1_matches = glob.glob(os.path.join(frameanalysis_dir, f"{draw_prefix}-vs-cb1=*.buf"))
+    vb2_matches = _glob_dump_variants(frameanalysis_dir, draw_prefix, "vb2", ".txt")
+    vs_t0_matches = _glob_dump_variants(frameanalysis_dir, draw_prefix, "vs-t0", ".buf")
+    vs_cb1_matches = _glob_dump_variants(frameanalysis_dir, draw_prefix, "vs-cb1", ".buf")
 
     if not vs_t0_matches:
         raise ValueError("missing vs-t0 dump")
@@ -179,6 +199,22 @@ def _parse_draw_index_from_path(path: str) -> int:
     return int(file_name[:6])
 
 
+def _glob_dump_variants(frameanalysis_dir: str, draw_prefix: str, slot_name: str, extension: str) -> list[str]:
+    matches: list[str] = []
+    seen_paths: set[str] = set()
+    for pattern in (
+        f"{draw_prefix}-{slot_name}=*{extension}",
+        f"{draw_prefix}-{slot_name}-*{extension}",
+    ):
+        for candidate_path in glob.glob(os.path.join(frameanalysis_dir, pattern)):
+            normalized_path = os.path.abspath(candidate_path)
+            if normalized_path in seen_paths:
+                continue
+            seen_paths.add(normalized_path)
+            matches.append(candidate_path)
+    return sorted(matches)
+
+
 def build_part_records(draw_records: list[DrawRecord]) -> list[PartRecord]:
     part_records: list[PartRecord] = []
     next_global_bone_base = 0
@@ -206,6 +242,71 @@ def build_part_records(draw_records: list[DrawRecord]) -> list[PartRecord]:
         )
         next_global_bone_base += bone_count
     return part_records
+
+
+def detect_last_shadow_host(frameanalysis_dir: str) -> ShadowHostRecord:
+    log_path = os.path.join(frameanalysis_dir, "log.txt")
+    if not os.path.exists(log_path):
+        raise ValueError(f"log.txt not found in {frameanalysis_dir}")
+
+    first_gbuffer_draw_index: int | None = None
+    last_draw_before_gbuffer: LoggedDraw | None = None
+    current_draws, _warnings = parse_logged_draws(frameanalysis_dir)
+
+    with open(log_path, "r", encoding="utf-8", errors="replace") as file_handle:
+        for raw_line in file_handle:
+            line = raw_line.rstrip("\n")
+
+            om_match = _OM_SET_RENDER_TARGETS_RE.match(line)
+            if om_match:
+                num_views = int(om_match.group("num"))
+                draw_index = int(om_match.group("draw"))
+                if num_views >= 5:
+                    first_gbuffer_draw_index = draw_index
+                    break
+
+    if first_gbuffer_draw_index is None:
+        raise ValueError("Could not detect the first G-buffer draw from OMSetRenderTargets(NumViews:5)")
+
+    for draw_index in sorted(current_draws):
+        if draw_index >= first_gbuffer_draw_index:
+            break
+        last_draw_before_gbuffer = current_draws[draw_index]
+
+    if last_draw_before_gbuffer is None:
+        raise ValueError("Could not find a draw before the first G-buffer draw")
+
+    ib_dump_files = _index_ib_dump_files(frameanalysis_dir)
+    draw_prefix = f"{last_draw_before_gbuffer.draw_index:06d}"
+    ib_hash = ""
+    for paths in ib_dump_files.values():
+        for candidate_path in paths:
+            if os.path.basename(candidate_path).startswith(f"{draw_prefix}-ib="):
+                file_name = os.path.basename(candidate_path)
+                match = _IB_DUMP_FILE_RE.match(file_name)
+                if match:
+                    ib_hash = match.group("hash").lower()
+                    break
+        if ib_hash:
+            break
+
+    if not ib_hash:
+        direct_matches = glob.glob(os.path.join(frameanalysis_dir, f"{draw_prefix}-ib=*.txt"))
+        if direct_matches:
+            file_name = os.path.basename(direct_matches[0])
+            match = _IB_DUMP_FILE_RE.match(file_name)
+            if match:
+                ib_hash = match.group("hash").lower()
+
+    if not ib_hash:
+        raise ValueError(f"Could not resolve IB hash for draw {last_draw_before_gbuffer.draw_index:06d}")
+
+    return ShadowHostRecord(
+        draw_index=last_draw_before_gbuffer.draw_index,
+        ib_hash=ib_hash,
+        match_index_count=last_draw_before_gbuffer.match_index_count,
+        vs_hash=last_draw_before_gbuffer.vs_hash,
+    )
 
 
 def build_duplicate_bone_aliases(part_records: list[PartRecord]) -> list[BoneAlias]:

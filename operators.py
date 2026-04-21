@@ -17,6 +17,8 @@ from .core.blender_ops import (
 )
 from .core.presets import delete_preset, load_preset, save_preset
 from .core.export_prepare import prepare_export_collection
+from .core.frameanalysis import detect_last_shadow_host
+from .core.shadow_split import generate_shadow_split
 from .core.workflow import (
     apply_vertex_group_remap_for_target_names,
     merge_duplicate_bone_weights_for_target_names,
@@ -140,6 +142,9 @@ def _refresh_target_item(scene, item):
     if identity is not None:
         item.ib_hash = identity[0]
         item.match_index_count = int(identity[1])
+    else:
+        item.ib_hash = ""
+        item.match_index_count = 0
     item.autodetected = bool(getattr(mesh_obj, "merge_ib_autodetected", True))
     return mesh_obj
 
@@ -175,9 +180,10 @@ def _normalize_export_collection_membership(scene) -> dict[str, int]:
 
     subtree_collections = tuple(_iter_collection_subtree(export_collection))
     subtree_ids = {collection.as_pointer() for collection in subtree_collections}
-    created_chunk_names = {child.name for child in export_collection.children}
+    existing_chunk_names = {child.name for child in export_collection.children}
     moved_count = 0
     skipped_count = 0
+    created_count = 0
 
     for mesh_obj in tuple(_iter_mesh_objects_in_collection_subtree(export_collection)):
         identity = resolve_mesh_identity(mesh_obj)
@@ -186,9 +192,10 @@ def _normalize_export_collection_membership(scene) -> dict[str, int]:
             continue
 
         chunk_name = f"{identity[0].lower()}-{int(identity[1])}-0"
+        if chunk_name not in existing_chunk_names:
+            created_count += 1
+            existing_chunk_names.add(chunk_name)
         chunk_collection = _ensure_export_chunk_collection(export_collection, identity[0], int(identity[1]), 0)
-        if chunk_name not in created_chunk_names:
-            created_chunk_names.add(chunk_name)
 
         moved_here = False
         if all(obj.name != mesh_obj.name for obj in chunk_collection.objects):
@@ -207,9 +214,73 @@ def _normalize_export_collection_membership(scene) -> dict[str, int]:
 
     return {
         "moved": moved_count,
-        "created": len(created_chunk_names),
+        "created": created_count,
         "skipped": skipped_count,
     }
+
+
+def _should_refresh_for_depsgraph_update(scene, depsgraph) -> bool:
+    if scene is None:
+        return False
+    if scene.bmc_export_collection is None and not scene.bmc_target_items:
+        return False
+
+    target_object_ids: set[int] = set()
+    for item in scene.bmc_target_items:
+        mesh_obj = getattr(item, "object_ref", None)
+        if mesh_obj is None and getattr(item, "object_name", ""):
+            mesh_obj = scene.objects.get(item.object_name)
+        if mesh_obj is not None and mesh_obj.type == "MESH":
+            target_object_ids.add(mesh_obj.as_pointer())
+
+    export_collection_ids: set[int] = set()
+    export_object_ids: set[int] = set()
+    export_collection = scene.bmc_export_collection
+    if export_collection is not None:
+        for collection in _iter_collection_subtree(export_collection):
+            export_collection_ids.add(collection.as_pointer())
+            for mesh_obj in collection.objects:
+                if mesh_obj.type == "MESH":
+                    export_object_ids.add(mesh_obj.as_pointer())
+
+    for update in depsgraph.updates:
+        update_id = getattr(update, "id", None)
+        if isinstance(update_id, bpy.types.Object):
+            pointer = update_id.as_pointer()
+            if pointer in target_object_ids or pointer in export_object_ids:
+                return True
+            continue
+        if isinstance(update_id, bpy.types.Collection):
+            if update_id.as_pointer() in export_collection_ids:
+                return True
+            if scene.bmc_target_collection is not None and update_id == scene.bmc_target_collection:
+                return True
+    return False
+
+
+@persistent
+def _bmc_depsgraph_update_post(scene, depsgraph):
+    global _EXPORT_NORMALIZE_GUARD
+
+    if _EXPORT_NORMALIZE_GUARD or not _should_refresh_for_depsgraph_update(scene, depsgraph):
+        return
+
+    _EXPORT_NORMALIZE_GUARD = True
+    try:
+        _refresh_target_items(scene)
+        _normalize_export_collection_membership(scene)
+    finally:
+        _EXPORT_NORMALIZE_GUARD = False
+
+
+def register_runtime_handlers():
+    if _bmc_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_bmc_depsgraph_update_post)
+
+
+def unregister_runtime_handlers():
+    if _bmc_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_bmc_depsgraph_update_post)
 
 
 def _add_mesh_object_to_target_list(scene, mesh_obj, existing_names: set[str]) -> bool:
@@ -238,7 +309,20 @@ def _enabled_target_specs(context) -> list[TargetObjectSpec]:
         mesh_obj = _refresh_target_item(scene, item)
         if mesh_obj is None:
             raise ValueError(f"{item.object_name}: mesh object not found in current scene")
-        local_bone_count = infer_local_bone_count_from_mesh(mesh_obj)
+        manifest_bone_count = _lookup_capture_bone_count_from_manifest(
+            scene,
+            item.ib_hash.lower(),
+            int(item.match_index_count),
+            mesh_obj.name,
+        )
+        try:
+            local_bone_count = infer_local_bone_count_from_mesh(mesh_obj)
+        except ValueError:
+            if manifest_bone_count is None:
+                raise
+            local_bone_count = manifest_bone_count
+        if local_bone_count > BI4_MAX_BONE_COUNT and manifest_bone_count is not None:
+            local_bone_count = manifest_bone_count
         if local_bone_count > BI4_MAX_BONE_COUNT:
             raise ValueError(
                 f"{item.object_name}: local bone count {local_bone_count} exceeds BI4 limit {BI4_MAX_BONE_COUNT}; "
@@ -255,13 +339,46 @@ def _enabled_target_specs(context) -> list[TargetObjectSpec]:
     return target_specs
 
 
+def _lookup_capture_bone_count_from_manifest(scene, ib_hash: str, match_index_count: int, object_name: str) -> int | None:
+    manifest_path = bpy.path.abspath(str(getattr(scene, "bmc_manifest_path", "") or ""))
+    if not manifest_path or not os.path.exists(manifest_path):
+        return None
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as file_handle:
+            manifest = json.load(file_handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    normalized_hash = str(ib_hash).lower()
+    normalized_count = int(match_index_count)
+    fallback_count = None
+    for part_record in manifest.get("part_records", []):
+        if str(part_record.get("ib_hash", "")).lower() != normalized_hash:
+            continue
+        if int(part_record.get("match_index_count", -1)) != normalized_count:
+            continue
+        bone_count = int(part_record.get("capture_bone_count", part_record.get("bone_count", 0)))
+        if bone_count <= 0:
+            continue
+        if str(part_record.get("object_name", "")) == str(object_name):
+            return bone_count
+        if fallback_count is None:
+            fallback_count = bone_count
+    return fallback_count
+
+
 def _enabled_target_names(scene) -> list[str]:
     target_names: list[str] = []
     for item in scene.bmc_target_items:
         if not item.enabled:
             continue
-        mesh_obj = _refresh_target_item(scene, item)
+        mesh_obj = getattr(item, "object_ref", None)
+        if mesh_obj is None and getattr(item, "object_name", ""):
+            mesh_obj = scene.objects.get(item.object_name)
         if mesh_obj is None:
+            continue
+        if mesh_obj.type != "MESH":
             continue
         target_names.append(mesh_obj.name)
     return target_names
@@ -332,6 +449,13 @@ def _serialize_scene_preset(scene) -> dict:
     _refresh_target_items(scene)
     return {
         "merge_same_bone_groups": bool(scene.bmc_merge_same_bone_groups),
+        "workspace": {
+            "frameanalysis_dir": str(scene.bmc_frameanalysis_dir or ""),
+            "output_dir": str(scene.bmc_output_dir or ""),
+            "source_ini_path": str(scene.bmc_source_ini_path or ""),
+            "target_collection_name": scene.bmc_target_collection.name if scene.bmc_target_collection else "",
+            "export_collection_name": scene.bmc_export_collection.name if scene.bmc_export_collection else "",
+        },
         "targets": [
             {
                 "object_name": item.object_name,
@@ -348,6 +472,30 @@ def _serialize_scene_preset(scene) -> dict:
 
 def _apply_loaded_preset(scene, payload: dict):
     scene.bmc_merge_same_bone_groups = bool(payload.get("merge_same_bone_groups", False))
+    workspace = payload.get("workspace", {})
+    if isinstance(workspace, dict):
+        scene.bmc_frameanalysis_dir = str(workspace.get("frameanalysis_dir", scene.bmc_frameanalysis_dir or ""))
+        scene.bmc_output_dir = str(workspace.get("output_dir", scene.bmc_output_dir or ""))
+        scene.bmc_manifest_path = ""
+        scene.bmc_ini_path = ""
+        scene.bmc_export_manifest_path = ""
+        scene.bmc_source_ini_path = str(workspace.get("source_ini_path", scene.bmc_source_ini_path or ""))
+        scene.bmc_shadow_host_hash = ""
+        scene.bmc_shadow_host_match_index_count = -1
+        scene.bmc_shadow_host_vs_hash = ""
+
+        target_collection_name = str(workspace.get("target_collection_name", "") or "").strip()
+        if target_collection_name:
+            target_collection = bpy.data.collections.get(target_collection_name)
+            if target_collection is not None:
+                scene.bmc_target_collection = target_collection
+
+        export_collection_name = str(workspace.get("export_collection_name", "") or "").strip()
+        if export_collection_name:
+            export_collection = bpy.data.collections.get(export_collection_name)
+            if export_collection is not None:
+                scene.bmc_export_collection = export_collection
+
     scene.bmc_target_items.clear()
     for target in payload.get("targets", []):
         item = scene.bmc_target_items.add()
@@ -545,6 +693,8 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
                 context=context,
                 export_collection=scene.bmc_export_collection,
                 output_dir=scene.bmc_output_dir,
+                internal_manifest_dir=None,
+                capture_manifest_path=scene.bmc_manifest_path,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Prepare export failed: {exc}")
@@ -555,7 +705,55 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
             scene.bmc_ini_path = result["bonestore_ini_path"]
         self.report(
             {"INFO"},
-            f"Prepared {result['objects']} object(s), {result['palettes']} palette(s) in {result['export_collection_name']}",
+            f"Prepared {result['objects']} object(s), {result['palettes']} palette(s); wrote 3Dmigoto files to {result['output_dir']}",
+        )
+        return {"FINISHED"}
+
+
+class BMC_OT_generate_shadow_split(bpy.types.Operator):
+    bl_idname = "object.bmc_generate_shadow_split"
+    bl_label = "Generate Shadow Split"
+    bl_description = "Rewrite the source mod INI so vs==200 shadow draws move to the last shadow host and consume BoneStore local palettes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        has_manual_shadow_host = bool(
+            scene
+            and scene.bmc_shadow_host_hash
+            and int(scene.bmc_shadow_host_match_index_count) > 0
+        )
+        return bool(
+            scene
+            and (scene.bmc_frameanalysis_dir or has_manual_shadow_host)
+            and scene.bmc_export_manifest_path
+            and scene.bmc_ini_path
+            and scene.bmc_source_ini_path
+        )
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            result = generate_shadow_split(
+                frameanalysis_dir=bpy.path.abspath(scene.bmc_frameanalysis_dir),
+                export_manifest_path=bpy.path.abspath(scene.bmc_export_manifest_path),
+                bonestore_ini_path=bpy.path.abspath(scene.bmc_ini_path),
+                source_ini_path=bpy.path.abspath(scene.bmc_source_ini_path),
+                shadow_host_hash=scene.bmc_shadow_host_hash,
+                shadow_host_match_index_count=int(scene.bmc_shadow_host_match_index_count),
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Shadow split failed: {exc}")
+            return {"CANCELLED"}
+
+        scene.bmc_source_ini_path = result.source_ini_path
+        scene.bmc_shadow_host_hash = result.shadow_host_hash
+        scene.bmc_shadow_host_match_index_count = int(result.shadow_host_match_index_count)
+        scene.bmc_shadow_host_vs_hash = result.shadow_host_vs_hash
+        self.report(
+            {"INFO"},
+            f"Shadow split updated {result.rewritten_sections} section(s); migrated {result.migrated_chunks} chunk(s) via host {result.shadow_host_hash}-{result.shadow_host_match_index_count}",
         )
         return {"FINISHED"}
 
@@ -615,6 +813,7 @@ class BMC_OT_scan_targets(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         try:
+            _refresh_target_items(scene)
             target_specs = _enabled_target_specs(context)
             result = scan_targets_and_generate_outputs(
                 frameanalysis_dir=scene.bmc_frameanalysis_dir,
@@ -628,6 +827,14 @@ class BMC_OT_scan_targets(bpy.types.Operator):
 
         scene.bmc_manifest_path = result.manifest_path
         scene.bmc_ini_path = result.ini_path
+        shadow_host_warning = ""
+        try:
+            shadow_host = detect_last_shadow_host(scene.bmc_frameanalysis_dir)
+            scene.bmc_shadow_host_hash = shadow_host.ib_hash
+            scene.bmc_shadow_host_match_index_count = int(shadow_host.match_index_count)
+            scene.bmc_shadow_host_vs_hash = shadow_host.vs_hash
+        except Exception as exc:
+            shadow_host_warning = f"Last shadow host detection failed: {exc}"
 
         remap_result = None
         try:
@@ -662,6 +869,11 @@ class BMC_OT_scan_targets(bpy.types.Operator):
         if scene.bmc_merge_same_bone_groups:
             merged_aliases = auto_merge_result.merged_aliases if auto_merge_result is not None else 0
             info_message += f"; same-bone aliases {auto_alias_count}, merged {merged_aliases}"
+        if scene.bmc_shadow_host_hash:
+            info_message += (
+                f"; shadow host {scene.bmc_shadow_host_hash}-{scene.bmc_shadow_host_match_index_count}"
+                f" vs={scene.bmc_shadow_host_vs_hash or '?'}"
+            )
         self.report({"INFO"}, info_message)
         if result.warnings:
             self.report({"WARNING"}, " | ".join(result.warnings[:3]))
@@ -669,6 +881,8 @@ class BMC_OT_scan_targets(bpy.types.Operator):
             self.report({"WARNING"}, " | ".join(remap_result.skipped_objects[:3]))
         if auto_merge_warning:
             self.report({"WARNING"}, auto_merge_warning)
+        if shadow_host_warning:
+            self.report({"WARNING"}, shadow_host_warning)
         if auto_merge_result is not None and auto_merge_result.skipped_objects:
             self.report({"WARNING"}, " | ".join(auto_merge_result.skipped_objects[:3]))
         return {"FINISHED"}
@@ -825,6 +1039,7 @@ class BMC_OT_load_preset(bpy.types.Operator):
         try:
             payload = load_preset(preset_name)
             _apply_loaded_preset(scene, payload)
+            _refresh_target_items(scene)
         except Exception as exc:
             self.report({"ERROR"}, f"Load preset failed: {exc}")
             return {"CANCELLED"}

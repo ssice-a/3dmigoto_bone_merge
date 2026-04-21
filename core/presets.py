@@ -38,6 +38,26 @@ def load_preset(preset_name: str) -> dict:
         return json.load(file_handle)
 
 
+def resolve_preset_workspace_paths(preset_name: str) -> dict[str, str | int]:
+    payload = load_preset(preset_name)
+    workspace = payload.get("workspace", {})
+    if not isinstance(workspace, dict):
+        return {}
+
+    return {
+        "frameanalysis_dir": str(workspace.get("frameanalysis_dir", "") or ""),
+        "output_dir": str(workspace.get("output_dir", "") or ""),
+        "manifest_path": "",
+        "ini_path": "",
+        "export_manifest_path": "",
+        "source_ini_path": str(workspace.get("source_ini_path", "") or ""),
+        "shadow_host_hash": "",
+        "shadow_host_match_index_count": -1,
+        "shadow_host_vs_hash": "",
+        "preset_cache_dir": "",
+    }
+
+
 def delete_preset(preset_name: str) -> None:
     normalized_name = sanitize_preset_name(preset_name)
     preset_path = Path(get_presets_dir()) / f"{normalized_name}.json"

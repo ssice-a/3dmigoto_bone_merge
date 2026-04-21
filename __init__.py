@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Bone Merge Capture",
     "author": "OpenAI Codex",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Bone Merge Capture",
     "description": "Build global bone remaps and standalone BoneStore capture configs from a target object list.",
@@ -38,6 +38,7 @@ def register():
         operators.BMC_OT_create_export_collection,
         operators.BMC_OT_add_selected_export_objects,
         operators.BMC_OT_prepare_export_collection,
+        operators.BMC_OT_generate_shadow_split,
         operators.BMC_OT_remove_target,
         operators.BMC_OT_clear_targets,
         operators.BMC_OT_scan_targets,
@@ -56,12 +57,16 @@ def register():
     for blender_class in REGISTERED_CLASSES:
         bpy.utils.register_class(blender_class)
     properties.register_addon_properties()
+    operators.register_runtime_handlers()
 
 
 def unregister():
     if bpy is None:
         return
 
+    from . import operators
+
+    operators.unregister_runtime_handlers()
     if _PROPERTIES_MODULE is not None:
         _PROPERTIES_MODULE.unregister_addon_properties()
     for blender_class in reversed(REGISTERED_CLASSES):

@@ -10,17 +10,20 @@ from ..constants import (
     BI4_MAX_BONE_COUNT,
     BONESTORE_INI_FILE_NAME,
     BUFFER_EXPORT_DIR_NAME,
+    BMC_EXPORT_CHUNK_PROP,
+    BMC_EXPORT_PALETTE_PROP,
+    BMC_VERTEX_GROUP_STATE_EXPORT_LOCAL,
+    BMC_VERTEX_GROUP_STATE_PROP,
     CAPTURE_MANIFEST_FILE_NAME,
     EXPORT_MANIFEST_FILE_NAME,
 )
-from .ini_export import write_bonestore_ini
+from .hlsl_assets import export_required_hlsl
+from .ini_export import build_bonestore_namespace, write_bonestore_ini
 from .io import ensure_directory, read_json, write_json, write_uint32_buffer
 from .models import LocalPaletteRecord, PartRecord
 
 _NUMERIC_GROUP_RE = re.compile(r"^\d+$")
 _CHUNK_COLLECTION_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)(?:[-_](?P<chunk>\d+))?")
-_LOCALIZED_PALETTE_PROP = "bmc_export_palette_values"
-_LOCALIZED_CHUNK_PROP = "bmc_export_chunk"
 
 
 @dataclass(frozen=True)
@@ -32,15 +35,23 @@ class ExportChunk:
     mesh_objects: tuple[object, ...]
 
 
-def prepare_export_collection(context, export_collection, output_dir: str | None = None):
+def prepare_export_collection(
+    context,
+    export_collection,
+    output_dir: str | None = None,
+    internal_manifest_dir: str | None = None,
+    capture_manifest_path: str | None = None,
+):
     if export_collection is None:
         raise ValueError("Export collection is not set")
 
     normalized_output_dir = ensure_directory(output_dir or context.scene.bmc_output_dir or context.scene.bmc_frameanalysis_dir)
     buffer_dir = ensure_directory(os.path.join(normalized_output_dir, BUFFER_EXPORT_DIR_NAME))
+    hlsl_dir = export_required_hlsl(normalized_output_dir)
 
     chunks = _build_export_chunks(export_collection)
     _validate_single_chunk_membership(chunks)
+    _validate_chunks_are_global_state(chunks)
 
     palette_records = []
     local_palette_records: list[LocalPaletteRecord] = []
@@ -103,6 +114,7 @@ def prepare_export_collection(context, export_collection, output_dir: str | None
     manifest = {
         "export_collection": export_collection.name,
         "buffer_dir": buffer_dir,
+        "bonestore_namespace": build_bonestore_namespace(normalized_output_dir),
         "palettes": palette_records,
         "objects": object_records,
         "note": (
@@ -111,12 +123,20 @@ def prepare_export_collection(context, export_collection, output_dir: str | None
             "Prepare Export localizes vertex groups in place, so export the same collection after running it."
         ),
     }
-    manifest_path = write_json(os.path.join(normalized_output_dir, EXPORT_MANIFEST_FILE_NAME), manifest)
-    bonestore_ini_path = _regenerate_bonestore_ini_if_possible(normalized_output_dir, local_palette_records)
+    manifest_dir = ensure_directory(internal_manifest_dir or normalized_output_dir)
+    manifest_path = write_json(os.path.join(manifest_dir, EXPORT_MANIFEST_FILE_NAME), manifest)
+    bonestore_ini_path = _regenerate_bonestore_ini_if_possible(
+        normalized_output_dir,
+        local_palette_records,
+        capture_manifest_path=capture_manifest_path,
+    )
     return {
         "manifest_path": manifest_path,
         "bonestore_ini_path": bonestore_ini_path,
         "export_collection_name": export_collection.name,
+        "output_dir": normalized_output_dir,
+        "buffer_dir": buffer_dir,
+        "hlsl_dir": hlsl_dir,
         "objects": len(object_records),
         "palettes": len(palette_records),
     }
@@ -145,9 +165,32 @@ def localize_vertex_groups_for_palette(mesh_obj, palette: tuple[int, ...], chunk
         for vertex_index, weight in assignments.items():
             vertex_group.add([vertex_index], weight, "REPLACE")
 
-    mesh_obj[_LOCALIZED_PALETTE_PROP] = list(palette)
+    mesh_obj[BMC_EXPORT_PALETTE_PROP] = list(palette)
+    mesh_obj[BMC_VERTEX_GROUP_STATE_PROP] = BMC_VERTEX_GROUP_STATE_EXPORT_LOCAL
     if chunk_name:
-        mesh_obj[_LOCALIZED_CHUNK_PROP] = chunk_name
+        mesh_obj[BMC_EXPORT_CHUNK_PROP] = chunk_name
+
+
+def _validate_chunks_are_global_state(chunks: tuple[ExportChunk, ...]) -> None:
+    seen_names: set[str] = set()
+    for chunk in chunks:
+        for mesh_obj in chunk.mesh_objects:
+            if mesh_obj.name in seen_names:
+                continue
+            seen_names.add(mesh_obj.name)
+            _validate_mesh_is_global_state(mesh_obj)
+
+
+def _validate_mesh_is_global_state(mesh_obj) -> None:
+    localized_palette = _get_existing_localized_palette(mesh_obj)
+    state = str(mesh_obj.get(BMC_VERTEX_GROUP_STATE_PROP, "") or "")
+    export_chunk = str(mesh_obj.get(BMC_EXPORT_CHUNK_PROP, "") or "")
+    if localized_palette is None and state != BMC_VERTEX_GROUP_STATE_EXPORT_LOCAL and not export_chunk:
+        return
+    raise ValueError(
+        f"{mesh_obj.name}: old export-local state is no longer supported. "
+        "Re-import or rebuild this mesh from global vertex groups before Prepare Export."
+    )
 
 
 def _build_export_chunks(export_collection) -> tuple[ExportChunk, ...]:
@@ -257,21 +300,17 @@ def _iter_weighted_global_assignments(mesh_obj):
 
 
 def _build_group_index_to_global_map(mesh_obj) -> dict[int, int]:
-    localized_palette = _get_existing_localized_palette(mesh_obj)
     group_index_to_global = {}
     for vertex_group in mesh_obj.vertex_groups:
         numeric_group = _parse_numeric_group(vertex_group.name)
         if numeric_group is None:
             continue
-        if localized_palette is not None and 0 <= numeric_group < len(localized_palette):
-            group_index_to_global[vertex_group.index] = int(localized_palette[numeric_group])
-        else:
-            group_index_to_global[vertex_group.index] = numeric_group
+        group_index_to_global[vertex_group.index] = numeric_group
     return group_index_to_global
 
 
 def _get_existing_localized_palette(mesh_obj) -> tuple[int, ...] | None:
-    raw_palette = mesh_obj.get(_LOCALIZED_PALETTE_PROP)
+    raw_palette = mesh_obj.get(BMC_EXPORT_PALETTE_PROP)
     if not raw_palette:
         return None
     try:
@@ -290,8 +329,11 @@ def _parse_numeric_group(group_name: str) -> int | None:
 def _regenerate_bonestore_ini_if_possible(
     output_dir: str,
     local_palette_records: list[LocalPaletteRecord],
+    capture_manifest_path: str | None = None,
 ) -> str:
-    manifest_path = os.path.join(output_dir, CAPTURE_MANIFEST_FILE_NAME)
+    manifest_path = os.path.abspath(capture_manifest_path or "") if capture_manifest_path else ""
+    if not manifest_path or not os.path.exists(manifest_path):
+        manifest_path = os.path.join(output_dir, CAPTURE_MANIFEST_FILE_NAME)
     if not os.path.exists(manifest_path):
         return os.path.join(output_dir, BONESTORE_INI_FILE_NAME)
 

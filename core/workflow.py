@@ -12,7 +12,7 @@ from .blender_ops import (
 )
 from .frameanalysis import build_part_records, find_draw_records_for_targets, resolve_output_dir
 from .hlsl_assets import export_required_hlsl
-from .ini_export import write_bonestore_ini
+from .ini_export import build_bonestore_namespace, write_bonestore_ini
 from .io import read_json, write_json
 from .models import ObjectRemap, ScanGenerateResult, TargetObjectSpec
 
@@ -52,6 +52,7 @@ def scan_targets_and_generate_outputs(
     manifest_payload = {
         "frameanalysis_dir": normalized_frameanalysis_dir,
         "hlsl_dir": hlsl_output_dir,
+        "bonestore_namespace": build_bonestore_namespace(normalized_output_dir),
         "selected_vs_hashes": selected_vs_hashes,
         "local_palette_protocol": {
             "palette_format": "R32_UINT",

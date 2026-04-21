@@ -5,7 +5,15 @@ from __future__ import annotations
 import struct
 from math import floor
 
-from ..constants import GLOBAL_RESERVED_ROWS
+from ..constants import (
+    BMC_EXPORT_CHUNK_PROP,
+    BMC_EXPORT_PALETTE_PROP,
+    BMC_GLOBAL_REMAP_PROP,
+    BMC_ORIGINAL_LOCAL_BONE_COUNT_PROP,
+    BMC_VERTEX_GROUP_STATE_GLOBAL,
+    BMC_VERTEX_GROUP_STATE_PROP,
+    GLOBAL_RESERVED_ROWS,
+)
 from .frameanalysis import infer_mesh_identity_from_name
 from .models import DuplicateMergeResult, RemapApplyResult
 
@@ -41,6 +49,18 @@ def resolve_mesh_identity(mesh_obj) -> tuple[str, int] | None:
 
 
 def infer_local_bone_count_from_mesh(mesh_obj) -> int:
+    original_count = _read_int_prop(mesh_obj, BMC_ORIGINAL_LOCAL_BONE_COUNT_PROP)
+    if original_count is not None and original_count > 0:
+        return original_count
+
+    global_remap = _read_int_sequence_prop(mesh_obj, BMC_GLOBAL_REMAP_PROP)
+    if global_remap:
+        return len(global_remap)
+
+    localized_palette = _read_int_sequence_prop(mesh_obj, BMC_EXPORT_PALETTE_PROP)
+    if localized_palette:
+        return len(localized_palette)
+
     numeric_group_indices: list[int] = []
     for vertex_group in mesh_obj.vertex_groups:
         try:
@@ -54,6 +74,68 @@ def infer_local_bone_count_from_mesh(mesh_obj) -> int:
     if not numeric_group_indices:
         raise ValueError(f"{mesh_obj.name}: no numeric local vertex groups found")
     return max(numeric_group_indices) + 1
+
+
+def _read_int_prop(mesh_obj, prop_name: str) -> int | None:
+    raw_value = mesh_obj.get(prop_name)
+    if raw_value is None:
+        return None
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_int_sequence_prop(mesh_obj, prop_name: str) -> tuple[int, ...] | None:
+    raw_value = mesh_obj.get(prop_name)
+    if raw_value is None:
+        return None
+    try:
+        return tuple(int(value) for value in raw_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_local_to_global(local_to_global: dict[str, int]) -> dict[int, int]:
+    normalized = {}
+    for local_index, global_index in local_to_global.items():
+        try:
+            local_int = int(local_index)
+            global_int = int(global_index)
+        except (TypeError, ValueError):
+            continue
+        if local_int < 0 or global_int < 0:
+            continue
+        normalized[local_int] = global_int
+    return normalized
+
+
+def _dense_remap_sequence(local_to_global: dict[int, int]) -> tuple[int, ...]:
+    if not local_to_global:
+        return ()
+    max_local = max(local_to_global)
+    return tuple(int(local_to_global.get(local_index, -1)) for local_index in range(max_local + 1))
+
+
+def _set_global_remap_metadata(mesh_obj, local_to_global: dict[int, int]) -> None:
+    remap_sequence = _dense_remap_sequence(local_to_global)
+    if remap_sequence:
+        mesh_obj[BMC_GLOBAL_REMAP_PROP] = list(remap_sequence)
+        mesh_obj[BMC_ORIGINAL_LOCAL_BONE_COUNT_PROP] = len(remap_sequence)
+    mesh_obj[BMC_VERTEX_GROUP_STATE_PROP] = BMC_VERTEX_GROUP_STATE_GLOBAL
+    _clear_export_local_metadata(mesh_obj)
+
+
+def _clear_export_local_metadata(mesh_obj) -> None:
+    for prop_name in (BMC_EXPORT_PALETTE_PROP, BMC_EXPORT_CHUNK_PROP):
+        if prop_name in mesh_obj:
+            del mesh_obj[prop_name]
+
+
+def _mesh_has_expected_global_remap(mesh_obj, local_to_global: dict[int, int]) -> bool:
+    expected = _dense_remap_sequence(local_to_global)
+    current = _read_int_sequence_prop(mesh_obj, BMC_GLOBAL_REMAP_PROP)
+    return bool(expected and current == expected and mesh_obj.get(BMC_VERTEX_GROUP_STATE_PROP) == BMC_VERTEX_GROUP_STATE_GLOBAL)
 
 
 def annotate_alias_items_with_mesh_proximity(scene, alias_items) -> None:
@@ -215,12 +297,9 @@ def apply_group_remaps_to_meshes(mesh_objects, manifest: dict) -> RemapApplyResu
             skipped_objects.append(f"{mesh_obj.name}: no remap entry for {mesh_identity[0]}-{mesh_identity[1]}")
             continue
 
-        local_to_global = {
-            str(key): int(value)
-            for key, value in remap_entry.get("local_group_to_global_group", {}).items()
-        }
+        local_to_global = _normalize_local_to_global(remap_entry.get("local_group_to_global_group", {}))
         renamed = _apply_group_rename(mesh_obj, local_to_global)
-        if renamed:
+        if renamed or _mesh_has_expected_global_remap(mesh_obj, local_to_global):
             updated_objects += 1
             renamed_groups += renamed
         else:
@@ -234,15 +313,23 @@ def apply_group_remaps_to_meshes(mesh_objects, manifest: dict) -> RemapApplyResu
     )
 
 
-def _apply_group_rename(mesh_obj, local_to_global: dict[str, int]) -> int:
-    rename_pairs: list[tuple[str, str]] = []
-    for local_name, global_index in local_to_global.items():
-        vertex_group = mesh_obj.vertex_groups.get(local_name)
-        if vertex_group is None:
-            continue
-        rename_pairs.append((local_name, str(global_index)))
+def _apply_group_rename(mesh_obj, local_to_global: dict[int, int]) -> int:
+    if not local_to_global:
+        return 0
 
+    if _mesh_has_expected_global_remap(mesh_obj, local_to_global):
+        return 0
+
+    rename_pairs = _build_rename_pairs_for_current_state(mesh_obj, local_to_global)
     if not rename_pairs:
+        existing_global_names = {str(global_index) for global_index in local_to_global.values()}
+        current_numeric_names = {
+            str(vertex_group.name).strip()
+            for vertex_group in mesh_obj.vertex_groups
+            if _parse_numeric_group(vertex_group.name) is not None
+        }
+        if existing_global_names and existing_global_names.issubset(current_numeric_names):
+            _set_global_remap_metadata(mesh_obj, local_to_global)
         return 0
 
     temp_name_by_source: dict[str, str] = {}
@@ -261,7 +348,52 @@ def _apply_group_rename(mesh_obj, local_to_global: dict[str, int]) -> int:
             continue
         mesh_obj.vertex_groups[temp_name].name = target_name
         renamed_count += 1
+    _set_global_remap_metadata(mesh_obj, local_to_global)
     return renamed_count
+
+
+def _build_rename_pairs_for_current_state(mesh_obj, local_to_global: dict[int, int]) -> list[tuple[str, str]]:
+    current_remap = _read_int_sequence_prop(mesh_obj, BMC_GLOBAL_REMAP_PROP)
+    localized_palette = _read_int_sequence_prop(mesh_obj, BMC_EXPORT_PALETTE_PROP)
+    global_to_original_local = _invert_remap_sequence(current_remap)
+
+    rename_by_source: dict[str, str] = {}
+    for vertex_group in mesh_obj.vertex_groups:
+        numeric_name = _parse_numeric_group(vertex_group.name)
+        if numeric_name is None:
+            continue
+
+        original_local = None
+        if localized_palette is not None and 0 <= numeric_name < len(localized_palette):
+            original_local = global_to_original_local.get(int(localized_palette[numeric_name]))
+        elif current_remap is not None:
+            original_local = global_to_original_local.get(numeric_name)
+        else:
+            original_local = numeric_name
+
+        if original_local is None:
+            continue
+        target_global = local_to_global.get(int(original_local))
+        if target_global is None:
+            continue
+
+        source_name = str(vertex_group.name)
+        target_name = str(int(target_global))
+        if source_name == target_name:
+            continue
+        rename_by_source[source_name] = target_name
+
+    return sorted(rename_by_source.items(), key=lambda item: (_parse_numeric_group(item[0]) or 0, item[0]))
+
+
+def _invert_remap_sequence(remap_sequence: tuple[int, ...] | None) -> dict[int, int]:
+    if not remap_sequence:
+        return {}
+    return {
+        int(global_index): local_index
+        for local_index, global_index in enumerate(remap_sequence)
+        if int(global_index) >= 0
+    }
 
 
 def merge_duplicate_alias_weights(mesh_objects, alias_entries: list[dict]) -> DuplicateMergeResult:
@@ -283,11 +415,19 @@ def merge_duplicate_alias_weights(mesh_objects, alias_entries: list[dict]) -> Du
         )
 
     aliases_by_object: dict[str, list[dict]] = {}
+    aliases_by_ib_hash: dict[str, list[dict]] = {}
     for alias_entry in active_alias_entries:
         aliases_by_object.setdefault(str(alias_entry.get("src_object_name", "")).strip(), []).append(alias_entry)
+        src_ib_hash = str(alias_entry.get("src_ib_hash", "")).strip().lower()
+        if src_ib_hash:
+            aliases_by_ib_hash.setdefault(src_ib_hash, []).append(alias_entry)
 
     for mesh_obj in mesh_objects:
         relevant_alias_entries = aliases_by_object.get(mesh_obj.name, [])
+        if not relevant_alias_entries:
+            mesh_identity = resolve_mesh_identity(mesh_obj)
+            if mesh_identity is not None:
+                relevant_alias_entries = aliases_by_ib_hash.get(mesh_identity[0].lower(), [])
         if not relevant_alias_entries:
             skipped_objects.append(f"{mesh_obj.name}: no duplicate alias groups present")
             continue
@@ -296,19 +436,23 @@ def merge_duplicate_alias_weights(mesh_objects, alias_entries: list[dict]) -> Du
             str(int(alias_entry["src_global_bone"])) for alias_entry in relevant_alias_entries
         }
         source_group_entries = _collect_group_member_weights(mesh_obj, relevant_source_group_names)
+        groups_by_global_name = _build_global_name_to_vertex_groups(mesh_obj)
         changed = False
         for alias_entry in relevant_alias_entries:
-            source_group = mesh_obj.vertex_groups.get(str(int(alias_entry["src_global_bone"])))
+            source_group_name = str(int(alias_entry["src_global_bone"]))
+            canonical_group_name = str(int(alias_entry["canonical_global_bone"]))
+            source_group = _first_group_for_global(groups_by_global_name, source_group_name)
             if source_group is None:
                 continue
-            canonical_group = mesh_obj.vertex_groups.get(str(int(alias_entry["canonical_global_bone"])))
+            canonical_group = _first_group_for_global(groups_by_global_name, canonical_group_name)
             if canonical_group is None:
-                canonical_group = mesh_obj.vertex_groups.new(name=str(int(alias_entry["canonical_global_bone"])))
+                canonical_group = mesh_obj.vertex_groups.new(name=canonical_group_name)
+                groups_by_global_name.setdefault(canonical_group_name, []).append(canonical_group)
             moved_vertices = _move_vertex_group_weights(
                 mesh_obj,
                 source_group,
                 canonical_group,
-                source_group_entries.get(source_group.name, ()),
+                source_group_entries.get(source_group_name, ()),
             )
             if moved_vertices <= 0:
                 continue
@@ -355,38 +499,56 @@ def _is_safe_alias_entry(alias_entry: dict) -> bool:
     return True
 
 
-def _infer_group_weighted_center_world(mesh_obj, group_name: str):
-    vertex_group = mesh_obj.vertex_groups.get(group_name)
-    if vertex_group is None:
-        return None
-
-    weighted_sum = None
-    total_weight = 0.0
-    for vertex in mesh_obj.data.vertices:
-        weight = _safe_weight(vertex_group, vertex.index)
-        if weight <= 0.0:
+def _build_group_index_to_global_name_map(mesh_obj) -> dict[int, str]:
+    localized_palette = _read_int_sequence_prop(mesh_obj, BMC_EXPORT_PALETTE_PROP)
+    group_index_to_global_name = {}
+    for vertex_group in mesh_obj.vertex_groups:
+        numeric_group = _parse_numeric_group(vertex_group.name)
+        if numeric_group is None:
             continue
-        world_position = mesh_obj.matrix_world @ vertex.co
-        weighted_position = world_position * weight
-        weighted_sum = weighted_position if weighted_sum is None else weighted_sum + weighted_position
-        total_weight += weight
+        if localized_palette is not None and 0 <= numeric_group < len(localized_palette):
+            global_group = int(localized_palette[numeric_group])
+        else:
+            global_group = numeric_group
+        if global_group < 0:
+            continue
+        group_index_to_global_name[int(vertex_group.index)] = str(global_group)
+    return group_index_to_global_name
 
-    if weighted_sum is None or total_weight <= 0.0:
-        return None
-    return weighted_sum / total_weight
+
+def _build_global_name_to_vertex_groups(mesh_obj) -> dict[str, list[object]]:
+    group_index_to_global_name = _build_group_index_to_global_name_map(mesh_obj)
+    groups_by_global_name: dict[str, list[object]] = {}
+    for vertex_group in mesh_obj.vertex_groups:
+        global_name = group_index_to_global_name.get(int(vertex_group.index))
+        if global_name is None:
+            continue
+        groups_by_global_name.setdefault(global_name, []).append(vertex_group)
+    return groups_by_global_name
+
+
+def _first_group_for_global(groups_by_global_name: dict[str, list[object]], global_group_name: str):
+    groups = groups_by_global_name.get(str(global_group_name), [])
+    if groups:
+        return groups[0]
+    return None
+
+
+def _infer_group_weighted_center_world(mesh_obj, group_name: str):
+    return _infer_group_weighted_centers_world_bulk(mesh_obj, {str(group_name)}).get(str(group_name))
 
 
 def _infer_group_weighted_centers_world_bulk(mesh_obj, group_names: set[str]) -> dict[str, object]:
-    group_name_to_index = {}
-    for group_name in group_names:
-        vertex_group = mesh_obj.vertex_groups.get(group_name)
-        if vertex_group is not None:
-            group_name_to_index[group_name] = vertex_group.index
-
-    if not group_name_to_index:
+    requested_names = {str(group_name) for group_name in group_names}
+    group_index_to_global_name = _build_group_index_to_global_name_map(mesh_obj)
+    relevant_group_indices = {
+        group_index
+        for group_index, global_name in group_index_to_global_name.items()
+        if global_name in requested_names
+    }
+    if not relevant_group_indices:
         return {}
 
-    relevant_group_indices = set(group_name_to_index.values())
     weighted_sums = {}
     total_weights = {}
 
@@ -398,39 +560,41 @@ def _infer_group_weighted_centers_world_bulk(mesh_obj, group_names: set[str]) ->
             group_index = int(group_element.group)
             if group_index not in relevant_group_indices:
                 continue
+            global_name = group_index_to_global_name.get(group_index)
+            if global_name is None:
+                continue
             weight = float(group_element.weight)
             if weight <= 0.0:
                 continue
             weighted_position = world_position * weight
-            weighted_sums[group_index] = (
-                weighted_position if group_index not in weighted_sums else weighted_sums[group_index] + weighted_position
+            weighted_sums[global_name] = (
+                weighted_position
+                if global_name not in weighted_sums
+                else weighted_sums[global_name] + weighted_position
             )
-            total_weights[group_index] = total_weights.get(group_index, 0.0) + weight
+            total_weights[global_name] = total_weights.get(global_name, 0.0) + weight
 
     centers = {}
-    for group_name, group_index in group_name_to_index.items():
-        total_weight = total_weights.get(group_index, 0.0)
+    for group_name in requested_names:
+        total_weight = total_weights.get(group_name, 0.0)
         if total_weight <= 0.0:
             continue
-        centers[group_name] = weighted_sums[group_index] / total_weight
+        centers[group_name] = weighted_sums[group_name] / total_weight
     return centers
 
 
 def _collect_group_member_weights(mesh_obj, group_names: set[str]) -> dict[str, tuple[tuple[int, float], ...]]:
-    group_name_to_index = {}
-    index_to_name = {}
-    for group_name in group_names:
-        vertex_group = mesh_obj.vertex_groups.get(group_name)
-        if vertex_group is None:
-            continue
-        group_name_to_index[group_name] = vertex_group.index
-        index_to_name[vertex_group.index] = group_name
-
-    if not group_name_to_index:
+    requested_names = {str(group_name) for group_name in group_names}
+    group_index_to_global_name = _build_group_index_to_global_name_map(mesh_obj)
+    relevant_group_indices = {
+        group_index
+        for group_index, global_name in group_index_to_global_name.items()
+        if global_name in requested_names
+    }
+    if not relevant_group_indices:
         return {}
 
-    members = {group_name: [] for group_name in group_name_to_index}
-    relevant_group_indices = set(index_to_name.keys())
+    members = {group_name: [] for group_name in requested_names}
     for vertex in mesh_obj.data.vertices:
         for group_element in vertex.groups:
             group_index = int(group_element.group)
@@ -439,7 +603,10 @@ def _collect_group_member_weights(mesh_obj, group_names: set[str]) -> dict[str, 
             weight = float(group_element.weight)
             if weight <= 0.0:
                 continue
-            members[index_to_name[group_index]].append((vertex.index, weight))
+            global_name = group_index_to_global_name.get(group_index)
+            if global_name is None:
+                continue
+            members[global_name].append((vertex.index, weight))
 
     return {group_name: tuple(entries) for group_name, entries in members.items()}
 
@@ -654,11 +821,14 @@ def _build_mapping_candidates_from_seams(source_obj, target_obj, matched_pairs, 
 
 def _read_vertex_weights(obj, vertex_index):
     weight_map = {}
+    group_index_to_global_name = _build_group_index_to_global_name_map(obj)
     vertex = obj.data.vertices[vertex_index]
     for assignment in vertex.groups:
-        group_name = obj.vertex_groups[assignment.group].name
+        group_name = group_index_to_global_name.get(int(assignment.group))
+        if group_name is None:
+            continue
         if assignment.weight > _WEIGHT_EPSILON:
-            weight_map[group_name] = assignment.weight
+            weight_map[group_name] = min(1.0, weight_map.get(group_name, 0.0) + float(assignment.weight))
     return weight_map
 
 

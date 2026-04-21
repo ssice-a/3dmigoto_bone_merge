@@ -113,3 +113,23 @@ class DuplicateMergeResult:
     updated_objects: int
     merged_aliases: int
     skipped_objects: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ShadowHostRecord:
+    draw_index: int
+    ib_hash: str
+    match_index_count: int
+    vs_hash: str = ""
+
+
+@dataclass(frozen=True)
+class ShadowSplitResult:
+    source_ini_path: str
+    bonestore_ini_path: str
+    export_manifest_path: str
+    shadow_host_hash: str
+    shadow_host_match_index_count: int
+    migrated_chunks: int
+    rewritten_sections: int
+    shadow_host_vs_hash: str = ""

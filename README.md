@@ -1,232 +1,208 @@
-﻿# Bone Merge Capture
+# Bone Merge Capture
 
-独立 Blender 插件，用于：
+Blender addon for building a 3Dmigoto bone-capture pipeline around multiple IBs.
 
-- 从目标物体列表解析 `ib_hash + match_index_count`
-- 使用 `Target Collection` 集中管理要参与扫描的 IB 物体
-- 在指定 `FrameAnalysis` 文件夹里找到对应 draw
-- 按 draw 顺序建立全局骨序
-- 生成 `capture_manifest.json`
-- 生成独立 `BoneStore.ini`
-- 自动导出 `hlsl/` 目录并复制捕获所需 HLSL
-- 按映射表把 Blender 里的局部数字顶点组重命名为全局数字顶点组
-- 单独执行“同骨顶点组”分析与权重合并
+It helps with four related jobs:
 
-## 当前主流程
+- Scan a `FrameAnalysis` folder and freeze a bone mapping.
+- Save/load that mapping as a preset.
+- Prepare local palettes and `BoneStore.ini` for export.
+- Optionally split `vs == 200` shadow drawing to the final shadow host.
 
-第一版主流程 **不再依赖 `vb2` 推断骨数**。
+It also includes an independent `Seam Group Matcher` for fast seam-only vertex group renaming. That tool does not depend on Scan, BoneStore, manifests, or shader dumps.
 
-骨数来源固定为：
+## Install
 
-- 当前 Blender 物体上所有“纯数字命名”的顶点组
-- `local_bone_count = max(numeric_group_name) + 1`
+Copy this folder as `3dmigoto_bone_merge` into Blender's addon folder, then enable:
 
-`FrameAnalysis` 只负责：
+`Edit > Preferences > Add-ons > Bone Merge Capture`
 
-- 找到目标 draw
-- 读取 draw 顺序
-- 读取 `vs-t0` / `vs-cb1`
-- 生成捕获所需的部位记录
+The panel appears at:
 
-## Target Collection
+`View3D > Sidebar > Bone Merge Capture`
 
-面板中的 `Target Collection` 用来集中管理“骨骼调色板需要扫描的 IB 物体”。
+When developing, close Blender before overwriting the installed addon files. Blender can keep `__init__.py`, `operators.py`, and other files locked.
 
-- `Create Target Collection`
-  - 创建或选择默认集合 `BMC Bone Palette Targets`
-- `Add Selected Objects`
-  - 把选中的 mesh 加入目标列表
-  - 同时链接到 `Target Collection`
-- `Sync Targets From Collection`
-  - 用集合里的 mesh 重新生成目标列表
+## Recommended Workflow
 
-这个集合只负责管理扫描对象；真正的 `palette.buf` 仍然等后续导出阶段再生成。
+### 1. Target Objects
 
-扫描完成后，插件会自动：
+Use `Target Objects` for the original game IBs whose bone palettes should be captured.
 
-- 生成 `capture_manifest.json`
-- 生成 `BoneStore.ini`
-- 导出 `hlsl/` 子目录
-- 立即对当前目标物体执行一次局部顶点组 -> 全局顶点组重命名
+- `Create Target Collection` creates `BMC Bone Palette Targets`.
+- `Add Selected Objects` adds selected mesh objects to the target list.
+- `Sync Targets From Collection` rebuilds the target list from the target collection.
+- `Refresh Target Identity` refreshes only the selected target item.
 
-`palette.buf` 和本地化后的 `Blend.buf` 属于后续导出阶段，不在 `Scan and Generate` 阶段生成。
+Target identity is frozen when added or refreshed:
 
-默认情况下，`Scan and Generate` 不会自动跑“同骨/接缝骨”匹配。这个空间近邻 + 权重 + 矩阵签名分析可能比较慢。
+- `object_name`
+- `ib_hash`
+- `match_index_count`
+- `local_bone_count`
 
-如果勾选 `Scan 后自动合并同骨顶点组`，扫描完成后会自动：
+`Scan` does not silently re-read edited vertex groups unless you explicitly refresh target identity first.
 
-- 跑 `Analyze Same-Bone Groups`
-- 把推荐 alias 写回 `capture_manifest.json`
-- 立即执行一次 `Merge Duplicate Bones`
+### 2. Scan / Freeze Mapping
 
-不勾选时，也可以在后处理阶段手动点击 `Analyze Same-Bone Groups` 和 `Merge Duplicate Bones`。
+Set `FrameAnalysis Dir`, then click `Scan`.
 
-## Export Preparation
-
-导出阶段现在分成两层集合：
-
-- `Export Source Collection`
-  - 你真正手工编辑和摆放物体的集合
-  - 下面的子集合仍然代表最终宿主 draw/chunk
-- `Export Build Collection`
-  - 插件每次 `Prepare Export / Palette` 时自动重建的临时导出副本集合
-  - 只给导出和运行时使用，不应手工长期编辑
-
-工作流变成：
-
-- 在 `Export Source Collection` 下面创建或整理子集合
-- 子集合名称就是最终宿主 draw/chunk 身份，格式推荐为 `<ib_hash>-<match_index_count>-<chunk_index>`
-  - 例如：`fe47dc61-7014-0`
-  - 如果 A 的几何想挂到 B 的宿主上，就把 A 的 mesh 放到 B 对应的 source 子集合下
-- `Prepare Export / Palette` 会：
-  - 先清空并重建 `Export Build Collection`
-  - 从 `Export Source Collection` 把 mesh 复制到 build 子集合
-  - 每个 build 子集合生成一份 `Buffer/<ib>-<match_index_count>-<chunk_index>-Palette.buf`
-  - 只把 build 副本的数字顶点组从全局编号本地化成 `0..n-1`
-  - 重建 build 副本的顶点组内部顺序，确保 3Dmigoto 导出的 `BLENDINDICES` 也变成本地连续索引
-  - 对没有导出子集合的扫描 IB 生成默认原始 palette：`local i -> global_bone_base + i`
-  - 写出 `export_manifest.json`
-
-第一版不直接导出完整 3Dmigoto 网格缓冲。现有 3Dmigoto Blender 导出插件应对 `Export Collection` / 对应子集合里的 mesh 导出 `Position/Texcoord/Blend/Index` 等 mesh buffer。
-
-注意：
-
-- `Export Source Collection` 里应该始终放**干净的全局骨源对象**
-- 不要把旧的 export-local build 副本再放回 source 集合
-- 现在真正会被本地化成 `0..n-1` 的，只有 `Export Build Collection` 里的临时副本
-
-面板中的导出相关按钮在 `Export Preparation` 区域：
-
-- `Create Export Collection`：创建导出源集合，并自动创建当前 Target 列表对应的 `<ib>-<count>-0` 子集合
-- `Add Selected To Export`：把当前选中的 mesh 放入一个宿主子集合；默认使用 active mesh 的 IB 信息创建 `<ib>-<count>-0`
-- `Prepare Export / Palette`：按子集合生成 `Palette.buf`，并就地本地化顶点组
-
-## Preset Cache
-
-`Save Preset` 不只保存目标列表和同骨 alias，也会把已经生成好的工程缓存复制到插件的 `presets/<preset_name>/` 文件夹：
+Scan writes:
 
 - `capture_manifest.json`
+- `BoneStore.ini`
+- frozen `object_remaps`
+- detected last `vs == 200` shadow host
+
+By default, Scan does not modify Blender meshes. If `Auto remap after Scan` is enabled, Scan also applies target remap and old same-bone merge logic. That checkbox is slower and should be used only when you intentionally want the one-click path.
+
+### 3. Mapping Preset
+
+Use `Save Preset` after a good Scan.
+
+Presets are mapping-only snapshots. They save the scan result and shadow host information, but they do not own runtime export output paths.
+
+Use `Load Preset` when you want to reuse an existing mapping without opening the old `FrameAnalysis` folder again.
+
+### 4. Apply Mapping
+
+Use `Legacy Target Remap` only when you want enabled target objects renamed from local numeric vertex groups to global bone groups.
+
+This is intentionally separate from Scan. The safer rhythm is:
+
+1. Scan or load preset.
+2. Apply mapping to selected/target objects only when needed.
+3. Then do seam matching or export.
+
+### 5. Seam Group Matcher
+
+`Seam Group Matcher` is independent. It is for the case where different IBs have different numeric vertex group names but the seam proves they are actually the same bone.
+
+Workflow:
+
+1. Select mesh objects that should participate.
+2. Click `+` in `Seam Group Matcher`.
+3. Click `Build Seam Mapping`.
+4. Inspect the pair summary and alias list.
+5. Click `Apply Seam Mapping`.
+
+Rules:
+
+- It only uses enabled mesh objects in the seam matcher list.
+- It only reads boundary/seam vertices.
+- It compares world-space nearest seam vertices and their visible numeric vertex group weights.
+- It does not read `vs-t0`, manifests, or FrameAnalysis files.
+- If several groups are judged the same bone, the smallest numeric group is canonical.
+- Applying the mapping only renames vertex groups and leaves an empty placeholder with the old name.
+- It does not move, add, or merge weights.
+- If the destination group already exists on the same object, it errors instead of guessing.
+- If matched objects already share the same group number, it errors and asks you to rename first.
+
+This tool is deliberately strict. If it refuses to apply, that is usually safer than silently corrupting a model.
+
+### 6. Prepare Export
+
+Use `3Dmigoto Export`.
+
+- `Export Source` is the collection you edit by hand.
+- Child collections under `Export Source` represent the runtime host chunk.
+- Child collection names should be `<ib_hash>-<match_index_count>-<chunk_index>`, for example `fe47dc61-7014-0`.
+- `Export Build` is disposable and regenerated by `Prepare Export`.
+
+`Prepare Export` rebuilds:
+
+- `Buffer/*-Palette.buf`
 - `export_manifest.json`
 - `BoneStore.ini`
 
-选择 preset 下拉框时会自动恢复这些缓存副本路径，但 `Output Dir` 继续表示真正的 3Dmigoto 文件导出目录。`Load Preset` 只作为手动刷新/报错入口保留。这样同一个工程后续只需要选中 preset，就能继续 `Prepare Export / Palette` 或 `Generate Shadow Split`，不需要每次重新选择旧的 FrameAnalysis 文件夹或重新 `Scan`。
+Only build copies are localized to `0..n-1`. Do not edit `Export Build` as your source of truth.
 
-`Prepare Export / Palette` 只会把运行时需要的文件写入 `Output Dir`：`BoneStore.ini`、`hlsl/`、`Buffer/*-Palette.buf`。`export_manifest.json` 是插件内部给阴影分流用的缓存，会写到 preset 文件夹，不再混进 3Dmigoto 导出目录。
+Important: the exported `Blend.buf` and `Palette.buf` must come from the same build generation. If you change vertex groups, rerun `Prepare Export` and re-export the mesh buffers.
 
-只有在换角色、换目标 IB、游戏更新、draw 顺序/hash 变化，或需要重新自动检测最后 `vs == 200` 阴影宿主时，才需要重新跑 `Scan and Generate`。
+### 7. Modify Main INI
 
-## `cb1` 使用约定
+`Modify Main INI` is optional. It moves `vs == 200` shadow payloads to the final shadow host.
 
-- `ResourceDumpedCB1_SRV`
-  - 是当前这一次 `ExtractCB1` 后的**临时 cb1 staging**
-- Stage 1（source `ib` 捕获）
-  - `ExtractCB1 -> RecordBones`
-  - 这里只是借当前 source draw 的 `cb1[5].x/.y` 去找到原始 `vs-t0` 里的骨骼窗口并写入全局大缓冲
-- Stage 2（最终 chunk 绘制）
-  - 再对当前 consuming draw 重新 `ExtractCB1`
-  - `RedirectCB1` 只修改这个 consuming draw 的 `cb1[5].x/.y`
-  - 让它指向共享本地小缓冲区
+It always uses the current `Export Manifest` shown in the panel. There is no separate manifest picker for this step.
 
-也就是说：
+Shadow host source order:
 
-- Stage 1：`ExtractCB1 -> RecordBones`
-- Stage 2：`ExtractCB1 -> GatherBones -> RedirectCB1 -> bind local vs-t0/vs-cb1`
+1. Loaded mapping preset or latest Scan.
+2. Current `FrameAnalysis` auto-detection.
+3. Manual override fields.
 
-## Capture 协议
+`vs == 201` is not treated as shadow.
 
-每个源 `IB` 只存两项元数据：
+## Runtime Protocol
 
-- `global_bone_base`
-- `capture_bone_count`
+`BoneStore.ini` keeps each captured IB in the same basic structure:
 
-运行时由 HLSL 自行计算：
+```ini
+[TextureOverride_IB_<hash>_merge]
+hash = <hash>
+match_index_count = <count>
+match_priority = -500
+if vs == 200
+  run = CustomShader_ExtractCB1
+  cs-t2 = ResourceBoneMeta_<hash>
+  run = CustomShader_RecordBones
+endif
+run = CustomShader_ExtractCB1
+cs-t2 = ResourceLocalPalette_<chunk>
+cs-t3 = ResourceLocalPaletteMeta_<chunk>
+run = CustomShader_GatherBones
+vs-t0 = ResourceLocalFakeT0_SRV
+run = CustomShader_RedirectCB1
+vs-cb1 = ResourceFakeCB1
+```
 
-- `row_base = global_bone_base * 3`
+`Palette.buf` maps:
 
-大缓冲区布局固定为：
+`localBone -> globalBone`
 
-- current: `3 + g*3 .. 3 + g*3 + 2`
-- previous: `100000 + 3 + g*3 .. +2`
+The final draw still uses local `BLENDINDICES`, while `GatherBones` fills the local fake `vs-t0` from the global captured buffer.
 
-## 输出
+## Safety Limits
 
-- `capture_manifest.json`
-- `BoneStore.ini`
-- `hlsl/extract_cb1_vs.hlsl`
-- `hlsl/extract_cb1_ps.hlsl`
-- `hlsl/gather_bones_cs.hlsl`
-- `hlsl/record_bones_dynamic_cs.hlsl`
-- `hlsl/redirect_cb1_cs.hlsl`
+- A single final draw chunk must stay within the game's local bone-index format. In the current workflow, keep each chunk at `<= 256` local bones.
+- Global captured bones can exceed 256 because they are stored in the large BoneStore buffer.
+- If a chunk needs bones captured by a later draw, drawing it too early can still twist. Use a later host, split the mesh, or move shadow drawing to the final shadow host.
 
-## 备注
+## Troubleshooting
 
-- 第一版只处理 `vs == 200`
-- “重复骨/接缝骨合并”是后处理按钮，不影响主捕获布局
-- `Analyze Same-Bone Groups` 推荐现在必须同时满足：
-  - 接缝顶点在世界空间内互为最近点
-  - 至少有多对接缝顶点支持这个物体对
-  - 某个顶点组映射必须有多票权重支持
-  - 接缝顶点上的权重值相似
-  - 对应全局骨的 current/previous `vs-t0` 矩阵签名一致
-- 当前工作流按 `BI4 / R8G8B8A8_UINT` 约束处理：每个目标物体/最终 draw chunk 的局部骨数必须 `<=256`
-- 扫描阶段允许建立更大的全局骨序；真正需要受 `256` 限制的是单个最终绘制块，而不是 capture 阶段的全局骨总数
+### The model is twisted
 
-## Local Palette 路线（第一版协议）
+Check these first:
 
-为避免修改 IA / BLENDINDICES 格式，推荐后续导出器走：
+- `Blend.buf` and `Palette.buf` were generated from the same `Export Build`.
+- You reran `Prepare Export` after changing vertex groups.
+- The source object was not already a localized build copy.
+- The chunk host draw happens after all required bones have been captured.
+- The final chunk uses `<= 256` local bones.
+- `BoneStore.ini` in the mod folder is the newest generated one.
 
-- Blender 内继续保留**全局骨号**
-- 导出每个最终 draw chunk 时，生成一个 `palette.buf`
-- `palette[localBone] = globalBone`
-- 顶点里的 `BLENDINDICES` 改写成本地连续 `0..n-1`
-- 运行时推荐顺序：
-  1. Stage 1（source `ib`，只在 `vs == 200` 时做一次）
-     - `CustomShader_ExtractCB1`
-     - `CustomShader_RecordBones`
-  2. Stage 2（最终 consuming draw）
-     - `CustomShader_ExtractCB1`
-     - `CustomShader_GatherBones`
-     - 绑定 `vs-t0 = ResourceLocalFakeT0_SRV`
-     - `CustomShader_RedirectCB1`
-     - 绑定 `vs-cb1 = ResourceFakeCB1`
-     - 再 draw
+### Seam mapping produced no aliases
 
-### `palette.buf`
+Common causes:
 
-- 类型：`Buffer`
-- 格式：`R32_UINT`
-- 步长：`4 bytes`
-- 含义：`localBone -> globalBone`
+- The selected meshes do not share boundary vertices closely enough.
+- Vertex group weights differ more than the tolerance.
+- Vertex groups are not numeric.
+- The seam is not open/boundary geometry from Blender's point of view.
 
-### `palette meta`
+### Addon update did not appear in Blender
 
-- 类型：`Buffer`
-- 格式：`R32_FLOAT`
-- 字段：
-  - `x = local_bone_count`
+Close Blender, copy the addon folder again, reopen Blender, then disable/enable the addon once.
 
-### 行布局
+## Git Notes
 
-全局大骨缓冲：
+Do not commit runtime caches:
 
-- `current = 3 + globalBone*3 + rowInBone`
-- `previous = 100000 + 3 + globalBone*3 + rowInBone`
+- `__pycache__/`
+- `*.pyc`
+- `Buffer/`
+- `Meshes/`
+- `presets/`
+- `export_manifest.json`
 
-本地 gather 后小骨缓冲：
-
-- `current = 3 + localBone*3 + rowInBone`
-- `previous = 1024 + 3 + localBone*3 + rowInBone`
-
-对应本地绘制时 `RedirectCB1` 改写后的 `cb1[5]`：
-
-- `cb1[5].x = 0`
-- `cb1[5].y = 1024`
-
-这两个“骨数”是不同概念：
-
-- `capture_bone_count`
-  - 原始 source IB 的局部骨数
-  - 给 `CustomShader_RecordBones` 用
-- `local_bone_count`
-  - 一个最终导出 chunk 的本地 palette 骨数
-  - 给 `CustomShader_GatherBones` 用
+Those are ignored by `.gitignore` for new files. If pycache files were already tracked in older commits, remove them from the repository index before publishing.

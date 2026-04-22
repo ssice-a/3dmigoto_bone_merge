@@ -24,6 +24,8 @@ _SEAM_WEIGHT_TOLERANCE = 0.001
 _SEAM_MIN_VERTEX_PAIRS = 4
 _SEAM_MIN_MAPPING_VOTES = 3
 _SEAM_MAX_AVERAGE_DISTANCE = 0.001
+_SEAM_OBJECT_BBOX_GAP_TOLERANCE = 0.01
+_SEAM_GROUP_BBOX_GAP_TOLERANCE = 0.003
 _WEIGHT_EPSILON = 1.0e-8
 _MAPPING_WEIGHT_FLOOR = 1.0e-4
 
@@ -135,7 +137,18 @@ def _clear_export_local_metadata(mesh_obj) -> None:
 def _mesh_has_expected_global_remap(mesh_obj, local_to_global: dict[int, int]) -> bool:
     expected = _dense_remap_sequence(local_to_global)
     current = _read_int_sequence_prop(mesh_obj, BMC_GLOBAL_REMAP_PROP)
-    return bool(expected and current == expected and mesh_obj.get(BMC_VERTEX_GROUP_STATE_PROP) == BMC_VERTEX_GROUP_STATE_GLOBAL)
+    if not expected or current != expected or mesh_obj.get(BMC_VERTEX_GROUP_STATE_PROP) != BMC_VERTEX_GROUP_STATE_GLOBAL:
+        return False
+
+    expected_global_names = {int(global_index) for global_index in expected if int(global_index) >= 0}
+    current_numeric_names = {
+        numeric_group
+        for vertex_group in mesh_obj.vertex_groups
+        if (numeric_group := _parse_numeric_group(vertex_group.name)) is not None
+    }
+    # Metadata can survive copies or manual edits. Treat an object as already
+    # global only when its visible vertex-group names actually contain globals.
+    return bool(current_numeric_names and current_numeric_names.intersection(expected_global_names))
 
 
 def annotate_alias_items_with_mesh_proximity(scene, alias_items) -> None:
@@ -189,81 +202,83 @@ def mesh_objects_from_target_names(context, target_object_names: list[str]):
 def build_seam_filtered_aliases_from_manifest(context, manifest: dict, target_object_names: list[str]) -> list[dict]:
     mesh_objects, _missing_names = mesh_objects_from_target_names(context, target_object_names)
     mesh_by_name = {mesh_obj.name: mesh_obj for mesh_obj in mesh_objects}
-    signature_by_global, metadata_by_global = _build_global_bone_signature_index(manifest)
+    identity_by_name = {
+        object_name: resolve_mesh_identity(mesh_obj)
+        for object_name, mesh_obj in mesh_by_name.items()
+    }
+    metadata_by_object = _build_object_metadata_index(manifest, mesh_by_name, identity_by_name)
+    seam_cache = {
+        object_name: _build_seam_analysis_cache(mesh_by_name[object_name], force_visible_group_names=True)
+        for object_name in target_object_names
+        if object_name in mesh_by_name
+    }
 
-    aliases_by_key: dict[tuple[int, int], dict] = {}
-    object_names = [name for name in target_object_names if name in mesh_by_name]
+    candidate_edges: list[dict] = []
+    object_names = [name for name in target_object_names if name in mesh_by_name and seam_cache.get(name)]
     for source_index, source_name in enumerate(object_names):
-        source_obj = mesh_by_name[source_name]
-        source_seam_vertices = _collect_seam_vertices(source_obj)
-        if not source_seam_vertices:
+        source_cache = seam_cache.get(source_name)
+        if not source_cache:
             continue
 
         for target_name in object_names[source_index + 1 :]:
-            target_obj = mesh_by_name[target_name]
-            target_seam_vertices = _collect_seam_vertices(target_obj)
-            if not target_seam_vertices:
+            target_cache = seam_cache.get(target_name)
+            if not target_cache:
+                continue
+            source_identity = identity_by_name.get(source_name)
+            target_identity = identity_by_name.get(target_name)
+            if (
+                source_identity is not None
+                and target_identity is not None
+                and str(source_identity[0]).lower() == str(target_identity[0]).lower()
+            ):
+                continue
+            if not _seam_bounds_overlap_with_gap(
+                source_cache["bounds_min"],
+                source_cache["bounds_max"],
+                target_cache["bounds_min"],
+                target_cache["bounds_max"],
+                _SEAM_OBJECT_BBOX_GAP_TOLERANCE,
+            ):
                 continue
 
-            matched_pairs = _build_vertex_pairs(source_seam_vertices, target_seam_vertices, _SEAM_MATCH_TOLERANCE)
+            matched_pairs = _build_vertex_pairs(
+                source_cache["seam_vertices"],
+                target_cache["seam_vertices"],
+                _SEAM_MATCH_TOLERANCE,
+            )
             if len(matched_pairs) < _SEAM_MIN_VERTEX_PAIRS:
                 continue
 
             candidates = _build_mapping_candidates_from_seams(
-                source_obj,
-                target_obj,
+                source_cache["weight_items_by_vertex"],
+                target_cache["weight_items_by_vertex"],
                 matched_pairs,
                 _SEAM_WEIGHT_TOLERANCE,
             )
             for candidate in candidates:
                 source_group = _parse_numeric_group(candidate["group_a"])
                 target_group = _parse_numeric_group(candidate["group_b"])
-                if source_group is None or target_group is None or source_group == target_group:
+                if source_group is None or target_group is None:
                     continue
-                if signature_by_global.get(source_group) != signature_by_global.get(target_group):
-                    continue
-
-                source_meta = metadata_by_global.get(source_group)
-                target_meta = metadata_by_global.get(target_group)
-                if source_meta is None or target_meta is None:
-                    continue
-
-                canonical_group, canonical_meta, duplicate_group, duplicate_meta = _choose_canonical_bone(
-                    source_group,
-                    source_meta,
-                    target_group,
-                    target_meta,
+                if source_group == target_group:
+                    raise ValueError(
+                        f"Same seam group number {source_group} was found on both {source_name} and {target_name}. "
+                        "Rename vertex groups to a non-overlapping/global numbering first, then rebuild aliases."
+                    )
+                candidate_edges.append(
+                    {
+                        "source_name": source_name,
+                        "source_group": source_group,
+                        "target_name": target_name,
+                        "target_group": target_group,
+                        "vote_count": int(candidate["vote_count"]),
+                        "score": float(candidate["score"]),
+                        "average_distance": float(candidate["average_distance"]),
+                        "average_weight_difference": float(candidate["average_weight_difference"]),
+                    }
                 )
-                alias_key = (duplicate_group, canonical_group)
-                existing_alias = aliases_by_key.get(alias_key)
-                if existing_alias is not None and existing_alias.get("_score", 0.0) >= candidate["score"]:
-                    continue
 
-                aliases_by_key[alias_key] = {
-                    "src_draw_index": duplicate_meta["draw_index"],
-                    "src_object_name": duplicate_meta["object_name"],
-                    "src_ib_hash": duplicate_meta["ib_hash"],
-                    "src_local_bone": duplicate_meta["local_bone"],
-                    "src_global_bone": duplicate_group,
-                    "canonical_draw_index": canonical_meta["draw_index"],
-                    "canonical_object_name": canonical_meta["object_name"],
-                    "canonical_ib_hash": canonical_meta["ib_hash"],
-                    "canonical_local_bone": canonical_meta["local_bone"],
-                    "canonical_global_bone": canonical_group,
-                    "confidence": (
-                        "seam_weight_exact_matrix"
-                        f"|votes={candidate['vote_count']}"
-                        f"|score={candidate['score']:.6f}"
-                        f"|avg_dist={candidate['average_distance']:.6f}"
-                        f"|avg_wdiff={candidate['average_weight_difference']:.6f}"
-                    ),
-                    "_score": candidate["score"],
-                }
-
-    aliases = []
-    for alias in aliases_by_key.values():
-        alias.pop("_score", None)
-        aliases.append(alias)
+    aliases = _build_aliases_from_fast_seam_edges(candidate_edges, metadata_by_object)
     aliases.sort(
         key=lambda item: (
             int(item["canonical_draw_index"]),
@@ -274,18 +289,172 @@ def build_seam_filtered_aliases_from_manifest(context, manifest: dict, target_ob
     return aliases
 
 
-def apply_group_remaps_to_meshes(mesh_objects, manifest: dict) -> RemapApplyResult:
+def _build_object_metadata_index(manifest: dict, mesh_by_name: dict[str, object], identity_by_name: dict[str, tuple[str, int] | None]) -> dict[str, dict]:
+    metadata_by_exact_name: dict[str, dict] = {}
+    metadata_by_identity: dict[tuple[str, int], dict] = {}
+    for part in manifest.get("part_records", []):
+        object_name = str(part.get("object_name", "")).strip()
+        ib_hash = str(part.get("ib_hash", "")).strip().lower()
+        try:
+            match_index_count = int(part.get("match_index_count"))
+        except (TypeError, ValueError):
+            continue
+        metadata = {
+            "draw_index": int(part.get("draw_index", 0)),
+            "object_name": object_name,
+            "ib_hash": ib_hash,
+            "match_index_count": match_index_count,
+        }
+        if object_name:
+            metadata_by_exact_name[object_name] = metadata
+        if ib_hash and match_index_count >= 0:
+            metadata_by_identity[(ib_hash, match_index_count)] = metadata
+
+    metadata_by_object: dict[str, dict] = {}
+    for object_name in mesh_by_name:
+        exact = metadata_by_exact_name.get(object_name)
+        if exact is not None:
+            metadata_by_object[object_name] = exact
+            continue
+        identity = identity_by_name.get(object_name)
+        if identity is None:
+            continue
+        by_identity = metadata_by_identity.get((identity[0].lower(), int(identity[1])))
+        if by_identity is not None:
+            metadata_by_object[object_name] = {
+                **by_identity,
+                "object_name": object_name,
+            }
+    return metadata_by_object
+
+
+def _build_aliases_from_fast_seam_edges(candidate_edges: list[dict], metadata_by_object: dict[str, dict]) -> list[dict]:
+    if not candidate_edges:
+        return []
+
+    parent: dict[tuple[str, int], tuple[str, int]] = {}
+
+    def find(node: tuple[str, int]) -> tuple[str, int]:
+        parent.setdefault(node, node)
+        if parent[node] != node:
+            parent[node] = find(parent[node])
+        return parent[node]
+
+    def union(left: tuple[str, int], right: tuple[str, int]) -> None:
+        root_left = find(left)
+        root_right = find(right)
+        if root_left == root_right:
+            return
+        parent[root_right] = root_left
+
+    edge_by_pair: dict[tuple[tuple[str, int], tuple[str, int]], dict] = {}
+    for edge in candidate_edges:
+        source_node = (str(edge["source_name"]), int(edge["source_group"]))
+        target_node = (str(edge["target_name"]), int(edge["target_group"]))
+        union(source_node, target_node)
+        edge_key = tuple(sorted((source_node, target_node)))
+        existing = edge_by_pair.get(edge_key)
+        if existing is None or float(existing.get("score", 0.0)) < float(edge["score"]):
+            edge_by_pair[edge_key] = edge
+
+    component_nodes: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    for node in list(parent):
+        component_nodes.setdefault(find(node), []).append(node)
+
+    aliases: list[dict] = []
+    for nodes in component_nodes.values():
+        if len(nodes) < 2:
+            continue
+        groups = [group for _object_name, group in nodes]
+        if len(groups) != len(set(groups)):
+            duplicated_groups = sorted({group for group in groups if groups.count(group) > 1})
+            raise ValueError(
+                "The same seam group number appears on multiple matched objects: "
+                + ", ".join(str(group) for group in duplicated_groups[:8])
+                + ". Rename vertex groups to a non-overlapping/global numbering first."
+            )
+
+        objects_in_component: dict[str, list[int]] = {}
+        for object_name, group in nodes:
+            objects_in_component.setdefault(object_name, []).append(group)
+        ambiguous_objects = {
+            object_name: groups_for_object
+            for object_name, groups_for_object in objects_in_component.items()
+            if len(groups_for_object) > 1
+        }
+        if ambiguous_objects:
+            object_name, groups_for_object = next(iter(ambiguous_objects.items()))
+            raise ValueError(
+                f"{object_name}: multiple groups were mapped into one seam component "
+                f"({', '.join(str(group) for group in sorted(groups_for_object))}). "
+                "Clean the seam candidates or split the mesh before fast merge."
+            )
+
+        canonical_node = min(nodes, key=lambda item: (int(item[1]), str(item[0])))
+        canonical_meta = metadata_by_object.get(canonical_node[0], {})
+        for source_node in sorted(nodes, key=lambda item: (int(item[1]), str(item[0]))):
+            if source_node == canonical_node:
+                continue
+            source_meta = metadata_by_object.get(source_node[0], {})
+            supporting_edges = [
+                edge
+                for key, edge in edge_by_pair.items()
+                if source_node in key and canonical_node in key
+            ]
+            if not supporting_edges:
+                supporting_edges = [
+                    edge
+                    for key, edge in edge_by_pair.items()
+                    if source_node in key
+                ]
+            confidence = _format_fast_seam_confidence(supporting_edges)
+            aliases.append(
+                {
+                    "src_draw_index": int(source_meta.get("draw_index", 0)),
+                    "src_object_name": source_node[0],
+                    "src_ib_hash": str(source_meta.get("ib_hash", "")),
+                    "src_local_bone": int(source_node[1]),
+                    "src_global_bone": int(source_node[1]),
+                    "canonical_draw_index": int(canonical_meta.get("draw_index", 0)),
+                    "canonical_object_name": canonical_node[0],
+                    "canonical_ib_hash": str(canonical_meta.get("ib_hash", "")),
+                    "canonical_local_bone": int(canonical_node[1]),
+                    "canonical_global_bone": int(canonical_node[1]),
+                    "confidence": confidence,
+                }
+            )
+    return aliases
+
+
+def _format_fast_seam_confidence(edges: list[dict]) -> str:
+    if not edges:
+        return "fast_seam_weight"
+    vote_count = sum(int(edge.get("vote_count", 0)) for edge in edges)
+    score = sum(float(edge.get("score", 0.0)) for edge in edges)
+    average_distance = sum(float(edge.get("average_distance", 0.0)) for edge in edges) / max(1, len(edges))
+    average_weight_difference = sum(float(edge.get("average_weight_difference", 0.0)) for edge in edges) / max(1, len(edges))
+    return (
+        "fast_seam_weight"
+        f"|votes={vote_count}"
+        f"|score={score:.6f}"
+        f"|avg_dist={average_distance:.6f}"
+        f"|avg_wdiff={average_weight_difference:.6f}"
+    )
+
+
+def apply_group_remaps_to_meshes(mesh_objects, manifest: dict, identity_resolver=None) -> RemapApplyResult:
     remap_index = {}
     for entry in manifest.get("object_remaps", []):
         remap_index[(entry.get("object_name", ""), entry["ib_hash"].lower(), int(entry["match_index_count"]))] = entry
         remap_index[("", entry["ib_hash"].lower(), int(entry["match_index_count"]))] = entry
 
+    resolver = identity_resolver or resolve_mesh_identity
     updated_objects = 0
     renamed_groups = 0
     skipped_objects: list[str] = []
 
     for mesh_obj in mesh_objects:
-        mesh_identity = resolve_mesh_identity(mesh_obj)
+        mesh_identity = resolver(mesh_obj)
         if mesh_identity is None:
             skipped_objects.append(f"{mesh_obj.name}: cannot infer ib_hash/index_count")
             continue
@@ -396,10 +565,11 @@ def _invert_remap_sequence(remap_sequence: tuple[int, ...] | None) -> dict[int, 
     }
 
 
-def merge_duplicate_alias_weights(mesh_objects, alias_entries: list[dict]) -> DuplicateMergeResult:
+def merge_duplicate_alias_weights(mesh_objects, alias_entries: list[dict], identity_resolver=None) -> DuplicateMergeResult:
     updated_objects = 0
     merged_aliases = 0
     skipped_objects: list[str] = []
+    resolver = identity_resolver or resolve_mesh_identity
 
     active_alias_entries = [
         entry
@@ -416,46 +586,67 @@ def merge_duplicate_alias_weights(mesh_objects, alias_entries: list[dict]) -> Du
 
     aliases_by_object: dict[str, list[dict]] = {}
     aliases_by_ib_hash: dict[str, list[dict]] = {}
+    source_objects_by_ib_hash: dict[str, set[str]] = {}
     for alias_entry in active_alias_entries:
         aliases_by_object.setdefault(str(alias_entry.get("src_object_name", "")).strip(), []).append(alias_entry)
         src_ib_hash = str(alias_entry.get("src_ib_hash", "")).strip().lower()
         if src_ib_hash:
             aliases_by_ib_hash.setdefault(src_ib_hash, []).append(alias_entry)
+            source_objects_by_ib_hash.setdefault(src_ib_hash, set()).add(str(alias_entry.get("src_object_name", "")).strip())
 
     for mesh_obj in mesh_objects:
         relevant_alias_entries = aliases_by_object.get(mesh_obj.name, [])
         if not relevant_alias_entries:
-            mesh_identity = resolve_mesh_identity(mesh_obj)
+            mesh_identity = resolver(mesh_obj)
             if mesh_identity is not None:
-                relevant_alias_entries = aliases_by_ib_hash.get(mesh_identity[0].lower(), [])
+                candidate_ib_hash = mesh_identity[0].lower()
+                if len(source_objects_by_ib_hash.get(candidate_ib_hash, set())) == 1:
+                    relevant_alias_entries = aliases_by_ib_hash.get(candidate_ib_hash, [])
         if not relevant_alias_entries:
             skipped_objects.append(f"{mesh_obj.name}: no duplicate alias groups present")
             continue
 
-        relevant_source_group_names = {
-            str(int(alias_entry["src_global_bone"])) for alias_entry in relevant_alias_entries
-        }
-        source_group_entries = _collect_group_member_weights(mesh_obj, relevant_source_group_names)
         groups_by_global_name = _build_global_name_to_vertex_groups(mesh_obj)
-        changed = False
+        planned_renames = []
+        planned_source_names: set[str] = set()
+        planned_canonical_names: set[str] = set()
         for alias_entry in relevant_alias_entries:
             source_group_name = str(int(alias_entry["src_global_bone"]))
             canonical_group_name = str(int(alias_entry["canonical_global_bone"]))
+            if source_group_name == canonical_group_name:
+                continue
+            if source_group_name in planned_source_names:
+                raise ValueError(
+                    f"{mesh_obj.name}: source group {source_group_name} is listed by more than one same-bone alias. "
+                    "Rebuild/clean the alias list before fast merge."
+                )
+            if canonical_group_name in planned_canonical_names:
+                raise ValueError(
+                    f"{mesh_obj.name}: multiple source groups would be renamed to canonical group {canonical_group_name}. "
+                    "Fast merge requires one source -> one canonical per object."
+                )
+
             source_group = _first_group_for_global(groups_by_global_name, source_group_name)
             if source_group is None:
                 continue
+
             canonical_group = _first_group_for_global(groups_by_global_name, canonical_group_name)
-            if canonical_group is None:
-                canonical_group = mesh_obj.vertex_groups.new(name=canonical_group_name)
-                groups_by_global_name.setdefault(canonical_group_name, []).append(canonical_group)
-            moved_vertices = _move_vertex_group_weights(
-                mesh_obj,
-                source_group,
-                canonical_group,
-                source_group_entries.get(source_group_name, ()),
-            )
-            if moved_vertices <= 0:
-                continue
+            if canonical_group is not None:
+                raise ValueError(
+                    f"{mesh_obj.name}: canonical group {canonical_group_name} already exists while "
+                    f"fast-merging source group {source_group_name}. Run global rename before merge and "
+                    "perform same-bone merge before combining different IB meshes into one object."
+                )
+
+            planned_renames.append((source_group, source_group_name, canonical_group_name))
+            planned_source_names.add(source_group_name)
+            planned_canonical_names.add(canonical_group_name)
+
+        changed = False
+        for source_group, source_group_name, canonical_group_name in planned_renames:
+            source_group.name = canonical_group_name
+            if mesh_obj.vertex_groups.get(source_group_name) is None:
+                mesh_obj.vertex_groups.new(name=source_group_name)
             merged_aliases += 1
             changed = True
         if changed:
@@ -499,15 +690,29 @@ def _is_safe_alias_entry(alias_entry: dict) -> bool:
     return True
 
 
-def _build_group_index_to_global_name_map(mesh_obj) -> dict[int, str]:
+def _build_group_index_to_global_name_map(
+    mesh_obj,
+    local_to_global: dict[int, int] | None = None,
+    force_visible_group_names: bool = False,
+) -> dict[int, str]:
     localized_palette = _read_int_sequence_prop(mesh_obj, BMC_EXPORT_PALETTE_PROP)
+    vertex_group_state = mesh_obj.get(BMC_VERTEX_GROUP_STATE_PROP)
+    metadata_remap = _read_int_sequence_prop(mesh_obj, BMC_GLOBAL_REMAP_PROP)
     group_index_to_global_name = {}
     for vertex_group in mesh_obj.vertex_groups:
         numeric_group = _parse_numeric_group(vertex_group.name)
         if numeric_group is None:
             continue
-        if localized_palette is not None and 0 <= numeric_group < len(localized_palette):
+        if force_visible_group_names:
+            global_group = numeric_group
+        elif localized_palette is not None and 0 <= numeric_group < len(localized_palette):
             global_group = int(localized_palette[numeric_group])
+        elif vertex_group_state == BMC_VERTEX_GROUP_STATE_GLOBAL:
+            global_group = numeric_group
+        elif local_to_global is not None and numeric_group in local_to_global:
+            global_group = int(local_to_global[numeric_group])
+        elif metadata_remap is not None and 0 <= numeric_group < len(metadata_remap):
+            global_group = int(metadata_remap[numeric_group])
         else:
             global_group = numeric_group
         if global_group < 0:
@@ -538,9 +743,9 @@ def _infer_group_weighted_center_world(mesh_obj, group_name: str):
     return _infer_group_weighted_centers_world_bulk(mesh_obj, {str(group_name)}).get(str(group_name))
 
 
-def _infer_group_weighted_centers_world_bulk(mesh_obj, group_names: set[str]) -> dict[str, object]:
+def _infer_group_weighted_centers_world_bulk(mesh_obj, group_names: set[str], local_to_global: dict[int, int] | None = None) -> dict[str, object]:
     requested_names = {str(group_name) for group_name in group_names}
-    group_index_to_global_name = _build_group_index_to_global_name_map(mesh_obj)
+    group_index_to_global_name = _build_group_index_to_global_name_map(mesh_obj, local_to_global)
     relevant_group_indices = {
         group_index
         for group_index, global_name in group_index_to_global_name.items()
@@ -581,6 +786,120 @@ def _infer_group_weighted_centers_world_bulk(mesh_obj, group_names: set[str]) ->
             continue
         centers[group_name] = weighted_sums[group_name] / total_weight
     return centers
+
+
+def _get_group_spatial_info(
+    mesh_obj,
+    group_name: int | str,
+    local_to_global: dict[int, int] | None,
+    cache: dict[tuple[str, str], dict | None],
+) -> dict | None:
+    normalized_group_name = str(group_name)
+    cache_key = (mesh_obj.name, normalized_group_name)
+    if cache_key not in cache:
+        cache[cache_key] = _infer_group_spatial_info_world(mesh_obj, normalized_group_name, local_to_global)
+    return cache[cache_key]
+
+
+def _infer_group_spatial_info_world(mesh_obj, group_name: str, local_to_global: dict[int, int] | None = None) -> dict | None:
+    group_index_to_global_name = _build_group_index_to_global_name_map(mesh_obj, local_to_global)
+    relevant_group_indices = {
+        group_index
+        for group_index, global_name in group_index_to_global_name.items()
+        if global_name == str(group_name)
+    }
+    if not relevant_group_indices:
+        return None
+
+    weighted_sum = None
+    total_weight = 0.0
+    vertex_count = 0
+    bounds_min = None
+    bounds_max = None
+
+    for vertex in mesh_obj.data.vertices:
+        vertex_weight = 0.0
+        for group_element in vertex.groups:
+            if int(group_element.group) not in relevant_group_indices:
+                continue
+            vertex_weight += float(group_element.weight)
+        if vertex_weight <= _MAPPING_WEIGHT_FLOOR:
+            continue
+
+        world_position = mesh_obj.matrix_world @ vertex.co
+        weighted_position = world_position * vertex_weight
+        weighted_sum = weighted_position if weighted_sum is None else weighted_sum + weighted_position
+        total_weight += vertex_weight
+        vertex_count += 1
+
+        position_tuple = (float(world_position[0]), float(world_position[1]), float(world_position[2]))
+        if bounds_min is None or bounds_max is None:
+            bounds_min = position_tuple
+            bounds_max = position_tuple
+        else:
+            bounds_min = (
+                min(bounds_min[0], position_tuple[0]),
+                min(bounds_min[1], position_tuple[1]),
+                min(bounds_min[2], position_tuple[2]),
+            )
+            bounds_max = (
+                max(bounds_max[0], position_tuple[0]),
+                max(bounds_max[1], position_tuple[1]),
+                max(bounds_max[2], position_tuple[2]),
+            )
+
+    if weighted_sum is None or total_weight <= 0.0 or bounds_min is None or bounds_max is None:
+        return None
+    return {
+        "center": weighted_sum / total_weight,
+        "bounds_min": bounds_min,
+        "bounds_max": bounds_max,
+        "vertex_count": vertex_count,
+        "total_weight": total_weight,
+    }
+
+
+def _groups_have_compatible_spatial_support(
+    source_obj,
+    source_group: int,
+    source_local_to_global: dict[int, int] | None,
+    target_obj,
+    target_group: int,
+    target_local_to_global: dict[int, int] | None,
+    cache: dict[tuple[str, str], dict | None],
+) -> dict | None:
+    source_info = _get_group_spatial_info(source_obj, source_group, source_local_to_global, cache)
+    target_info = _get_group_spatial_info(target_obj, target_group, target_local_to_global, cache)
+    if source_info is None or target_info is None:
+        return None
+
+    gap_x = _axis_gap(
+        source_info["bounds_min"][0],
+        source_info["bounds_max"][0],
+        target_info["bounds_min"][0],
+        target_info["bounds_max"][0],
+    )
+    gap_y = _axis_gap(
+        source_info["bounds_min"][1],
+        source_info["bounds_max"][1],
+        target_info["bounds_min"][1],
+        target_info["bounds_max"][1],
+    )
+    gap_z = _axis_gap(
+        source_info["bounds_min"][2],
+        source_info["bounds_max"][2],
+        target_info["bounds_min"][2],
+        target_info["bounds_max"][2],
+    )
+    bbox_gap = max(gap_x, gap_y, gap_z)
+    if bbox_gap > _SEAM_GROUP_BBOX_GAP_TOLERANCE:
+        return None
+
+    center_distance = float((source_info["center"] - target_info["center"]).length)
+    return {
+        "bbox_gap": bbox_gap,
+        "center_distance": center_distance,
+    }
 
 
 def _collect_group_member_weights(mesh_obj, group_names: set[str]) -> dict[str, tuple[tuple[int, float], ...]]:
@@ -697,6 +1016,31 @@ def _collect_seam_vertices(obj):
     return vertices
 
 
+def _build_seam_analysis_cache(
+    mesh_obj,
+    local_to_global: dict[int, int] | None = None,
+    force_visible_group_names: bool = False,
+) -> dict | None:
+    seam_vertices = _collect_seam_vertices(mesh_obj)
+    if not seam_vertices:
+        return None
+    group_index_to_global_name = _build_group_index_to_global_name_map(
+        mesh_obj,
+        local_to_global,
+        force_visible_group_names=force_visible_group_names,
+    )
+    return {
+        "seam_vertices": seam_vertices,
+        "bounds_min": _seam_bounds_min(seam_vertices),
+        "bounds_max": _seam_bounds_max(seam_vertices),
+        "weight_items_by_vertex": _build_sorted_vertex_weight_cache(
+            mesh_obj,
+            {vertex_index for vertex_index, _world_co in seam_vertices},
+            group_index_to_global_name,
+        ),
+    }
+
+
 def _resolve_boundary_vertex_indices(obj):
     mesh = obj.data
     edge_face_counts = {}
@@ -711,6 +1055,52 @@ def _resolve_boundary_vertex_indices(obj):
         if edge.is_loose or edge_face_counts.get(edge_key, 0) == 1:
             boundary_indices.update(edge.vertices)
     return boundary_indices
+
+
+def _seam_bounds_min(vertices):
+    first_world_co = vertices[0][1]
+    min_x = max_x = float(first_world_co[0])
+    min_y = max_y = float(first_world_co[1])
+    min_z = max_z = float(first_world_co[2])
+    for _vertex_index, world_co in vertices[1:]:
+        min_x = min(min_x, float(world_co[0]))
+        min_y = min(min_y, float(world_co[1]))
+        min_z = min(min_z, float(world_co[2]))
+        max_x = max(max_x, float(world_co[0]))
+        max_y = max(max_y, float(world_co[1]))
+        max_z = max(max_z, float(world_co[2]))
+    return min_x, min_y, min_z
+
+
+def _seam_bounds_max(vertices):
+    first_world_co = vertices[0][1]
+    max_x = float(first_world_co[0])
+    max_y = float(first_world_co[1])
+    max_z = float(first_world_co[2])
+    for _vertex_index, world_co in vertices[1:]:
+        max_x = max(max_x, float(world_co[0]))
+        max_y = max(max_y, float(world_co[1]))
+        max_z = max(max_z, float(world_co[2]))
+    return max_x, max_y, max_z
+
+
+def _axis_gap(min_a: float, max_a: float, min_b: float, max_b: float) -> float:
+    if max_a < min_b:
+        return min_b - max_a
+    if max_b < min_a:
+        return min_a - max_b
+    return 0.0
+
+
+def _seam_bounds_overlap_with_gap(bounds_min_a, bounds_max_a, bounds_min_b, bounds_max_b, max_gap: float) -> bool:
+    gap_x = _axis_gap(bounds_min_a[0], bounds_max_a[0], bounds_min_b[0], bounds_max_b[0])
+    if gap_x > max_gap:
+        return False
+    gap_y = _axis_gap(bounds_min_a[1], bounds_max_a[1], bounds_min_b[1], bounds_max_b[1])
+    if gap_y > max_gap:
+        return False
+    gap_z = _axis_gap(bounds_min_a[2], bounds_max_a[2], bounds_min_b[2], bounds_max_b[2])
+    return gap_z <= max_gap
 
 
 def _cell_key(world_co, tolerance):
@@ -778,11 +1168,11 @@ def _build_vertex_pairs(source_vertices, target_vertices, tolerance):
     return matched_pairs
 
 
-def _build_mapping_candidates_from_seams(source_obj, target_obj, matched_pairs, weight_tolerance):
+def _build_mapping_candidates_from_seams(source_weight_items_by_vertex, target_weight_items_by_vertex, matched_pairs, weight_tolerance):
     candidate_stats = {}
     for source_index, target_index, pair_distance in matched_pairs:
-        source_items = _sorted_weight_items(_read_vertex_weights(source_obj, source_index))
-        target_items = _sorted_weight_items(_read_vertex_weights(target_obj, target_index))
+        source_items = source_weight_items_by_vertex.get(source_index, ())
+        target_items = target_weight_items_by_vertex.get(target_index, ())
         if not source_items or not target_items:
             continue
         _accumulate_mapping_candidates(candidate_stats, source_items, target_items, weight_tolerance, pair_distance)
@@ -819,9 +1209,18 @@ def _build_mapping_candidates_from_seams(source_obj, target_obj, matched_pairs, 
     return mappings
 
 
-def _read_vertex_weights(obj, vertex_index):
+def _build_sorted_vertex_weight_cache(mesh_obj, vertex_indices: set[int], group_index_to_global_name: dict[int, str]) -> dict[int, tuple[tuple[str, float], ...]]:
+    cached_weight_items: dict[int, tuple[tuple[str, float], ...]] = {}
+    for vertex_index in vertex_indices:
+        cached_weight_items[int(vertex_index)] = _sorted_weight_items(
+            _read_vertex_weights(mesh_obj, int(vertex_index), group_index_to_global_name)
+        )
+    return cached_weight_items
+
+
+def _read_vertex_weights(obj, vertex_index, group_index_to_global_name: dict[int, str] | None = None):
     weight_map = {}
-    group_index_to_global_name = _build_group_index_to_global_name_map(obj)
+    group_index_to_global_name = group_index_to_global_name or _build_group_index_to_global_name_map(obj)
     vertex = obj.data.vertices[vertex_index]
     for assignment in vertex.groups:
         group_name = group_index_to_global_name.get(int(assignment.group))

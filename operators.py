@@ -10,20 +10,26 @@ from bpy.app.handlers import persistent
 
 from .constants import BI4_MAX_BONE_COUNT
 from .core.blender_ops import (
+    apply_group_remaps_to_meshes,
     annotate_alias_items_with_mesh_proximity,
     build_seam_filtered_aliases_from_manifest,
     infer_local_bone_count_from_mesh,
+    merge_duplicate_alias_weights,
     resolve_mesh_identity,
+)
+from .core.mapping_payload import (
+    apply_mapping_payload_to_scene,
+    build_mapping_payload,
+    load_mapping_payload_from_scene,
+    serialize_alias_items,
+    store_mapping_payload_on_scene,
 )
 from .core.presets import delete_preset, load_preset, save_preset
 from .core.export_prepare import prepare_export_collection
-from .core.frameanalysis import detect_last_shadow_host
+from .core.frameanalysis import detect_last_shadow_host, infer_mesh_identity_from_name
 from .core.shadow_split import generate_shadow_split
-from .core.workflow import (
-    apply_vertex_group_remap_for_target_names,
-    merge_duplicate_bone_weights_for_target_names,
-    scan_targets_and_generate_outputs,
-)
+from .core.seam_matcher import apply_seam_mapping, build_seam_mapping
+from .core.workflow import scan_targets_and_generate_outputs
 from .core.models import TargetObjectSpec
 
 DEFAULT_TARGET_COLLECTION_NAME = "BMC Bone Palette Targets"
@@ -399,26 +405,20 @@ def _enabled_target_names(scene) -> list[str]:
     return target_names
 
 
+def _enabled_target_mesh_objects(scene) -> list[object]:
+    mesh_objects: list[object] = []
+    for item in scene.bmc_target_items:
+        if not item.enabled:
+            continue
+        mesh_obj = _resolve_target_item_object(scene, item)
+        if mesh_obj is None or mesh_obj.type != "MESH":
+            continue
+        mesh_objects.append(mesh_obj)
+    return mesh_objects
+
+
 def _enabled_alias_payload(scene) -> list[dict]:
-    payload = []
-    for item in scene.bmc_alias_items:
-        payload.append(
-            {
-                "enabled": bool(item.enabled),
-                "src_draw_index": int(item.src_draw_index),
-                "src_object_name": item.src_object_name,
-                "src_ib_hash": item.src_ib_hash.lower(),
-                "src_local_bone": int(item.src_local_bone),
-                "src_global_bone": int(item.src_global_bone),
-                "canonical_draw_index": int(item.canonical_draw_index),
-                "canonical_object_name": item.canonical_object_name,
-                "canonical_ib_hash": item.canonical_ib_hash.lower(),
-                "canonical_local_bone": int(item.canonical_local_bone),
-                "canonical_global_bone": int(item.canonical_global_bone),
-                "confidence": item.confidence,
-            }
-        )
-    return payload
+    return serialize_alias_items(scene)
 
 
 def _replace_alias_items_from_manifest(scene, manifest: dict):
@@ -460,95 +460,259 @@ def _analyze_same_bone_aliases(context, manifest_path: str, target_object_names:
     return len(context.scene.bmc_alias_items)
 
 
-def _serialize_scene_preset(scene) -> dict:
-    return {
-        "merge_same_bone_groups": bool(scene.bmc_merge_same_bone_groups),
-        "workspace": {
-            "frameanalysis_dir": str(scene.bmc_frameanalysis_dir or ""),
-            "output_dir": str(scene.bmc_output_dir or ""),
-            "source_ini_path": str(scene.bmc_source_ini_path or ""),
-            "target_collection_name": scene.bmc_target_collection.name if scene.bmc_target_collection else "",
-            "export_collection_name": scene.bmc_export_collection.name if scene.bmc_export_collection else "",
-            "export_build_collection_name": scene.bmc_export_build_collection.name if scene.bmc_export_build_collection else "",
-        },
-        "targets": [
-            {
-                "object_name": (item.object_ref.name if getattr(item, "object_ref", None) else item.object_name),
-                "ib_hash": item.ib_hash,
-                "match_index_count": int(item.match_index_count),
-                "local_bone_count": int(getattr(item, "local_bone_count", 0)),
-                "autodetected": bool(item.autodetected),
-                "enabled": bool(item.enabled),
-            }
-            for item in scene.bmc_target_items
-        ],
-        "aliases": _enabled_alias_payload(scene),
+def _read_manifest_payload(manifest_path: str) -> dict:
+    normalized_manifest_path = bpy.path.abspath(str(manifest_path or ""))
+    if not normalized_manifest_path or not os.path.exists(normalized_manifest_path):
+        return {}
+    with open(normalized_manifest_path, "r", encoding="utf-8") as file_handle:
+        return json.load(file_handle)
+
+
+def _update_scene_mapping_payload(scene, manifest_path: str | None = None) -> dict:
+    manifest_payload = _read_manifest_payload(manifest_path or scene.bmc_manifest_path)
+    base_payload = load_mapping_payload_from_scene(scene)
+    payload = build_mapping_payload(scene, manifest_payload=manifest_payload, base_payload=base_payload)
+    store_mapping_payload_on_scene(scene, payload)
+    return payload
+
+
+def _resolve_active_mapping_payload(scene) -> dict:
+    payload = load_mapping_payload_from_scene(scene)
+    if payload.get("object_remaps"):
+        return payload
+    payload = _update_scene_mapping_payload(scene)
+    if payload.get("object_remaps"):
+        return payload
+    raise ValueError("No mapping payload is loaded. Run Scan first or load a Mapping Preset.")
+
+
+def _selected_mesh_objects(context) -> list[object]:
+    return [mesh_obj for mesh_obj in context.selected_objects if mesh_obj.type == "MESH"]
+
+
+def _resolve_seam_item_object(scene, item):
+    mesh_obj = getattr(item, "object_ref", None)
+    if mesh_obj is not None and mesh_obj.type == "MESH":
+        return mesh_obj
+    object_name = str(getattr(item, "object_name", "") or "")
+    if not object_name:
+        return None
+    mesh_obj = scene.objects.get(object_name)
+    if mesh_obj is None or mesh_obj.type != "MESH":
+        return None
+    item.object_ref = mesh_obj
+    return mesh_obj
+
+
+def _enabled_seam_mesh_objects(scene, sync_names: bool = False) -> list[object]:
+    mesh_objects = []
+    seen_names: set[str] = set()
+    for item in scene.bmc_seam_match_items:
+        if not item.enabled:
+            continue
+        mesh_obj = _resolve_seam_item_object(scene, item)
+        if mesh_obj is None or mesh_obj.name in seen_names:
+            continue
+        if sync_names:
+            item.object_name = mesh_obj.name
+        mesh_objects.append(mesh_obj)
+        seen_names.add(mesh_obj.name)
+    return mesh_objects
+
+
+def _replace_seam_alias_items(scene, build_result) -> None:
+    scene.bmc_seam_alias_items.clear()
+    for alias in build_result.aliases:
+        item = scene.bmc_seam_alias_items.add()
+        item.enabled = True
+        item.src_object_name = alias.src_object_name
+        item.src_group = int(alias.src_group)
+        item.dst_object_name = alias.dst_object_name
+        item.dst_group = int(alias.dst_group)
+        item.votes = int(alias.votes)
+        item.score = float(alias.score)
+        item.average_distance = float(alias.average_distance)
+        item.average_weight_difference = float(alias.average_weight_difference)
+    scene.bmc_seam_alias_index = min(scene.bmc_seam_alias_index, max(0, len(scene.bmc_seam_alias_items) - 1))
+    scene.bmc_seam_pair_summary = "\n".join(build_result.pair_summaries)
+
+
+def _seam_alias_payload(scene) -> list[dict]:
+    return [
+        {
+            "enabled": bool(item.enabled),
+            "src_object_name": str(item.src_object_name),
+            "src_group": int(item.src_group),
+            "dst_object_name": str(item.dst_object_name),
+            "dst_group": int(item.dst_group),
+            "votes": int(item.votes),
+            "score": float(item.score),
+            "average_distance": float(item.average_distance),
+            "average_weight_difference": float(item.average_weight_difference),
+        }
+        for item in scene.bmc_seam_alias_items
+    ]
+
+
+def _mesh_identity_from_name(mesh_obj) -> tuple[str, int] | None:
+    inferred = infer_mesh_identity_from_name(mesh_obj.name)
+    if inferred is None:
+        return None
+    return inferred[0].lower(), int(inferred[1])
+
+
+def _choose_identity_remap_entry(remap_entries: list[dict], mesh_name: str) -> dict | None:
+    if not remap_entries:
+        return None
+    exact_matches = [entry for entry in remap_entries if str(entry.get("object_name", "")) == str(mesh_name)]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(remap_entries) == 1:
+        return remap_entries[0]
+    return None
+
+
+def _select_object_remap_entries_for_meshes(mesh_objects: list[object], payload: dict) -> tuple[list[object], list[dict], list[str]]:
+    entries_by_identity: dict[tuple[str, int], list[dict]] = {}
+    for entry in payload.get("object_remaps", []):
+        key = (str(entry.get("ib_hash", "")).lower(), int(entry.get("match_index_count", -1)))
+        entries_by_identity.setdefault(key, []).append(entry)
+
+    matched_meshes: list[object] = []
+    selected_entries: list[dict] = []
+    skipped_messages: list[str] = []
+
+    for mesh_obj in mesh_objects:
+        identity = _mesh_identity_from_name(mesh_obj)
+        if identity is None:
+            skipped_messages.append(f"{mesh_obj.name}: object name does not contain hash-count")
+            continue
+        remap_entries = entries_by_identity.get(identity, [])
+        if not remap_entries:
+            skipped_messages.append(f"{mesh_obj.name}: no mapping entry for {identity[0]}-{identity[1]}")
+            continue
+        chosen_entry = _choose_identity_remap_entry(remap_entries, mesh_obj.name)
+        if chosen_entry is None:
+            skipped_messages.append(f"{mesh_obj.name}: multiple mapping entries exist for {identity[0]}-{identity[1]}")
+            continue
+        matched_meshes.append(mesh_obj)
+        selected_entries.append(chosen_entry)
+
+    return matched_meshes, selected_entries, skipped_messages
+
+
+def _select_object_remap_entries_for_targets(scene, payload: dict) -> tuple[list[object], list[dict], list[str]]:
+    entries_by_identity: dict[tuple[str, int], list[dict]] = {}
+    for entry in payload.get("object_remaps", []):
+        key = (str(entry.get("ib_hash", "")).lower(), int(entry.get("match_index_count", -1)))
+        entries_by_identity.setdefault(key, []).append(entry)
+
+    matched_meshes: list[object] = []
+    selected_entries: list[dict] = []
+    skipped_messages: list[str] = []
+
+    for item in scene.bmc_target_items:
+        if not item.enabled:
+            continue
+        mesh_obj = _resolve_target_item_object(scene, item)
+        if mesh_obj is None or mesh_obj.type != "MESH":
+            skipped_messages.append(f"{item.object_name}: target mesh object not found in scene")
+            continue
+
+        identity = (str(item.ib_hash or "").lower(), int(item.match_index_count))
+        if not identity[0] or identity[1] < 0:
+            skipped_messages.append(f"{mesh_obj.name}: frozen target identity is incomplete")
+            continue
+
+        remap_entries = entries_by_identity.get(identity, [])
+        if not remap_entries:
+            skipped_messages.append(f"{mesh_obj.name}: no mapping entry for {identity[0]}-{identity[1]}")
+            continue
+        chosen_entry = _choose_identity_remap_entry(remap_entries, mesh_obj.name)
+        if chosen_entry is None:
+            skipped_messages.append(f"{mesh_obj.name}: multiple mapping entries exist for {identity[0]}-{identity[1]}")
+            continue
+        matched_meshes.append(mesh_obj)
+        selected_entries.append(chosen_entry)
+
+    return matched_meshes, selected_entries, skipped_messages
+
+
+def _identity_resolver_from_entries(mesh_objects: list[object], selected_entries: list[dict]):
+    identity_by_name = {
+        mesh_obj.name: (str(entry.get("ib_hash", "")).lower(), int(entry.get("match_index_count", -1)))
+        for mesh_obj, entry in zip(mesh_objects, selected_entries)
     }
 
+    def _resolver(mesh_obj):
+        identity = identity_by_name.get(mesh_obj.name)
+        if identity is not None and identity[0] and identity[1] >= 0:
+            return identity
+        return resolve_mesh_identity(mesh_obj)
 
-def _apply_loaded_preset(scene, payload: dict):
-    scene.bmc_merge_same_bone_groups = bool(payload.get("merge_same_bone_groups", False))
-    workspace = payload.get("workspace", {})
-    if isinstance(workspace, dict):
-        scene.bmc_frameanalysis_dir = str(workspace.get("frameanalysis_dir", scene.bmc_frameanalysis_dir or ""))
-        scene.bmc_output_dir = str(workspace.get("output_dir", scene.bmc_output_dir or ""))
-        scene.bmc_manifest_path = ""
-        scene.bmc_ini_path = ""
-        scene.bmc_export_manifest_path = ""
-        scene.bmc_source_ini_path = str(workspace.get("source_ini_path", scene.bmc_source_ini_path or ""))
-        scene.bmc_shadow_host_hash = ""
-        scene.bmc_shadow_host_match_index_count = -1
-        scene.bmc_shadow_host_vs_hash = ""
+    return _resolver
 
-        target_collection_name = str(workspace.get("target_collection_name", "") or "").strip()
-        if target_collection_name:
-            target_collection = bpy.data.collections.get(target_collection_name)
-            if target_collection is not None:
-                scene.bmc_target_collection = target_collection
 
-        export_collection_name = str(workspace.get("export_collection_name", "") or "").strip()
-        if export_collection_name:
-            export_collection = bpy.data.collections.get(export_collection_name)
-            if export_collection is not None:
-                scene.bmc_export_collection = export_collection
+def _identity_resolver_from_targets(scene):
+    identity_by_name: dict[str, tuple[str, int]] = {}
+    for item in scene.bmc_target_items:
+        if not item.enabled:
+            continue
+        mesh_obj = _resolve_target_item_object(scene, item)
+        if mesh_obj is None:
+            continue
+        ib_hash = str(item.ib_hash or "").lower()
+        match_index_count = int(item.match_index_count)
+        if ib_hash and match_index_count >= 0:
+            identity_by_name[mesh_obj.name] = (ib_hash, match_index_count)
 
-        export_build_collection_name = str(workspace.get("export_build_collection_name", "") or "").strip()
-        if export_build_collection_name:
-            export_build_collection = bpy.data.collections.get(export_build_collection_name)
-            if export_build_collection is not None:
-                scene.bmc_export_build_collection = export_build_collection
+    def _resolver(mesh_obj):
+        identity = identity_by_name.get(mesh_obj.name)
+        if identity is not None:
+            return identity
+        return resolve_mesh_identity(mesh_obj)
 
-    scene.bmc_target_items.clear()
-    for target in payload.get("targets", []):
-        item = scene.bmc_target_items.add()
-        item.object_name = str(target.get("object_name", ""))
-        item.ib_hash = str(target.get("ib_hash", ""))
-        item.match_index_count = int(target.get("match_index_count", 0))
-        item.local_bone_count = int(target.get("local_bone_count", 0))
-        item.autodetected = bool(target.get("autodetected", False))
-        item.enabled = bool(target.get("enabled", True))
-        mesh_obj = scene.objects.get(item.object_name)
-        if mesh_obj is not None and mesh_obj.type == "MESH":
-            item.object_ref = mesh_obj
-            item.object_name = mesh_obj.name
-    scene.bmc_target_index = min(scene.bmc_target_index, max(0, len(scene.bmc_target_items) - 1))
+    return _resolver
 
-    scene.bmc_alias_items.clear()
-    for alias in payload.get("aliases", []):
-        item = scene.bmc_alias_items.add()
-        item.enabled = bool(alias.get("enabled", True))
-        item.src_draw_index = int(alias.get("src_draw_index", 0))
-        item.src_object_name = str(alias.get("src_object_name", ""))
-        item.src_ib_hash = str(alias.get("src_ib_hash", ""))
-        item.src_local_bone = int(alias.get("src_local_bone", 0))
-        item.src_global_bone = int(alias.get("src_global_bone", 0))
-        item.canonical_draw_index = int(alias.get("canonical_draw_index", 0))
-        item.canonical_object_name = str(alias.get("canonical_object_name", ""))
-        item.canonical_ib_hash = str(alias.get("canonical_ib_hash", ""))
-        item.canonical_local_bone = int(alias.get("canonical_local_bone", 0))
-        item.canonical_global_bone = int(alias.get("canonical_global_bone", 0))
-        item.confidence = str(alias.get("confidence", ""))
-    scene.bmc_alias_index = min(scene.bmc_alias_index, max(0, len(scene.bmc_alias_items) - 1))
+
+def _skipped_name_set(messages: tuple[str, ...] | list[str]) -> set[str]:
+    skipped_names: set[str] = set()
+    for message in messages:
+        if ":" not in message:
+            continue
+        skipped_names.add(message.split(":", 1)[0].strip())
+    return skipped_names
+
+
+def _apply_mapping_bundle(
+    mesh_objects: list[object],
+    selected_entries: list[dict],
+    alias_entries: list[dict],
+    identity_resolver,
+    merge_same_bone_groups: bool,
+):
+    remap_result = apply_group_remaps_to_meshes(
+        mesh_objects,
+        {"object_remaps": selected_entries},
+        identity_resolver=identity_resolver,
+    )
+    merged_aliases = 0
+    merge_messages: list[str] = []
+    if merge_same_bone_groups and alias_entries:
+        merge_meshes = [
+            mesh_obj
+            for mesh_obj in mesh_objects
+            if mesh_obj.name not in _skipped_name_set(remap_result.skipped_objects)
+        ]
+        if merge_meshes:
+            merge_result = merge_duplicate_alias_weights(
+                merge_meshes,
+                alias_entries,
+                identity_resolver=identity_resolver,
+            )
+            merged_aliases = int(merge_result.merged_aliases)
+            merge_messages.extend(list(merge_result.skipped_objects))
+    return remap_result, merged_aliases, merge_messages
 
 
 class BMC_OT_add_selected_targets(bpy.types.Operator):
@@ -744,7 +908,7 @@ class BMC_OT_add_selected_export_objects(bpy.types.Operator):
 class BMC_OT_prepare_export_collection(bpy.types.Operator):
     bl_idname = "object.bmc_prepare_export_collection"
     bl_label = "Prepare Export / Palette"
-    bl_description = "Localize export chunk vertex groups in place and write Palette.buf files"
+    bl_description = "Rebuild Export Build from Export Source, localize only the build copies, and write Palette.buf / export_manifest.json"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -754,7 +918,6 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         try:
-            _refresh_target_items(scene)
             source_collection = _ensure_export_collection(context)
             build_collection = _ensure_export_build_collection(context)
             result = prepare_export_collection(
@@ -781,8 +944,8 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
 
 class BMC_OT_generate_shadow_split(bpy.types.Operator):
     bl_idname = "object.bmc_generate_shadow_split"
-    bl_label = "Generate Shadow Split"
-    bl_description = "Rewrite the source mod INI so vs==200 shadow draws move to the last shadow host and consume BoneStore local palettes"
+    bl_label = "Modify Main INI"
+    bl_description = "Rewrite the source mod INI so vs==200 shadow draws move to the last shadow host and consume the latest exported BoneStore local palettes"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -861,10 +1024,138 @@ class BMC_OT_clear_targets(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BMC_OT_seam_add_selected_objects(bpy.types.Operator):
+    bl_idname = "object.bmc_seam_add_selected_objects"
+    bl_label = "Add Selected Seam Objects"
+    bl_description = "Add selected mesh objects to the independent seam matcher list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return any(obj.type == "MESH" for obj in context.selected_objects)
+
+    def execute(self, context):
+        scene = context.scene
+        existing_names = {
+            (item.object_ref.name if getattr(item, "object_ref", None) else item.object_name)
+            for item in scene.bmc_seam_match_items
+            if item.object_name or getattr(item, "object_ref", None)
+        }
+        added_count = 0
+        for mesh_obj in context.selected_objects:
+            if mesh_obj.type != "MESH" or mesh_obj.name in existing_names:
+                continue
+            item = scene.bmc_seam_match_items.add()
+            item.enabled = True
+            item.object_name = mesh_obj.name
+            item.object_ref = mesh_obj
+            existing_names.add(mesh_obj.name)
+            added_count += 1
+        if added_count:
+            scene.bmc_seam_match_index = len(scene.bmc_seam_match_items) - 1
+            self.report({"INFO"}, f"Added {added_count} seam matcher object(s)")
+        else:
+            self.report({"WARNING"}, "No new mesh objects were added")
+        return {"FINISHED"}
+
+
+class BMC_OT_seam_remove_object(bpy.types.Operator):
+    bl_idname = "object.bmc_seam_remove_object"
+    bl_label = "Remove Seam Object"
+    bl_description = "Remove the active object from the independent seam matcher list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_seam_match_items)
+
+    def execute(self, context):
+        scene = context.scene
+        scene.bmc_seam_match_items.remove(scene.bmc_seam_match_index)
+        scene.bmc_seam_match_index = min(scene.bmc_seam_match_index, max(0, len(scene.bmc_seam_match_items) - 1))
+        return {"FINISHED"}
+
+
+class BMC_OT_seam_clear_objects(bpy.types.Operator):
+    bl_idname = "object.bmc_seam_clear_objects"
+    bl_label = "Clear Seam Objects"
+    bl_description = "Clear seam matcher objects and mappings"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_seam_match_items)
+
+    def execute(self, context):
+        scene = context.scene
+        scene.bmc_seam_match_items.clear()
+        scene.bmc_seam_match_index = 0
+        scene.bmc_seam_alias_items.clear()
+        scene.bmc_seam_alias_index = 0
+        scene.bmc_seam_pair_summary = ""
+        return {"FINISHED"}
+
+
+class BMC_OT_seam_build_mapping(bpy.types.Operator):
+    bl_idname = "object.bmc_seam_build_mapping"
+    bl_label = "Build Seam Mapping"
+    bl_description = "Build a seam-only vertex-group rename map from the independent object list"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and len(_enabled_seam_mesh_objects(context.scene, sync_names=False)) >= 2)
+
+    def execute(self, context):
+        scene = context.scene
+        mesh_objects = _enabled_seam_mesh_objects(scene, sync_names=True)
+        try:
+            result = build_seam_mapping(mesh_objects)
+            _replace_seam_alias_items(scene, result)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Build seam mapping failed: {exc}")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Built {len(result.aliases)} seam mapping(s); tested {result.matched_pairs + result.skipped_pairs} pair(s)",
+        )
+        return {"FINISHED"}
+
+
+class BMC_OT_seam_apply_mapping(bpy.types.Operator):
+    bl_idname = "object.bmc_seam_apply_mapping"
+    bl_label = "Apply Seam Mapping"
+    bl_description = "Apply the current seam mapping by renaming source vertex groups to canonical groups"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_seam_alias_items)
+
+    def execute(self, context):
+        scene = context.scene
+        mesh_objects = _enabled_seam_mesh_objects(scene, sync_names=True)
+        if not mesh_objects:
+            self.report({"ERROR"}, "No enabled seam matcher objects found")
+            return {"CANCELLED"}
+        try:
+            result = apply_seam_mapping(mesh_objects, _seam_alias_payload(scene))
+        except Exception as exc:
+            self.report({"ERROR"}, f"Apply seam mapping failed: {exc}")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Applied seam mapping to {result.updated_objects} object(s); renamed {result.renamed_groups} group(s)",
+        )
+        if result.skipped_messages:
+            self.report({"WARNING"}, " | ".join(result.skipped_messages[:3]))
+        return {"FINISHED"}
+
+
 class BMC_OT_scan_targets(bpy.types.Operator):
     bl_idname = "object.bmc_scan_targets"
-    bl_label = "Scan and Generate"
-    bl_description = "Scan the chosen FrameAnalysis directory for the listed objects and generate capture_manifest.json plus BoneStore.ini"
+    bl_label = "Scan / Freeze Mapping"
+    bl_description = "Scan the chosen FrameAnalysis directory for the frozen target list and generate capture_manifest.json plus BoneStore.ini without modifying source meshes"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -881,6 +1172,11 @@ class BMC_OT_scan_targets(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
+        alias_count = 0
+        auto_apply_warning = ""
+        auto_apply_updated = 0
+        auto_apply_renamed = 0
+        auto_apply_merged = 0
         try:
             target_specs = _enabled_target_specs(context)
             result = scan_targets_and_generate_outputs(
@@ -896,6 +1192,9 @@ class BMC_OT_scan_targets(bpy.types.Operator):
         scene.bmc_manifest_path = result.manifest_path
         scene.bmc_ini_path = result.ini_path
         shadow_host_warning = ""
+        scene.bmc_shadow_host_hash = ""
+        scene.bmc_shadow_host_match_index_count = -1
+        scene.bmc_shadow_host_vs_hash = ""
         try:
             shadow_host = detect_last_shadow_host(scene.bmc_frameanalysis_dir)
             scene.bmc_shadow_host_hash = shadow_host.ib_hash
@@ -904,26 +1203,97 @@ class BMC_OT_scan_targets(bpy.types.Operator):
         except Exception as exc:
             shadow_host_warning = f"Last shadow host detection failed: {exc}"
 
+        alias_warning = ""
         scene.bmc_alias_items.clear()
+        if not scene.bmc_scan_auto_apply_mapping:
+            scene.bmc_mapping_payload_json = ""
+
+        _update_scene_mapping_payload(scene, result.manifest_path)
+        if scene.bmc_scan_auto_apply_mapping:
+            try:
+                payload = _resolve_active_mapping_payload(scene)
+                matched_meshes, selected_entries, skipped_before_apply = _select_object_remap_entries_for_targets(
+                    scene,
+                    payload,
+                )
+                if matched_meshes:
+                    identity_resolver = _identity_resolver_from_entries(matched_meshes, selected_entries)
+                    remap_result = apply_group_remaps_to_meshes(
+                        matched_meshes,
+                        {"object_remaps": selected_entries},
+                        identity_resolver=identity_resolver,
+                    )
+                    auto_apply_updated = int(remap_result.updated_objects)
+                    auto_apply_renamed = int(remap_result.renamed_groups)
+                    merge_messages: list[str] = []
+                    remapped_meshes = [
+                        mesh_obj
+                        for mesh_obj in matched_meshes
+                        if mesh_obj.name not in _skipped_name_set(remap_result.skipped_objects)
+                    ]
+                    if remapped_meshes:
+                        try:
+                            alias_count = _analyze_same_bone_aliases(
+                                context,
+                                result.manifest_path,
+                                _enabled_target_names(scene),
+                            )
+                            _update_scene_mapping_payload(scene, result.manifest_path)
+                            alias_payload = _enabled_alias_payload(scene) or list(
+                                _resolve_active_mapping_payload(scene).get("bone_aliases", [])
+                            )
+                            if alias_payload:
+                                merge_result = merge_duplicate_alias_weights(
+                                    remapped_meshes,
+                                    alias_payload,
+                                    identity_resolver=identity_resolver,
+                                )
+                                auto_apply_merged = int(merge_result.merged_aliases)
+                                merge_messages.extend(list(merge_result.skipped_objects))
+                        except Exception as exc:
+                            scene.bmc_alias_items.clear()
+                            alias_warning = f"Same-bone alias analysis failed after global rename: {exc}"
+                    combined_messages = list(skipped_before_apply) + list(remap_result.skipped_objects) + list(merge_messages)
+                    if combined_messages:
+                        auto_apply_warning = " | ".join(combined_messages[:3])
+                elif skipped_before_apply:
+                    auto_apply_warning = " | ".join(skipped_before_apply[:3])
+            except Exception as exc:
+                auto_apply_warning = f"Auto apply after Scan failed: {exc}"
+
         info_message = f"Scanned {result.scanned_parts} parts; total global bones {result.total_global_bones}"
+        if scene.bmc_scan_auto_apply_mapping:
+            info_message += (
+                f"; auto remap {auto_apply_updated}"
+                f"; renamed {auto_apply_renamed}"
+                f"; merged {auto_apply_merged}"
+                f"; aliases {alias_count}"
+            )
         if scene.bmc_shadow_host_hash:
             info_message += (
                 f"; shadow host {scene.bmc_shadow_host_hash}-{scene.bmc_shadow_host_match_index_count}"
                 f" vs={scene.bmc_shadow_host_vs_hash or '?'}"
             )
-        info_message += "; source meshes unchanged"
+        if scene.bmc_scan_auto_apply_mapping:
+            info_message += "; target meshes auto-updated"
+        else:
+            info_message += "; source meshes unchanged"
         self.report({"INFO"}, info_message)
         if result.warnings:
             self.report({"WARNING"}, " | ".join(result.warnings[:3]))
         if shadow_host_warning:
             self.report({"WARNING"}, shadow_host_warning)
+        if alias_warning:
+            self.report({"WARNING"}, alias_warning)
+        if auto_apply_warning:
+            self.report({"WARNING"}, auto_apply_warning)
         return {"FINISHED"}
 
 
 class BMC_OT_analyze_duplicate_bones(bpy.types.Operator):
     bl_idname = "object.bmc_analyze_duplicate_bones"
-    bl_label = "Analyze Same-Bone Groups"
-    bl_description = "Build seam-filtered same-bone recommendations from the current manifest and target meshes"
+    bl_label = "Rebuild Same-Bone Aliases"
+    bl_description = "Rebuild seam-filtered same-bone recommendations from the current manifest and frozen target meshes"
     bl_options = {"REGISTER"}
 
     @classmethod
@@ -943,58 +1313,82 @@ class BMC_OT_analyze_duplicate_bones(bpy.types.Operator):
             self.report({"ERROR"}, f"Same-bone analysis failed: {exc}")
             return {"CANCELLED"}
 
+        _update_scene_mapping_payload(scene, scene.bmc_manifest_path)
         self.report({"INFO"}, f"Found {alias_count} same-bone alias candidate(s)")
         return {"FINISHED"}
 
 
 class BMC_OT_apply_vertex_group_remap(bpy.types.Operator):
     bl_idname = "object.bmc_apply_vertex_group_remap"
-    bl_label = "Apply Vertex Group Remap"
-    bl_description = "Rename listed target mesh vertex groups from local indices to the generated global bone indices"
+    bl_label = "Rename Target Vertex Groups"
+    bl_description = "Rename enabled Target objects' local vertex groups to global bone indices using the frozen mapping"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        scene = context.scene
-        return bool(scene and scene.bmc_manifest_path and _enabled_target_names(scene))
+        return bool(context.scene and _enabled_target_names(context.scene))
 
     def execute(self, context):
         try:
-            result = apply_vertex_group_remap_for_target_names(
-                context=context,
-                manifest_path=context.scene.bmc_manifest_path,
-                target_object_names=_enabled_target_names(context.scene),
+            payload = _resolve_active_mapping_payload(context.scene)
+            matched_meshes, selected_entries, skipped_before_apply = _select_object_remap_entries_for_targets(
+                context.scene,
+                payload,
+            )
+            if not matched_meshes:
+                raise ValueError("No enabled Target objects matched any object_remap entry in the loaded mapping payload")
+            result, _merged_aliases, _merge_warning_messages = _apply_mapping_bundle(
+                matched_meshes,
+                selected_entries,
+                [],
+                identity_resolver=_identity_resolver_from_entries(matched_meshes, selected_entries),
+                merge_same_bone_groups=False,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Remap failed: {exc}")
             return {"CANCELLED"}
 
+        skipped_after_apply = list(result.skipped_objects)
+        skipped_after_apply.extend(skipped_before_apply)
+
         self.report(
             {"INFO"},
-            f"Remapped {result.updated_objects}/{result.target_objects} listed meshes; renamed {result.renamed_groups} groups",
+            f"Renamed {result.updated_objects}/{len(matched_meshes)} target meshes; renamed {result.renamed_groups} groups",
         )
-        if result.skipped_objects:
-            self.report({"WARNING"}, " | ".join(result.skipped_objects[:3]))
+        if skipped_after_apply:
+            self.report({"WARNING"}, " | ".join(skipped_after_apply[:3]))
         return {"FINISHED"}
 
 
 class BMC_OT_merge_duplicate_bones(bpy.types.Operator):
     bl_idname = "object.bmc_merge_duplicate_bones"
-    bl_label = "Merge Duplicate Bones"
-    bl_description = "Merge duplicate seam/alias bone weights for the listed target meshes using the configured alias list"
+    bl_label = "Fast Merge Same-Bone Groups"
+    bl_description = "Fast-merge same-bone groups on enabled Target objects by renaming source groups to canonical groups and leaving empty placeholders"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        scene = context.scene
-        return bool(scene and _enabled_target_names(scene))
+        return bool(context.scene and _enabled_target_names(context.scene))
 
     def execute(self, context):
+        target_meshes = _enabled_target_mesh_objects(context.scene)
+        if not target_meshes:
+            self.report({"ERROR"}, "No enabled Target mesh objects found")
+            return {"CANCELLED"}
         try:
-            result = merge_duplicate_bone_weights_for_target_names(
-                context=context,
-                target_object_names=_enabled_target_names(context.scene),
-                alias_entries=_enabled_alias_payload(context.scene),
+            rebuilt_alias_count = None
+            if context.scene.bmc_manifest_path:
+                rebuilt_alias_count = _analyze_same_bone_aliases(
+                    context,
+                    context.scene.bmc_manifest_path,
+                    _enabled_target_names(context.scene),
+                )
+                _update_scene_mapping_payload(context.scene, context.scene.bmc_manifest_path)
+            payload = _resolve_active_mapping_payload(context.scene)
+            result = merge_duplicate_alias_weights(
+                target_meshes,
+                _enabled_alias_payload(context.scene) or list(payload.get("bone_aliases", [])),
+                identity_resolver=_identity_resolver_from_targets(context.scene),
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Duplicate merge failed: {exc}")
@@ -1002,7 +1396,11 @@ class BMC_OT_merge_duplicate_bones(bpy.types.Operator):
 
         self.report(
             {"INFO"},
-            f"Merged {result.merged_aliases} aliases across {result.updated_objects}/{result.target_objects} listed meshes",
+            (
+                f"Fast-merged {result.merged_aliases} aliases across "
+                f"{result.updated_objects}/{len(target_meshes)} target meshes"
+                + (f"; rebuilt {rebuilt_alias_count} seam aliases" if rebuilt_alias_count is not None else "")
+            ),
         )
         if result.skipped_objects:
             self.report({"WARNING"}, " | ".join(result.skipped_objects[:3]))
@@ -1041,14 +1439,22 @@ class BMC_OT_alias_remove(bpy.types.Operator):
 
 class BMC_OT_save_preset(bpy.types.Operator):
     bl_idname = "object.bmc_save_preset"
-    bl_label = "Save Preset"
-    bl_description = "Save the current target list, duplicate-bone settings, and alias list as a preset"
+    bl_label = "Save Mapping Preset"
+    bl_description = "Save the current frozen scan mapping, alias list, and shadow host as a single JSON preset"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
         scene = context.scene
         try:
-            preset_path = save_preset(scene.bmc_preset_name or scene.bmc_preset_choice, _serialize_scene_preset(scene))
+            base_payload = load_mapping_payload_from_scene(scene)
+            payload = build_mapping_payload(scene, manifest_payload={}, base_payload=base_payload)
+            if not payload.get("object_remaps"):
+                raise ValueError("No frozen scan mapping is loaded. Run Scan first or load a Mapping Preset.")
+            preset_name = scene.bmc_preset_name or scene.bmc_preset_choice
+            preset_path = save_preset(preset_name, payload)
+            store_mapping_payload_on_scene(scene, payload)
+            scene.bmc_preset_name = os.path.splitext(os.path.basename(preset_path))[0]
+            scene.bmc_preset_choice = scene.bmc_preset_name
         except Exception as exc:
             self.report({"ERROR"}, f"Save preset failed: {exc}")
             return {"CANCELLED"}
@@ -1058,8 +1464,8 @@ class BMC_OT_save_preset(bpy.types.Operator):
 
 class BMC_OT_load_preset(bpy.types.Operator):
     bl_idname = "object.bmc_load_preset"
-    bl_label = "Load Preset"
-    bl_description = "Load the selected preset into the current scene"
+    bl_label = "Load Mapping Preset"
+    bl_description = "Load the selected mapping preset without overwriting runtime export paths"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1070,8 +1476,7 @@ class BMC_OT_load_preset(bpy.types.Operator):
             return {"CANCELLED"}
         try:
             payload = load_preset(preset_name)
-            _apply_loaded_preset(scene, payload)
-            _refresh_target_items(scene)
+            apply_mapping_payload_to_scene(scene, payload, preset_name=preset_name)
         except Exception as exc:
             self.report({"ERROR"}, f"Load preset failed: {exc}")
             return {"CANCELLED"}

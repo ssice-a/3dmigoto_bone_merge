@@ -103,7 +103,6 @@ def generate_shadow_split(
     preamble_lines, sections = _parse_sections(source_lines)
     _ensure_white_texture_file(os.path.dirname(normalized_source_ini_path))
     has_white_resource = any(section.name.lower() == _WHITE_RESOURCE_NAME.lower() for section in sections)
-
     payloads: list[ChunkSectionPayload] = []
     rewritten_section_names: list[str] = []
     for palette_record in palette_records:
@@ -548,10 +547,6 @@ def _build_generated_host_block(
         "match_priority = -300",
         "if vs == 200",
         f"  ps-t0 = {_WHITE_RESOURCE_NAME}",
-        f"  run = CustomShader\\{bonestore_namespace}\\_ExtractCB1",
-        f"  vs-t0 = Resource\\{bonestore_namespace}\\LocalFakeT0_SRV",
-        f"  run = CustomShader\\{bonestore_namespace}\\_RedirectCB1",
-        f"  vs-cb1 = Resource\\{bonestore_namespace}\\FakeCB1",
     ]
 
     for payload in payloads:

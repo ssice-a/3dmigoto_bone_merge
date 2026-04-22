@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime/export caches generated while testing the addon.
+Buffer/
+Meshes/
+presets/
+export_manifest.json
+
+# Blender autosaves/backups.
+*.blend1
+*.blend2

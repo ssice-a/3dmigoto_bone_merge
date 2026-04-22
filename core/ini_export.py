@@ -239,7 +239,7 @@ def _local_palette_sections(local_palette_records: list[LocalPaletteRecord]) -> 
                 f"[ResourceLocalPaletteMeta_{local_palette_record.resource_suffix}]",
                 "type = Buffer",
                 "format = R32_FLOAT",
-                f"data = R32_FLOAT {float(local_palette_record.local_bone_count):.1f}",
+                f"data = {float(local_palette_record.local_bone_count):.1f}",
                 "",
             ]
         )
@@ -343,7 +343,7 @@ def _part_sections(part_record: PartRecord, local_palette_record: LocalPaletteRe
         f"[ResourceBoneMeta_{hash_value}]",
         "type = Buffer",
         "format = R32_FLOAT",
-        f"data = R32_FLOAT {float(part_record.global_bone_base):.1f} {float(part_record.bone_count):.1f}",
+        f"data = {float(part_record.global_bone_base):.1f} {float(part_record.bone_count):.1f}",
         "",
     ]
 

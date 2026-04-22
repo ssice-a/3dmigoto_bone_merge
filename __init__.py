@@ -35,6 +35,7 @@ def register():
         operators.BMC_OT_add_selected_targets,
         operators.BMC_OT_create_target_collection,
         operators.BMC_OT_sync_targets_from_collection,
+        operators.BMC_OT_refresh_target_identity,
         operators.BMC_OT_create_export_collection,
         operators.BMC_OT_add_selected_export_objects,
         operators.BMC_OT_prepare_export_collection,

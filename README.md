@@ -63,25 +63,37 @@
 
 ## Export Preparation
 
-导出阶段使用单独的 `Export Collection`，但真正的最终绘制单位是它下面的**子集合**。
+导出阶段现在分成两层集合：
 
-- 点击 `Create Export Collection` 会自动按当前 Target 列表创建常用子集合
-- 用户也可以在 `Export Collection` 下面手动创建或重命名子集合
-- 直接放在根 `Export Collection` 下的 mesh 不会被 Prepare 接受，必须移动到某个子集合里
+- `Export Source Collection`
+  - 你真正手工编辑和摆放物体的集合
+  - 下面的子集合仍然代表最终宿主 draw/chunk
+- `Export Build Collection`
+  - 插件每次 `Prepare Export / Palette` 时自动重建的临时导出副本集合
+  - 只给导出和运行时使用，不应手工长期编辑
+
+工作流变成：
+
+- 在 `Export Source Collection` 下面创建或整理子集合
 - 子集合名称就是最终宿主 draw/chunk 身份，格式推荐为 `<ib_hash>-<match_index_count>-<chunk_index>`
   - 例如：`fe47dc61-7014-0`
-  - 如果 A 的几何想挂到 B 的宿主上，就把 A 的 mesh 放到 B 对应的子集合下
-- `Prepare Export Collection` 会：
-  - 按子集合分组
-  - 每个子集合生成一份 `Buffer/<ib>-<match_index_count>-<chunk_index>-Palette.buf`
-  - 直接把子集合内 mesh 的数字顶点组从全局编号本地化成 `0..n-1`
-  - 重建顶点组内部顺序，确保 3Dmigoto 导出的 `BLENDINDICES` 也变成本地连续索引
+  - 如果 A 的几何想挂到 B 的宿主上，就把 A 的 mesh 放到 B 对应的 source 子集合下
+- `Prepare Export / Palette` 会：
+  - 先清空并重建 `Export Build Collection`
+  - 从 `Export Source Collection` 把 mesh 复制到 build 子集合
+  - 每个 build 子集合生成一份 `Buffer/<ib>-<match_index_count>-<chunk_index>-Palette.buf`
+  - 只把 build 副本的数字顶点组从全局编号本地化成 `0..n-1`
+  - 重建 build 副本的顶点组内部顺序，确保 3Dmigoto 导出的 `BLENDINDICES` 也变成本地连续索引
   - 对没有导出子集合的扫描 IB 生成默认原始 palette：`local i -> global_bone_base + i`
   - 写出 `export_manifest.json`
 
 第一版不直接导出完整 3Dmigoto 网格缓冲。现有 3Dmigoto Blender 导出插件应对 `Export Collection` / 对应子集合里的 mesh 导出 `Position/Texcoord/Blend/Index` 等 mesh buffer。
 
-注意：导出准备现在是**严格全局骨输入**。`Prepare Export / Palette` 不再兼容旧的 export-local 对象，也不会尝试读取上一次导出的 `palette` 来恢复全局骨号。请始终从重新导入/重新重映射后的全局顶点组对象开始导出；如果对象已经被旧版本本地化过，请重新导入或重新构建。
+注意：
+
+- `Export Source Collection` 里应该始终放**干净的全局骨源对象**
+- 不要把旧的 export-local build 副本再放回 source 集合
+- 现在真正会被本地化成 `0..n-1` 的，只有 `Export Build Collection` 里的临时副本
 
 面板中的导出相关按钮在 `Export Preparation` 区域：
 

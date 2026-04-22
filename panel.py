@@ -85,14 +85,16 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
             )
             target_box.prop(target, "ib_hash")
             target_box.prop(target, "match_index_count")
+            target_box.prop(target, "local_bone_count")
             target_box.prop(target, "autodetected")
+            target_box.operator("object.bmc_refresh_target_identity", icon="FILE_REFRESH")
 
         scan_box = layout.box()
         scan_box.label(text="FrameAnalysis Scan", icon="FILE_FOLDER")
         scan_box.prop(scene, "bmc_frameanalysis_dir")
         scan_box.prop(scene, "bmc_output_dir")
-        scan_box.prop(scene, "bmc_merge_same_bone_groups")
         scan_box.operator("object.bmc_scan_targets", icon="VIEWZOOM")
+        scan_box.label(text="Scan now freezes capture data only; it no longer remaps or merges source meshes.", icon="INFO")
 
         preset_box = layout.box()
         preset_box.label(text="Presets", icon="BOOKMARKS")
@@ -112,18 +114,24 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         export_box = layout.box()
         export_box.label(text="3Dmigoto Export", icon="EXPORT")
         export_box.prop(scene, "bmc_output_dir", text="3Dmigoto Output Dir")
-        export_box.prop(scene, "bmc_export_collection")
+        export_box.prop(scene, "bmc_export_collection", text="Export Source")
+        export_box.prop(scene, "bmc_export_build_collection", text="Export Build")
         export_collection = scene.bmc_export_collection
+        export_build_collection = scene.bmc_export_build_collection
         export_box.label(
-            text=f"Export Collection: {export_collection.name if export_collection else '(not set)'}",
+            text=f"Source: {export_collection.name if export_collection else '(not set)'}",
+            icon="OUTLINER_COLLECTION",
+        )
+        export_box.label(
+            text=f"Build: {export_build_collection.name if export_build_collection else '(not set)'}",
             icon="OUTLINER_COLLECTION",
         )
         row = export_box.row(align=True)
         row.operator("object.bmc_create_export_collection", icon="COLLECTION_NEW")
         row.operator("object.bmc_add_selected_export_objects", icon="ADD")
         export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT")
-        export_box.label(text="Writes only 3Dmigoto runtime files: BoneStore.ini, hlsl, Buffer/*-Palette.buf.", icon="INFO")
-        export_box.label(text="Child collections are final chunks named like fe47dc61-7014-0.", icon="INFO")
+        export_box.label(text="Edit meshes only in Export Source child collections.", icon="INFO")
+        export_box.label(text="Prepare Export rebuilds Export Build from source, then localizes only the build copies.", icon="INFO")
 
         shadow_box = layout.box()
         shadow_box.label(text="Advanced Shadow Split", icon="SHADING_RENDERED")

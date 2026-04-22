@@ -44,12 +44,19 @@ def _apply_preset_payload_to_scene(scene, preset_name: str, payload: dict) -> No
             if export_collection is not None:
                 scene.bmc_export_collection = export_collection
 
+        export_build_collection_name = str(workspace.get("export_build_collection_name", "") or "").strip()
+        if export_build_collection_name:
+            export_build_collection = bpy.data.collections.get(export_build_collection_name)
+            if export_build_collection is not None:
+                scene.bmc_export_build_collection = export_build_collection
+
     scene.bmc_target_items.clear()
     for target in payload.get("targets", []):
         item = scene.bmc_target_items.add()
         item.object_name = str(target.get("object_name", ""))
         item.ib_hash = str(target.get("ib_hash", ""))
         item.match_index_count = int(target.get("match_index_count", 0))
+        item.local_bone_count = int(target.get("local_bone_count", 0))
         item.autodetected = bool(target.get("autodetected", True))
         item.enabled = bool(target.get("enabled", True))
         mesh_obj = scene.objects.get(item.object_name)
@@ -93,6 +100,7 @@ class BMC_TargetItem(bpy.types.PropertyGroup):
     object_ref: bpy.props.PointerProperty(name="Object Ref", type=bpy.types.Object)
     ib_hash: bpy.props.StringProperty(name="IB Hash", default="")
     match_index_count: bpy.props.IntProperty(name="Match Index Count", default=0, min=0)
+    local_bone_count: bpy.props.IntProperty(name="Local Bone Count", default=0, min=0)
     autodetected: bpy.props.BoolProperty(name="Auto", default=True)
     enabled: bpy.props.BoolProperty(name="Enabled", default=True)
 
@@ -122,6 +130,7 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_ini_path"),
     (bpy.types.Scene, "bmc_target_collection"),
     (bpy.types.Scene, "bmc_export_collection"),
+    (bpy.types.Scene, "bmc_export_build_collection"),
     (bpy.types.Scene, "bmc_export_manifest_path"),
     (bpy.types.Scene, "bmc_source_ini_path"),
     (bpy.types.Scene, "bmc_shadow_host_hash"),
@@ -185,9 +194,14 @@ def register_addon_properties():
         description="Collection containing mesh objects that should participate in Bone Merge Capture scanning.",
     )
     bpy.types.Scene.bmc_export_collection = bpy.props.PointerProperty(
-        name="Export Collection",
+        name="Export Source Collection",
         type=bpy.types.Collection,
-        description="Root collection containing final draw chunk child collections for BI4 export.",
+        description="Editable source collection containing final draw chunk child collections for export.",
+    )
+    bpy.types.Scene.bmc_export_build_collection = bpy.props.PointerProperty(
+        name="Export Build Collection",
+        type=bpy.types.Collection,
+        description="Disposable generated collection rebuilt from Export Source Collection during Prepare Export.",
     )
     bpy.types.Scene.bmc_export_manifest_path = bpy.props.StringProperty(
         name="Export Manifest",

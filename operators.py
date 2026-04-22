@@ -28,6 +28,7 @@ from .core.models import TargetObjectSpec
 
 DEFAULT_TARGET_COLLECTION_NAME = "BMC Bone Palette Targets"
 DEFAULT_EXPORT_COLLECTION_NAME = "BMC Export Sources"
+DEFAULT_EXPORT_BUILD_COLLECTION_NAME = "BMC Export Build"
 _EXPORT_NORMALIZE_GUARD = False
 
 
@@ -52,6 +53,18 @@ def _ensure_export_collection(context):
         collection = bpy.data.collections.new(DEFAULT_EXPORT_COLLECTION_NAME)
         scene.collection.children.link(collection)
     scene.bmc_export_collection = collection
+    return collection
+
+
+def _ensure_export_build_collection(context):
+    scene = context.scene
+    collection = scene.bmc_export_build_collection
+    if collection is None:
+        collection = bpy.data.collections.get(DEFAULT_EXPORT_BUILD_COLLECTION_NAME)
+    if collection is None:
+        collection = bpy.data.collections.new(DEFAULT_EXPORT_BUILD_COLLECTION_NAME)
+        scene.collection.children.link(collection)
+    scene.bmc_export_build_collection = collection
     return collection
 
 
@@ -138,13 +151,19 @@ def _refresh_target_item(scene, item):
         return None
 
     item.object_name = mesh_obj.name
-    identity = resolve_mesh_identity(mesh_obj)
-    if identity is not None:
-        item.ib_hash = identity[0]
-        item.match_index_count = int(identity[1])
-    else:
-        item.ib_hash = ""
-        item.match_index_count = 0
+    if not item.ib_hash or int(item.match_index_count) < 0:
+        identity = resolve_mesh_identity(mesh_obj)
+        if identity is not None:
+            item.ib_hash = identity[0]
+            item.match_index_count = int(identity[1])
+        else:
+            item.ib_hash = ""
+            item.match_index_count = 0
+    if int(getattr(item, "local_bone_count", 0)) <= 0:
+        try:
+            item.local_bone_count = int(infer_local_bone_count_from_mesh(mesh_obj))
+        except ValueError:
+            pass
     item.autodetected = bool(getattr(mesh_obj, "merge_ib_autodetected", True))
     return mesh_obj
 
@@ -222,7 +241,7 @@ def _normalize_export_collection_membership(scene) -> dict[str, int]:
 def _should_refresh_for_depsgraph_update(scene, depsgraph) -> bool:
     if scene is None:
         return False
-    if scene.bmc_export_collection is None and not scene.bmc_target_items:
+    if not scene.bmc_target_items and scene.bmc_target_collection is None:
         return False
 
     target_object_ids: set[int] = set()
@@ -233,26 +252,14 @@ def _should_refresh_for_depsgraph_update(scene, depsgraph) -> bool:
         if mesh_obj is not None and mesh_obj.type == "MESH":
             target_object_ids.add(mesh_obj.as_pointer())
 
-    export_collection_ids: set[int] = set()
-    export_object_ids: set[int] = set()
-    export_collection = scene.bmc_export_collection
-    if export_collection is not None:
-        for collection in _iter_collection_subtree(export_collection):
-            export_collection_ids.add(collection.as_pointer())
-            for mesh_obj in collection.objects:
-                if mesh_obj.type == "MESH":
-                    export_object_ids.add(mesh_obj.as_pointer())
-
     for update in depsgraph.updates:
         update_id = getattr(update, "id", None)
         if isinstance(update_id, bpy.types.Object):
             pointer = update_id.as_pointer()
-            if pointer in target_object_ids or pointer in export_object_ids:
+            if pointer in target_object_ids:
                 return True
             continue
         if isinstance(update_id, bpy.types.Collection):
-            if update_id.as_pointer() in export_collection_ids:
-                return True
             if scene.bmc_target_collection is not None and update_id == scene.bmc_target_collection:
                 return True
     return False
@@ -268,7 +275,6 @@ def _bmc_depsgraph_update_post(scene, depsgraph):
     _EXPORT_NORMALIZE_GUARD = True
     try:
         _refresh_target_items(scene)
-        _normalize_export_collection_membership(scene)
     finally:
         _EXPORT_NORMALIZE_GUARD = False
 
@@ -287,6 +293,10 @@ def _add_mesh_object_to_target_list(scene, mesh_obj, existing_names: set[str]) -
     identity = resolve_mesh_identity(mesh_obj)
     if identity is None:
         return False
+    try:
+        local_bone_count = infer_local_bone_count_from_mesh(mesh_obj)
+    except ValueError:
+        return False
     if mesh_obj.name in existing_names:
         return False
     item = scene.bmc_target_items.add()
@@ -294,6 +304,7 @@ def _add_mesh_object_to_target_list(scene, mesh_obj, existing_names: set[str]) -
     item.object_ref = mesh_obj
     item.ib_hash = identity[0]
     item.match_index_count = identity[1]
+    item.local_bone_count = int(local_bone_count)
     item.autodetected = bool(getattr(mesh_obj, "merge_ib_autodetected", True))
     item.enabled = True
     existing_names.add(mesh_obj.name)
@@ -309,28 +320,32 @@ def _enabled_target_specs(context) -> list[TargetObjectSpec]:
         mesh_obj = _refresh_target_item(scene, item)
         if mesh_obj is None:
             raise ValueError(f"{item.object_name}: mesh object not found in current scene")
+        display_name = mesh_obj.name
         manifest_bone_count = _lookup_capture_bone_count_from_manifest(
             scene,
             item.ib_hash.lower(),
             int(item.match_index_count),
-            mesh_obj.name,
+            display_name,
         )
-        try:
-            local_bone_count = infer_local_bone_count_from_mesh(mesh_obj)
-        except ValueError:
+        local_bone_count = int(getattr(item, "local_bone_count", 0))
+        if local_bone_count <= 0:
             if manifest_bone_count is None:
-                raise
-            local_bone_count = manifest_bone_count
+                raise ValueError(
+                    f"{display_name}: frozen local bone count is missing. "
+                    "Use Refresh Target Identity once before Scan."
+                )
+            local_bone_count = int(manifest_bone_count)
+            item.local_bone_count = local_bone_count
         if local_bone_count > BI4_MAX_BONE_COUNT and manifest_bone_count is not None:
             local_bone_count = manifest_bone_count
         if local_bone_count > BI4_MAX_BONE_COUNT:
             raise ValueError(
-                f"{item.object_name}: local bone count {local_bone_count} exceeds BI4 limit {BI4_MAX_BONE_COUNT}; "
+                f"{display_name}: local bone count {local_bone_count} exceeds BI4 limit {BI4_MAX_BONE_COUNT}; "
                 "this workflow requires each final object/draw chunk to stay within 256 bones"
             )
         target_specs.append(
             TargetObjectSpec(
-                object_name=item.object_name,
+                object_name=display_name,
                 ib_hash=item.ib_hash.lower(),
                 match_index_count=int(item.match_index_count),
                 local_bone_count=local_bone_count,
@@ -446,7 +461,6 @@ def _analyze_same_bone_aliases(context, manifest_path: str, target_object_names:
 
 
 def _serialize_scene_preset(scene) -> dict:
-    _refresh_target_items(scene)
     return {
         "merge_same_bone_groups": bool(scene.bmc_merge_same_bone_groups),
         "workspace": {
@@ -455,12 +469,14 @@ def _serialize_scene_preset(scene) -> dict:
             "source_ini_path": str(scene.bmc_source_ini_path or ""),
             "target_collection_name": scene.bmc_target_collection.name if scene.bmc_target_collection else "",
             "export_collection_name": scene.bmc_export_collection.name if scene.bmc_export_collection else "",
+            "export_build_collection_name": scene.bmc_export_build_collection.name if scene.bmc_export_build_collection else "",
         },
         "targets": [
             {
-                "object_name": item.object_name,
+                "object_name": (item.object_ref.name if getattr(item, "object_ref", None) else item.object_name),
                 "ib_hash": item.ib_hash,
                 "match_index_count": int(item.match_index_count),
+                "local_bone_count": int(getattr(item, "local_bone_count", 0)),
                 "autodetected": bool(item.autodetected),
                 "enabled": bool(item.enabled),
             }
@@ -496,14 +512,25 @@ def _apply_loaded_preset(scene, payload: dict):
             if export_collection is not None:
                 scene.bmc_export_collection = export_collection
 
+        export_build_collection_name = str(workspace.get("export_build_collection_name", "") or "").strip()
+        if export_build_collection_name:
+            export_build_collection = bpy.data.collections.get(export_build_collection_name)
+            if export_build_collection is not None:
+                scene.bmc_export_build_collection = export_build_collection
+
     scene.bmc_target_items.clear()
     for target in payload.get("targets", []):
         item = scene.bmc_target_items.add()
         item.object_name = str(target.get("object_name", ""))
         item.ib_hash = str(target.get("ib_hash", ""))
         item.match_index_count = int(target.get("match_index_count", 0))
+        item.local_bone_count = int(target.get("local_bone_count", 0))
         item.autodetected = bool(target.get("autodetected", False))
         item.enabled = bool(target.get("enabled", True))
+        mesh_obj = scene.objects.get(item.object_name)
+        if mesh_obj is not None and mesh_obj.type == "MESH":
+            item.object_ref = mesh_obj
+            item.object_name = mesh_obj.name
     scene.bmc_target_index = min(scene.bmc_target_index, max(0, len(scene.bmc_target_items) - 1))
 
     scene.bmc_alias_items.clear()
@@ -537,7 +564,11 @@ class BMC_OT_add_selected_targets(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         _refresh_target_items(scene)
-        existing_names = {item.object_name for item in scene.bmc_target_items if item.object_name}
+        existing_names = {
+            (item.object_ref.name if getattr(item, "object_ref", None) else item.object_name)
+            for item in scene.bmc_target_items
+            if item.object_name or getattr(item, "object_ref", None)
+        }
         added_count = 0
         collection = _ensure_target_collection(context)
 
@@ -556,7 +587,6 @@ class BMC_OT_add_selected_targets(bpy.types.Operator):
             self.report({"WARNING"}, "No new mesh targets were added")
             return {"CANCELLED"}
 
-        _refresh_target_items(scene)
         scene.bmc_target_index = len(scene.bmc_target_items) - 1
         self.report({"INFO"}, f"Added {added_count} target objects")
         return {"FINISHED"}
@@ -600,12 +630,54 @@ class BMC_OT_sync_targets_from_collection(bpy.types.Operator):
             else:
                 skipped_count += 1
 
-        _refresh_target_items(scene)
         scene.bmc_target_index = min(scene.bmc_target_index, max(0, len(scene.bmc_target_items) - 1))
         message = f"Synced {added_count} target object(s) from {collection.name}"
         if skipped_count:
             message += f"; skipped {skipped_count}"
         self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class BMC_OT_refresh_target_identity(bpy.types.Operator):
+    bl_idname = "object.bmc_refresh_target_identity"
+    bl_label = "Refresh Target Identity"
+    bl_description = "Explicitly re-freeze the active target's IB hash, match count, and local bone count from the current object"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_target_items and 0 <= scene.bmc_target_index < len(scene.bmc_target_items))
+
+    def execute(self, context):
+        scene = context.scene
+        item = scene.bmc_target_items[scene.bmc_target_index]
+        mesh_obj = _resolve_target_item_object(scene, item)
+        if mesh_obj is None:
+            self.report({"ERROR"}, f"{item.object_name}: mesh object not found in current scene")
+            return {"CANCELLED"}
+
+        identity = resolve_mesh_identity(mesh_obj)
+        if identity is None:
+            self.report({"ERROR"}, f"{mesh_obj.name}: cannot infer ib_hash/index_count")
+            return {"CANCELLED"}
+
+        try:
+            local_bone_count = int(infer_local_bone_count_from_mesh(mesh_obj))
+        except ValueError as exc:
+            self.report({"ERROR"}, f"{mesh_obj.name}: {exc}")
+            return {"CANCELLED"}
+
+        item.object_ref = mesh_obj
+        item.object_name = mesh_obj.name
+        item.ib_hash = identity[0]
+        item.match_index_count = int(identity[1])
+        item.local_bone_count = local_bone_count
+        item.autodetected = bool(getattr(mesh_obj, "merge_ib_autodetected", True))
+        self.report(
+            {"INFO"},
+            f"Frozen target {mesh_obj.name} as {item.ib_hash}-{item.match_index_count} with {item.local_bone_count} local bones",
+        )
         return {"FINISHED"}
 
 
@@ -616,17 +688,15 @@ class BMC_OT_create_export_collection(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        collection = _ensure_export_collection(context)
+        source_collection = _ensure_export_collection(context)
+        build_collection = _ensure_export_build_collection(context)
         _refresh_target_items(context.scene)
-        created_count = _ensure_export_chunk_collections_from_targets(context, collection)
-        normalize_result = _normalize_export_collection_membership(context.scene)
-        message = f"Export collection: {collection.name}"
+        created_count = _ensure_export_chunk_collections_from_targets(context, source_collection)
+        message = f"Export source: {source_collection.name}; build: {build_collection.name}"
         if created_count:
             message += f"; created {created_count} chunk collection(s)"
         else:
             message += "; no new chunk collections"
-        if normalize_result["moved"]:
-            message += f"; normalized {normalize_result['moved']} object(s)"
         self.report({"INFO"}, message)
         return {"FINISHED"}
 
@@ -657,17 +727,14 @@ class BMC_OT_add_selected_export_objects(bpy.types.Operator):
             _link_object_to_collection(mesh_obj, chunk_collection)
             added_count += 1
 
-        normalize_result = _normalize_export_collection_membership(context.scene)
-        if added_count == 0 and not normalize_result["moved"]:
+        if added_count == 0:
             if skipped_names:
                 self.report({"WARNING"}, f"Skipped {len(skipped_names)} mesh(es): cannot infer ib_hash/index_count")
             else:
-                self.report({"WARNING"}, "No new mesh objects were added to export collection")
+                self.report({"WARNING"}, "No new mesh objects were added to export source collection")
             return {"CANCELLED"}
 
-        message = f"Added {added_count} object(s) to export collection"
-        if normalize_result["moved"]:
-            message += f"; normalized {normalize_result['moved']} object(s)"
+        message = f"Added {added_count} object(s) to export source collection"
         if skipped_names:
             message += f"; skipped {len(skipped_names)}"
         self.report({"INFO"}, message)
@@ -688,10 +755,12 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         scene = context.scene
         try:
             _refresh_target_items(scene)
-            _normalize_export_collection_membership(scene)
+            source_collection = _ensure_export_collection(context)
+            build_collection = _ensure_export_build_collection(context)
             result = prepare_export_collection(
                 context=context,
-                export_collection=scene.bmc_export_collection,
+                source_collection=source_collection,
+                build_collection=build_collection,
                 output_dir=scene.bmc_output_dir,
                 internal_manifest_dir=None,
                 capture_manifest_path=scene.bmc_manifest_path,
@@ -813,7 +882,6 @@ class BMC_OT_scan_targets(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         try:
-            _refresh_target_items(scene)
             target_specs = _enabled_target_specs(context)
             result = scan_targets_and_generate_outputs(
                 frameanalysis_dir=scene.bmc_frameanalysis_dir,
@@ -836,55 +904,19 @@ class BMC_OT_scan_targets(bpy.types.Operator):
         except Exception as exc:
             shadow_host_warning = f"Last shadow host detection failed: {exc}"
 
-        remap_result = None
-        try:
-            remap_result = apply_vertex_group_remap_for_target_names(
-                context=context,
-                manifest_path=result.manifest_path,
-                target_object_names=_enabled_target_names(scene),
-            )
-        except Exception as exc:
-            self.report({"WARNING"}, f"Scan succeeded but auto-remap failed: {exc}")
-
         scene.bmc_alias_items.clear()
-        auto_alias_count = 0
-        auto_merge_result = None
-        auto_merge_warning = ""
-        if scene.bmc_merge_same_bone_groups:
-            try:
-                target_names = _enabled_target_names(scene)
-                auto_alias_count = _analyze_same_bone_aliases(context, result.manifest_path, target_names)
-                if auto_alias_count:
-                    auto_merge_result = merge_duplicate_bone_weights_for_target_names(
-                        context=context,
-                        target_object_names=target_names,
-                        alias_entries=_enabled_alias_payload(scene),
-                    )
-            except Exception as exc:
-                auto_merge_warning = f"Auto same-bone merge failed: {exc}"
-
         info_message = f"Scanned {result.scanned_parts} parts; total global bones {result.total_global_bones}"
-        if remap_result is not None:
-            info_message += f"; auto-renamed {remap_result.renamed_groups} groups on {remap_result.updated_objects} object(s)"
-        if scene.bmc_merge_same_bone_groups:
-            merged_aliases = auto_merge_result.merged_aliases if auto_merge_result is not None else 0
-            info_message += f"; same-bone aliases {auto_alias_count}, merged {merged_aliases}"
         if scene.bmc_shadow_host_hash:
             info_message += (
                 f"; shadow host {scene.bmc_shadow_host_hash}-{scene.bmc_shadow_host_match_index_count}"
                 f" vs={scene.bmc_shadow_host_vs_hash or '?'}"
             )
+        info_message += "; source meshes unchanged"
         self.report({"INFO"}, info_message)
         if result.warnings:
             self.report({"WARNING"}, " | ".join(result.warnings[:3]))
-        if remap_result is not None and remap_result.skipped_objects:
-            self.report({"WARNING"}, " | ".join(remap_result.skipped_objects[:3]))
-        if auto_merge_warning:
-            self.report({"WARNING"}, auto_merge_warning)
         if shadow_host_warning:
             self.report({"WARNING"}, shadow_host_warning)
-        if auto_merge_result is not None and auto_merge_result.skipped_objects:
-            self.report({"WARNING"}, " | ".join(auto_merge_result.skipped_objects[:3]))
         return {"FINISHED"}
 
 

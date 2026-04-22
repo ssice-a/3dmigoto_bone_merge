@@ -6,12 +6,15 @@ import os
 import re
 from dataclasses import dataclass
 
+import bpy
+
 from ..constants import (
     BI4_MAX_BONE_COUNT,
     BONESTORE_INI_FILE_NAME,
     BUFFER_EXPORT_DIR_NAME,
     BMC_EXPORT_CHUNK_PROP,
     BMC_EXPORT_PALETTE_PROP,
+    BMC_VERTEX_GROUP_STATE_GLOBAL,
     BMC_VERTEX_GROUP_STATE_EXPORT_LOCAL,
     BMC_VERTEX_GROUP_STATE_PROP,
     CAPTURE_MANIFEST_FILE_NAME,
@@ -35,30 +38,43 @@ class ExportChunk:
     mesh_objects: tuple[object, ...]
 
 
+@dataclass(frozen=True)
+class MeshPrepareState:
+    mesh_obj: object
+    is_localized: bool
+    localized_palette: tuple[int, ...]
+    export_chunk: str
+    used_global_groups: tuple[int, ...]
+
+
 def prepare_export_collection(
     context,
-    export_collection,
+    source_collection,
+    build_collection,
     output_dir: str | None = None,
     internal_manifest_dir: str | None = None,
     capture_manifest_path: str | None = None,
 ):
-    if export_collection is None:
-        raise ValueError("Export collection is not set")
+    if source_collection is None:
+        raise ValueError("Export source collection is not set")
+    if build_collection is None:
+        raise ValueError("Export build collection is not set")
 
     normalized_output_dir = ensure_directory(output_dir or context.scene.bmc_output_dir or context.scene.bmc_frameanalysis_dir)
     buffer_dir = ensure_directory(os.path.join(normalized_output_dir, BUFFER_EXPORT_DIR_NAME))
     hlsl_dir = export_required_hlsl(normalized_output_dir)
 
-    chunks = _build_export_chunks(export_collection)
+    _rebuild_build_collection_from_source(source_collection, build_collection)
+    chunks = _build_export_chunks(build_collection)
     _validate_single_chunk_membership(chunks)
-    _validate_chunks_are_global_state(chunks)
 
     palette_records = []
     local_palette_records: list[LocalPaletteRecord] = []
     object_records = []
 
     for chunk in chunks:
-        global_groups = _collect_used_groups_for_chunk(chunk)
+        mesh_states = _inspect_chunk_prepare_states(chunk)
+        global_groups = _collect_used_groups_for_chunk_states(chunk, mesh_states)
         ib_hash = chunk.ib_hash
         match_index_count = chunk.match_index_count
         chunk_index = chunk.chunk_index
@@ -97,8 +113,16 @@ def prepare_export_collection(
                 "palette_values": list(palette),
             }
         )
-        for mesh_obj in chunk.mesh_objects:
-            localize_vertex_groups_for_palette(mesh_obj, palette, chunk.name)
+        for mesh_state in mesh_states:
+            mesh_obj = mesh_state.mesh_obj
+            if _can_reuse_localized_mesh(mesh_state, palette):
+                mesh_obj[BMC_EXPORT_PALETTE_PROP] = list(palette)
+                mesh_obj[BMC_VERTEX_GROUP_STATE_PROP] = BMC_VERTEX_GROUP_STATE_EXPORT_LOCAL
+                mesh_obj[BMC_EXPORT_CHUNK_PROP] = chunk.name
+            else:
+                if mesh_state.is_localized:
+                    _restore_mesh_to_global_state(mesh_obj, mesh_state.localized_palette)
+                localize_vertex_groups_for_palette(mesh_obj, palette, chunk.name)
             object_records.append(
                 {
                     "object": mesh_obj.name,
@@ -112,15 +136,16 @@ def prepare_export_collection(
             )
 
     manifest = {
-        "export_collection": export_collection.name,
+        "export_source_collection": source_collection.name,
+        "export_collection": build_collection.name,
         "buffer_dir": buffer_dir,
         "bonestore_namespace": build_bonestore_namespace(normalized_output_dir),
         "palettes": palette_records,
         "objects": object_records,
         "note": (
-            "Export Collection child collections are final draw chunks. "
-            "Each child collection name must contain <ib_hash>-<match_index_count>-<chunk_index>. "
-            "Prepare Export localizes vertex groups in place, so export the same collection after running it."
+            "Export Source Collection child collections are final draw chunks. "
+            "Prepare Export rebuilds a disposable Export Build Collection from those source chunks, "
+            "then localizes only the build copies before writing runtime files."
         ),
     }
     manifest_dir = ensure_directory(internal_manifest_dir or normalized_output_dir)
@@ -133,7 +158,7 @@ def prepare_export_collection(
     return {
         "manifest_path": manifest_path,
         "bonestore_ini_path": bonestore_ini_path,
-        "export_collection_name": export_collection.name,
+        "export_collection_name": build_collection.name,
         "output_dir": normalized_output_dir,
         "buffer_dir": buffer_dir,
         "hlsl_dir": hlsl_dir,
@@ -171,26 +196,95 @@ def localize_vertex_groups_for_palette(mesh_obj, palette: tuple[int, ...], chunk
         mesh_obj[BMC_EXPORT_CHUNK_PROP] = chunk_name
 
 
-def _validate_chunks_are_global_state(chunks: tuple[ExportChunk, ...]) -> None:
-    seen_names: set[str] = set()
-    for chunk in chunks:
-        for mesh_obj in chunk.mesh_objects:
-            if mesh_obj.name in seen_names:
-                continue
-            seen_names.add(mesh_obj.name)
-            _validate_mesh_is_global_state(mesh_obj)
+def _inspect_chunk_prepare_states(chunk: ExportChunk) -> tuple[MeshPrepareState, ...]:
+    return tuple(_inspect_mesh_prepare_state(mesh_obj) for mesh_obj in chunk.mesh_objects)
 
 
-def _validate_mesh_is_global_state(mesh_obj) -> None:
+def _inspect_mesh_prepare_state(mesh_obj) -> MeshPrepareState:
     localized_palette = _get_existing_localized_palette(mesh_obj)
     state = str(mesh_obj.get(BMC_VERTEX_GROUP_STATE_PROP, "") or "")
     export_chunk = str(mesh_obj.get(BMC_EXPORT_CHUNK_PROP, "") or "")
+
     if localized_palette is None and state != BMC_VERTEX_GROUP_STATE_EXPORT_LOCAL and not export_chunk:
-        return
-    raise ValueError(
-        f"{mesh_obj.name}: old export-local state is no longer supported. "
-        "Re-import or rebuild this mesh from global vertex groups before Prepare Export."
+        used_groups = tuple(sorted(_collect_used_numeric_vertex_groups(mesh_obj)))
+        return MeshPrepareState(
+            mesh_obj=mesh_obj,
+            is_localized=False,
+            localized_palette=(),
+            export_chunk="",
+            used_global_groups=used_groups,
+        )
+
+    if localized_palette is None:
+        raise ValueError(
+            f"{mesh_obj.name}: export-local metadata is incomplete. "
+            "Rebuild this mesh from a clean global-source object before Prepare Export."
+        )
+
+    used_local_groups = _collect_used_numeric_vertex_groups(mesh_obj)
+    if any(local_index < 0 or local_index >= len(localized_palette) for local_index in used_local_groups):
+        raise ValueError(
+            f"{mesh_obj.name}: current local groups exceed saved palette range. "
+            "Rebuild this mesh from a clean global-source object before Prepare Export."
+        )
+
+    used_global_groups = tuple(sorted({int(localized_palette[local_index]) for local_index in used_local_groups}))
+    return MeshPrepareState(
+        mesh_obj=mesh_obj,
+        is_localized=True,
+        localized_palette=localized_palette,
+        export_chunk=export_chunk,
+        used_global_groups=used_global_groups,
     )
+
+
+def _collect_used_groups_for_chunk_states(chunk: ExportChunk, mesh_states: tuple[MeshPrepareState, ...]) -> set[int]:
+    used_groups: set[int] = set()
+    for mesh_state in mesh_states:
+        used_groups.update(mesh_state.used_global_groups)
+    if not used_groups:
+        raise ValueError(f"{chunk.name}: no weighted numeric vertex groups found")
+    return used_groups
+
+
+def _can_reuse_localized_mesh(mesh_state: MeshPrepareState, target_palette: tuple[int, ...]) -> bool:
+    if not mesh_state.is_localized or tuple(target_palette) != tuple(mesh_state.localized_palette):
+        return False
+    mesh_obj = mesh_state.mesh_obj
+    if len(mesh_obj.vertex_groups) != len(target_palette):
+        return False
+    for expected_local_index in range(len(target_palette)):
+        try:
+            vertex_group = mesh_obj.vertex_groups[expected_local_index]
+        except Exception:
+            return False
+        if vertex_group.index != expected_local_index:
+            return False
+    return True
+
+
+def _restore_mesh_to_global_state(mesh_obj, localized_palette: tuple[int, ...]) -> None:
+    if len(mesh_obj.vertex_groups) != len(localized_palette):
+        raise ValueError(
+            f"{mesh_obj.name}: export-local vertex groups no longer match the saved palette. "
+            "Rebuild this mesh from a clean global-source object before changing export host."
+        )
+
+    temp_names: list[str] = []
+    for local_index in range(len(localized_palette)):
+        vertex_group = mesh_obj.vertex_groups[local_index]
+        temp_name = f"__bmc_restore__{local_index}"
+        vertex_group.name = temp_name
+        temp_names.append(temp_name)
+
+    for local_index, global_index in enumerate(localized_palette):
+        mesh_obj.vertex_groups[temp_names[local_index]].name = str(int(global_index))
+
+    if BMC_EXPORT_PALETTE_PROP in mesh_obj:
+        del mesh_obj[BMC_EXPORT_PALETTE_PROP]
+    if BMC_EXPORT_CHUNK_PROP in mesh_obj:
+        del mesh_obj[BMC_EXPORT_CHUNK_PROP]
+    mesh_obj[BMC_VERTEX_GROUP_STATE_PROP] = BMC_VERTEX_GROUP_STATE_GLOBAL
 
 
 def _build_export_chunks(export_collection) -> tuple[ExportChunk, ...]:
@@ -239,6 +333,66 @@ def _resolve_chunk_collection_identity(collection) -> tuple[str, int, int] | Non
     if not match:
         return None
     return match.group("hash").lower(), int(match.group("count")), int(match.group("chunk") or 0)
+
+
+def _rebuild_build_collection_from_source(source_collection, build_collection) -> None:
+    source_chunks = _build_export_chunks(source_collection)
+    _clear_collection_tree(build_collection)
+
+    for source_chunk in source_chunks:
+        build_chunk_collection = bpy.data.collections.new(f"BMC_EXPORT__{source_chunk.name}")
+        build_collection.children.link(build_chunk_collection)
+        for mesh_obj in source_chunk.mesh_objects:
+            _assert_mesh_is_global_source(mesh_obj)
+            build_obj = _clone_mesh_object_for_build(mesh_obj)
+            build_chunk_collection.objects.link(build_obj)
+
+
+def _clear_collection_tree(root_collection) -> None:
+    for child_collection in list(root_collection.children):
+        _remove_collection_tree(child_collection)
+    for obj in list(root_collection.objects):
+        _remove_object_from_blender(obj)
+
+
+def _remove_collection_tree(collection) -> None:
+    for child_collection in list(collection.children):
+        _remove_collection_tree(child_collection)
+    for obj in list(collection.objects):
+        _remove_object_from_blender(obj)
+    bpy.data.collections.remove(collection)
+
+
+def _remove_object_from_blender(obj) -> None:
+    object_type = obj.type
+    data_block = getattr(obj, "data", None)
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if object_type == "MESH" and data_block is not None and data_block.users == 0:
+        bpy.data.meshes.remove(data_block)
+
+
+def _clone_mesh_object_for_build(mesh_obj):
+    build_obj = mesh_obj.copy()
+    if mesh_obj.data is not None:
+        build_obj.data = mesh_obj.data.copy()
+    build_obj.name = f"{mesh_obj.name}.BMC_EXPORT"
+    for prop_name in (BMC_EXPORT_PALETTE_PROP, BMC_EXPORT_CHUNK_PROP):
+        if prop_name in build_obj:
+            del build_obj[prop_name]
+    build_obj[BMC_VERTEX_GROUP_STATE_PROP] = BMC_VERTEX_GROUP_STATE_GLOBAL
+    return build_obj
+
+
+def _assert_mesh_is_global_source(mesh_obj) -> None:
+    localized_palette = _get_existing_localized_palette(mesh_obj)
+    state = str(mesh_obj.get(BMC_VERTEX_GROUP_STATE_PROP, "") or "")
+    export_chunk = str(mesh_obj.get(BMC_EXPORT_CHUNK_PROP, "") or "")
+    if localized_palette is None and state != BMC_VERTEX_GROUP_STATE_EXPORT_LOCAL and not export_chunk:
+        return
+    raise ValueError(
+        f"{mesh_obj.name}: Export Source Collection must contain clean global-source meshes, "
+        "not old export-local build copies."
+    )
 
 
 def _iter_mesh_objects_recursive(collection):

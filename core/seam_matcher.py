@@ -43,6 +43,49 @@ class SeamApplyResult:
     skipped_messages: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SeamMergeResult:
+    aliases: tuple[SeamAliasRecord, ...]
+    pair_summaries: tuple[str, ...]
+    matched_pairs: int
+    skipped_pairs: int
+    updated_objects: int
+    renamed_groups: int
+    skipped_messages: tuple[str, ...]
+
+
+def build_and_apply_seam_mapping(mesh_objects) -> SeamMergeResult:
+    build_result = build_seam_mapping(mesh_objects)
+    alias_payload = seam_aliases_to_payload(build_result.aliases)
+    apply_result = apply_seam_mapping(mesh_objects, alias_payload)
+    return SeamMergeResult(
+        aliases=build_result.aliases,
+        pair_summaries=build_result.pair_summaries,
+        matched_pairs=build_result.matched_pairs,
+        skipped_pairs=build_result.skipped_pairs,
+        updated_objects=apply_result.updated_objects,
+        renamed_groups=apply_result.renamed_groups,
+        skipped_messages=apply_result.skipped_messages,
+    )
+
+
+def seam_aliases_to_payload(aliases: tuple[SeamAliasRecord, ...] | list[SeamAliasRecord]) -> list[dict]:
+    return [
+        {
+            "enabled": True,
+            "src_object_name": alias.src_object_name,
+            "src_group": int(alias.src_group),
+            "dst_object_name": alias.dst_object_name,
+            "dst_group": int(alias.dst_group),
+            "votes": int(alias.votes),
+            "score": float(alias.score),
+            "average_distance": float(alias.average_distance),
+            "average_weight_difference": float(alias.average_weight_difference),
+        }
+        for alias in aliases
+    ]
+
+
 def build_seam_mapping(mesh_objects) -> SeamBuildResult:
     caches = {mesh_obj.name: _build_seam_cache(mesh_obj) for mesh_obj in mesh_objects}
     object_names = [mesh_obj.name for mesh_obj in mesh_objects if caches.get(mesh_obj.name)]
@@ -67,7 +110,9 @@ def build_seam_mapping(mesh_objects) -> SeamBuildResult:
 
             matched_pairs = _build_vertex_pairs(
                 source_cache["seam_vertices"],
+                source_cache["spatial_hash"],
                 target_cache["seam_vertices"],
+                target_cache["spatial_hash"],
                 _MATCH_TOLERANCE,
             )
             if len(matched_pairs) < _MIN_VERTEX_PAIRS:
@@ -83,10 +128,7 @@ def build_seam_mapping(mesh_objects) -> SeamBuildResult:
                 source_group = int(candidate["group_a"])
                 target_group = int(candidate["group_b"])
                 if source_group == target_group:
-                    raise ValueError(
-                        f"{source_name} and {target_name} matched seam group {source_group} on both objects. "
-                        "Rename vertex groups to non-overlapping numbers first."
-                    )
+                    continue
                 candidate_edges.append(
                     {
                         "source_name": source_name,
@@ -182,15 +224,26 @@ def _build_seam_cache(mesh_obj) -> dict | None:
     if not seam_vertices:
         return None
     group_index_to_number = _build_group_index_to_number_map(mesh_obj)
+    if not group_index_to_number:
+        return None
+    weight_items_by_vertex = _build_sorted_vertex_weight_cache(
+        mesh_obj,
+        {vertex_index for vertex_index, _world_co in seam_vertices},
+        group_index_to_number,
+    )
+    weighted_seam_vertices = [
+        (vertex_index, world_co)
+        for vertex_index, world_co in seam_vertices
+        if weight_items_by_vertex.get(vertex_index)
+    ]
+    if len(weighted_seam_vertices) < _MIN_VERTEX_PAIRS:
+        return None
     return {
-        "seam_vertices": seam_vertices,
-        "bounds_min": _bounds_min(seam_vertices),
-        "bounds_max": _bounds_max(seam_vertices),
-        "weight_items_by_vertex": _build_sorted_vertex_weight_cache(
-            mesh_obj,
-            {vertex_index for vertex_index, _world_co in seam_vertices},
-            group_index_to_number,
-        ),
+        "seam_vertices": weighted_seam_vertices,
+        "spatial_hash": _build_spatial_hash(weighted_seam_vertices, _MATCH_TOLERANCE),
+        "bounds_min": _bounds_min(weighted_seam_vertices),
+        "bounds_max": _bounds_max(weighted_seam_vertices),
+        "weight_items_by_vertex": weight_items_by_vertex,
     }
 
 
@@ -213,9 +266,13 @@ def _collect_seam_vertices(mesh_obj):
     vertices = []
     for vertex_index in boundary_indices:
         vertex = mesh_obj.data.vertices[vertex_index]
-        vertices.append((vertex.index, matrix_world @ vertex.co))
+        vertices.append((vertex.index, _world_coord_tuple(matrix_world @ vertex.co)))
     vertices.sort(key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
     return vertices
+
+
+def _world_coord_tuple(world_co) -> tuple[float, float, float]:
+    return float(world_co[0]), float(world_co[1]), float(world_co[2])
 
 
 def _resolve_boundary_vertex_indices(mesh_obj):
@@ -371,14 +428,6 @@ def _build_aliases_from_edges(candidate_edges: list[dict]) -> list[SeamAliasReco
     for nodes in component_nodes.values():
         if len(nodes) < 2:
             continue
-        group_numbers = [group for _object_name, group in nodes]
-        if len(group_numbers) != len(set(group_numbers)):
-            duplicated = sorted({group for group in group_numbers if group_numbers.count(group) > 1})
-            raise ValueError(
-                "The same seam group number appears on multiple matched objects: "
-                + ", ".join(str(group) for group in duplicated[:8])
-                + ". Rename vertex groups to non-overlapping numbers first."
-            )
         object_names = [object_name for object_name, _group in nodes]
         if len(object_names) != len(set(object_names)):
             repeated_objects = sorted({name for name in object_names if object_names.count(name) > 1})
@@ -392,7 +441,7 @@ def _build_aliases_from_edges(candidate_edges: list[dict]) -> list[SeamAliasReco
         canonical_group = int(canonical_node[1])
         for source_node in sorted(nodes, key=lambda item: (int(item[1]), str(item[0]))):
             source_group = int(source_node[1])
-            if source_node == canonical_node:
+            if source_node == canonical_node or source_group == canonical_group:
                 continue
             edge = best_edge_by_node.get(source_node, {})
             aliases.append(
@@ -446,8 +495,7 @@ def _build_spatial_hash(vertices, tolerance):
     return spatial_hash
 
 
-def _build_nearest_vertex_map(source_vertices, target_vertices, tolerance):
-    target_spatial_hash = _build_spatial_hash(target_vertices, tolerance)
+def _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance):
     tolerance_squared = tolerance * tolerance
     nearest_by_source = {}
     for source_index, source_world_co in source_vertices:
@@ -455,7 +503,10 @@ def _build_nearest_vertex_map(source_vertices, target_vertices, tolerance):
         nearest_distance_squared = None
         for key in _neighbor_keys(_cell_key(source_world_co, tolerance)):
             for target_index, target_world_co in target_spatial_hash.get(key, ()):
-                distance_squared = (source_world_co - target_world_co).length_squared
+                delta_x = source_world_co[0] - target_world_co[0]
+                delta_y = source_world_co[1] - target_world_co[1]
+                delta_z = source_world_co[2] - target_world_co[2]
+                distance_squared = delta_x * delta_x + delta_y * delta_y + delta_z * delta_z
                 if distance_squared > tolerance_squared:
                     continue
                 if nearest_distance_squared is None or distance_squared < nearest_distance_squared:
@@ -466,9 +517,9 @@ def _build_nearest_vertex_map(source_vertices, target_vertices, tolerance):
     return nearest_by_source
 
 
-def _build_vertex_pairs(source_vertices, target_vertices, tolerance):
-    source_to_target = _build_nearest_vertex_map(source_vertices, target_vertices, tolerance)
-    target_to_source = _build_nearest_vertex_map(target_vertices, source_vertices, tolerance)
+def _build_vertex_pairs(source_vertices, source_spatial_hash, target_vertices, target_spatial_hash, tolerance):
+    source_to_target = _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance)
+    target_to_source = _build_nearest_vertex_map(target_vertices, source_spatial_hash, tolerance)
     matched_pairs = []
     for source_index, (target_index, distance) in source_to_target.items():
         reverse = target_to_source.get(target_index)

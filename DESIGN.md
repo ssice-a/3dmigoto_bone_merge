@@ -20,11 +20,14 @@ For the tested `LX.ini` character:
 - Multiple passes can use the same part IB and `match_index_count`.
 - `vs-t0` was stable across tested passes: `554904b3`.
 - `VSSetConstantBuffers1(StartSlot:1)` can use different `first_constant` values per pass.
-- The logical `cb1` content can differ per pass.
-- The bone-window pointer fields used by current capture logic, `cb1[5].x` and `cb1[5].y`, remained stable in tested normal and afterimage passes.
+- FrameAnalysis CB dumps are raw full-buffer dumps. The shader-visible `cb1[5]` for a draw is located at `raw_cb1[first_constant + 5]`.
+- The logical `cb1` content can differ per pass, and the raw CB rows used by each pass can differ.
+- The bone-window pointer fields used by current capture logic, shader-visible `cb1[5].x` and `cb1[5].y`, remained stable for the same tested part IB across multiple passes after applying `first_constant + 5`.
 - `cb1[5].z` differed between normal and afterimage/effect passes, for example `258`, `2`, and `1`.
 
-Therefore the design must not assume that the whole `cb1` is identical for all passes of one IB. The runtime should preserve the current draw's `cb1[5].z/w` and only rewrite `cb1[5].x/y` when redirecting to the local rebuilt palette.
+For example, in `FrameAnalysis-2026-05-05-222451`, the tested `640d1c0e` passes used different `first_constant` values but all resolved to shader-visible `cb1[5].xy = 449614/448066`; tested `2009f0d6` passes resolved to `450751/448828`.
+
+Therefore the design must not assume that the whole `cb1` is identical for all passes of one IB. Capture must use the current draw's shader-visible `cb1[5].x/y` to read the native bone window. Consume must preserve the current draw's `cb1[5].z/w` and rewrite only `cb1[5].x/y` when redirecting to the local rebuilt palette.
 
 ## Runtime Identity
 
@@ -41,7 +44,16 @@ local_bone_count
 
 Shader hash and pass identity are useful for classification and diagnostics, but they should not be the primary bone-store identity. Shader hashes are expected to change more often during game updates than the underlying mesh layout and bone palette shape.
 
-`cb1[5].x/y` are offline validation fields in the default architecture. They are not read every frame by the runtime shaders when they match the expected local layout.
+`cb1[5].x/y` are both offline validation fields and runtime capture inputs. They are native bone-window offsets into the currently bound game `vs-t0` store. They must not be assumed to be `0/1024` during capture.
+
+When the consume path binds `ResourceLocalFakeT0_SRV` as `vs-t0`, the draw no longer points at the game's native large bone store. The draw's shader-visible `cb1[5].x/y` must therefore be redirected to the local fake layout:
+
+```text
+cb1[5].x = 0
+cb1[5].y = LOCAL_PREVIOUS_ROW_OFFSET
+```
+
+For the default local fake store, `LOCAL_PREVIOUS_ROW_OFFSET = 1024`.
 
 The final consume identity is:
 
@@ -199,7 +211,8 @@ Each record represents one accepted native source palette. Records are sorted by
   "capture_store_base": 0,
   "capture_meta_index": 0,
   "vs_t0_hash": "554904b3",
-  "cb1_xy": [0, 1024],
+  "native_cb1_xy": [449614, 448066],
+  "redirect_cb1_xy": [0, 1024],
   "capture_vs_filter": 200,
   "capture_draw_indices": [211],
   "confidence": "exact_hash",
@@ -307,7 +320,7 @@ Each chunk entry should include the exported mesh resources, draw calls, and pal
 
 ```json
 {
-  "cb1_xy_fast_path": true,
+  "native_cb1_xy_consistent_by_part": true,
   "all_required_captures_before_replay_host": true,
   "max_local_bone_count_ok": true,
   "ambiguous_records": [],
@@ -324,30 +337,29 @@ Capture pass:
 
 ```ini
 if vs == <capture_filter>
+  run = CustomShader_ExtractCB1
   cs-t2 = ResourceCaptureMeta_<record_view>
   run = CustomShader_RecordBones
 endif
 ```
 
-`RecordBones` reads the current draw's `vs-t0` by reference. In D3D11, a shader resource slot binds an SRV view, not just a raw underlying buffer. If the game created the SRV as a slice of a larger bone buffer, HLSL indexing is relative to that SRV view. Therefore `vs_t0[0]` means element zero of the currently bound view.
+`RecordBones` reads the current draw's native `vs-t0` by reference and reads the current draw's shader-visible `cb1[5].x/y` from the extracted CB1 copy.
 
-Because scanned target draws currently validate to:
+FrameAnalysis showed that the game binds a large native bone store in `vs-t0`. The native `cb1[5].x/y` values point into that large store and are not `0/1024`. Therefore capture must use:
 
 ```text
-cb1[5].x = 0
-cb1[5].y = 1024
+native_current_base  = cb1[5].x
+native_previous_base = cb1[5].y
 ```
 
-the default capture path does not need to extract or read `cb1` at runtime. It copies from the fixed view-relative layout:
+and copy from:
 
 ```text
-current:  0    + 3 + localBone * 3 + row
-previous: 1024 + 3 + localBone * 3 + row
+current:  native_current_base  + 3 + localBone * 3 + row
+previous: native_previous_base + 3 + localBone * 3 + row
 ```
 
 into the global capture store at `capture_store_base`.
-
-If a future scan finds a target whose `cb1[5].x/y` do not match `0/1024`, that target is not compatible with the fast path. It should be reported as needing a fallback runtime mode rather than silently generating incorrect capture code.
 
 Capture-only overrides may suppress original drawing only for source draws that have exported replacement geometry in the current export collection. Skipping an original draw without issuing replacement draw calls will create missing model parts. Therefore draw suppression must live inside the guarded branch that also emits the replacement path for that exported source.
 
@@ -364,24 +376,6 @@ capture_store_index = capture_store_base + localBone
 Consume pass:
 
 ```ini
-cs-t2 = ResourceLocalPalette_<chunk>
-cs-t3 = ResourceLocalPaletteMeta_<chunk>
-run = CustomShader_GatherBones
-vs-t0 = ResourceLocalFakeT0_SRV
-```
-
-This is the preferred fast path when the original draw already has:
-
-```text
-cb1[5].x = 0
-cb1[5].y = LOCAL_PREVIOUS_ROW_OFFSET
-```
-
-In that case the VS already points at the same row layout used by `ResourceLocalFakeT0_SRV`, so the consume phase only needs to gather the required bones into the local fake `vs-t0` and bind that resource. It does not need to copy or rewrite `cb1`.
-
-Fallback consume pass:
-
-```ini
 run = CustomShader_ExtractCB1
 cs-t2 = ResourceLocalPalette_<chunk>
 cs-t3 = ResourceLocalPaletteMeta_<chunk>
@@ -391,7 +385,14 @@ run = CustomShader_RedirectCB1
 vs-cb1 = ResourceFakeCB1
 ```
 
-The fallback is only needed when the original draw's `cb1[5].x/y` do not match the local fake `vs-t0` layout. `RedirectCB1` must preserve all current `cb1` values except `cb1[5].x/y`, which are rewritten to the local fake palette bases.
+`RedirectCB1` is part of the default consume path. Once `ResourceLocalFakeT0_SRV` is bound as `vs-t0`, the original native `cb1[5].x/y` would point outside the local fake store. `RedirectCB1` must preserve all current `cb1` values except shader-visible `cb1[5].x/y`, which are rewritten to the local fake palette bases:
+
+```text
+cb1[5].x = 0
+cb1[5].y = LOCAL_PREVIOUS_ROW_OFFSET
+```
+
+If a future design binds the full global capture store directly as `vs-t0`, then `cb1[5].x/y` must instead be redirected to that chunk's global current/previous offsets. Under the current small-buffer consume design, the correct redirect target is always `0/1024`.
 
 ## Performance Direction
 
@@ -630,15 +631,25 @@ This limit applies per hash collection/chunk after recursive object gathering an
 
 Import Selected IBs places imported objects directly under the single root collection. It does not create a separate import root.
 
-After Build Global Bone Pool, users manually move/edit/copy objects into the desired hash subcollections for export.
+After Build Global Bone Pool, the addon creates empty child collections for every accepted candidate:
+
+```text
+<root export collection>
+  <ib_hash>-<match_index_count>-0
+  <ib_hash>-<match_index_count>-0-NO_CAPTURE_BONES
+```
+
+These child collections are the export contract. Final INI identity, `match_index_count`, palette generation, and delayed shadow replay all derive from the child collection name. Mesh object names are not final export identity. The `NO_CAPTURE_BONES` suffix marks mapping-only candidates: their own native matrices were not captured in the early shadow stage, but the collection can still host meshes that use other captured global bones.
+
+Users manually move/edit/copy objects into the desired child collections for export.
 
 The addon may provide a convenience button:
 
 ```text
-Sort Selected By Object Hash
+Add Selected To Matching Export Collections
 ```
 
-This button reads each selected object's first independent 8-hex source hash, finds or creates the matching hash collection under the root, and moves/links the object there. This is only a workflow accelerator. The final export identity is still determined by the destination hash collection.
+This button reads each selected object's stored source hash or first independent 8-hex source hash, finds a unique matching child collection under the root, and links the object there. This is only a workflow accelerator. If the same hash has multiple child collections with different `match_index_count`, the operation must report `ambiguous_source_hash` instead of guessing. The final export identity is still determined by the destination child collection.
 
 ### Candidate List And Rename
 
@@ -654,20 +665,23 @@ The scanner uses the source hash to find current FrameAnalysis data:
 source IB hash
 match_index_count
 source_index_count
-source local bone count
+compact local bone count
+used source-local bone indices
+per-candidate skin weight/index format
 runtime validation fields
 ```
 
 Build Global Bone Pool creates:
 
 ```text
-source local bone -> global bone
-capture records sorted by match_index_count descending
+used source local bone -> compact global bone
+capture records sorted by capture availability, then match_index_count descending
 CaptureMeta / global pool manifest entries
 the single export root collection, if missing
+empty export child collections for accepted candidates, with unavailable markers for no-shadow mappings
 ```
 
-The pool build may immediately rename matched source objects into global vertex-group semantics. A separate Apply Global Bone Names button must also remain available for objects not imported by this plugin.
+The pool build may immediately rename matched imported/source objects into global vertex-group semantics. This is a convenience step for objects imported by this plugin, because they already carry `bmc_source_ib_hash`, `bmc_match_first_index`, and `bmc_match_index_count`.
 
 Rename logic:
 
@@ -675,9 +689,59 @@ Rename logic:
 object source hash + object local bone index -> global bone index
 ```
 
-Scan must not silently rewrite meshes.
+The rename must set object metadata:
+
+```text
+bmc_vertex_group_state = "global"
+bmc_global_group_remap = [...]
+bmc_global_source_key = "<ib_hash>-<match_index_count>-<match_first_index>"
+bmc_global_pool_generation = "<manifest generation id>"
+```
+
+If an object already has matching `bmc_vertex_group_state = "global"` and the same generation/source key, repeat clicks must skip it instead of remapping global groups as if they were local groups.
+
+Analyze must not silently rewrite meshes.
 
 This rename function is an important compatibility feature. For external models imported by other tools, the plugin can still convert local numeric groups to the global pool naming scheme by using the object hash and the built source mapping table.
+
+External/export objects use a separate button:
+
+```text
+Apply Global Names In Export Collection
+```
+
+This walks mesh objects under export child collections. It resolves the mapping from the child collection name, not from the object name:
+
+```text
+child collection: 640d1c0e-46845-0
+mapping source:   global pool record 640d1c0e + 46845
+operation:        local numeric vertex group -> canonical global vertex group
+```
+
+This makes the collection the authority for renamed external meshes. Object names can be free-form after the mesh is placed in a child collection.
+
+There is a default-closed `Vertex Group Tools` panel for temporary or external meshes:
+
+```text
+Rename To Global
+Rename To Local
+Merge Seam Groups
+```
+
+The rename buttons do not use collection membership. They inspect selected mesh objects, or all scene mesh objects when nothing is selected, and look for any 8-hex IB hash in the object name. If the hash uniquely matches a global-pool record, `Rename To Global` applies that source-local to global mapping. `Rename To Local` applies the inverse mapping and clears the global rename metadata. If one hash maps to multiple pool records, the object name must contain the full `hash-index_count-first_index` source key; otherwise the operation must report ambiguity instead of guessing.
+
+`Merge Seam Groups` reuses the same seam vertex-group matcher as the original standalone seam tool. It builds a seam-space mapping from selected mesh objects and renames matched seam groups to the canonical group. Build Global Bone Pool also calls this same function once after automatically renaming candidate source meshes to global groups, so imported IB pool meshes get seam-group normalization without a second UI step. A seam failure must warn instead of cancelling the global-pool build.
+
+The seam matcher is performance-sensitive. It must cache each mesh's weighted boundary vertices and spatial hash once, then reuse that cache for object-pair matching. Vertices without numeric weights are excluded from seam matching because they cannot contribute to a vertex-group alias. If two matched seam groups already have the same global group number, the matcher treats it as an idempotent no-op rather than an error.
+
+Final Blender contract before Prepare Export:
+
+```text
+Object name hash: used for auto-placement only.
+Child collection: authoritative export identity.
+Visible vertex-group numbers: canonical global bone indices.
+Prepare Export: localizes build copies into chunk-local indices and writes PaletteTable.
+```
 
 ### Import/Export/INI Rules
 
@@ -860,6 +924,16 @@ Candidate IBs are the editable UI list. They are merged from `draw_hits` by draw
   "source_index_count": 8148,
   "producer_dispatch_index": 274,
   "local_bone_count": 16,
+  "source_local_bone_count": 83,
+  "used_local_bone_indices": [0, 1, 4, 9],
+  "skin_format": {
+    "slot": "vb2",
+    "stride": 12,
+    "blend_weights_format": "R16G16B16A16_UNORM",
+    "blend_weights_offset": 0,
+    "blend_indices_format": "R8G8B8A8_UINT",
+    "blend_indices_offset": 8
+  },
   "texture_region_key": "ae1ab184-8148-190539",
   "import_paths": {
     "ib": "",
@@ -871,7 +945,13 @@ Candidate IBs are the editable UI list. They are merged from `draw_hits` by draw
 
 `enabled` is user-editable. Disabled candidates stay in the manifest for diagnostics but are not imported and do not build the global pool.
 
-`shadow_capture_ready` is the gate for Build Global Bone Pool. A candidate can be importable even when this field is false, but it must be excluded from the global bone pool because the runtime cannot safely capture its native palette from the early shadow stage.
+`local_bone_count` is the compact count of source-local bones that are actually referenced by weighted vertices. `source_local_bone_count` is the original native palette span, normally `max(used_local_bone_indices) + 1` unless the native draw proves a larger valid range. `used_local_bone_indices` is the authoritative sparse local palette list for Blender renaming and compact global-pool construction.
+
+`skin_format` is per candidate, not global. Import and compact-palette analysis must read weights and indices from this candidate's selected `import_draw_index` and its own skin slot. For example, one IB may use `R16G16B16A16_UNORM` weights plus `R8G8B8A8_UINT` indices, while another uses `R32G32B32A32_FLOAT` weights plus `R32G32B32A32_UINT` indices. Header/layout and `.buf` files from different passes must not be mixed when decoding skin data.
+
+For `.buf` decoding, the header/deduped layout `byte offset` is authoritative. The inline `vertex-data` preview in a `.txt` dump is useful evidence, but it must not be used to auto-shift the buffer base. In the tested `640d1c0e-46845-0` dump, trusting the preview would shift `vb2` by `-4` bytes and produce a false `0..255` fragmented weight palette; trusting the layout offset gives a stable 145-bone palette with per-vertex weights summing to 1.
+
+`shadow_capture_ready` means the candidate has an early-shadow draw that can provide native bone matrices. Candidates where this is false can still enter the global mapping pool, but their generated export collection must be visibly marked as bone-capture unavailable. They are useful as draw/material hosts, not as sources of captured bones.
 
 #### texture_candidates
 
@@ -933,11 +1013,16 @@ This preserves the runtime bone-store semantics and avoids event-order drift whe
   "producer_dispatch_index": 274,
   "global_bone_base": 378,
   "local_bone_count": 16,
-  "capture_store_base": 378
+  "source_local_bone_count": 83,
+  "used_local_bone_indices": [0, 1, 4, 9],
+  "capture_store_base": 378,
+  "bone_capture_available": true
 }
 ```
 
-The global bone index and capture-store index have the same meaning in HLSL. Exported chunk palettes must reference these indices exactly.
+`bone_pool_order` is compact. It allocates one global slot per entry in `used_local_bone_indices`, not one slot per number in `0..max_local`. Capture-ready candidates are sorted first; mapping-only/no-shadow candidates are sorted after them and are marked `bone_capture_available=false`.
+
+The global bone index and capture-store index have the same meaning in HLSL. Exported chunk palettes must reference these indices exactly. Runtime capture for sparse native palettes must use the same `used_local_bone_indices` table so local source bone `248` can be written to compact global slot `base + compact_index`, not blindly to `base + 248`.
 
 #### lod_frameanalysis
 
@@ -1119,41 +1204,33 @@ Do not create a separate imported data stream for `vb3` when it aliases `vb0`. P
 `Texcoord` buffer:
 
 ```text
-stride = 20
+stride/layout are per candidate import draw
 +0   TEXCOORD0  R32G32_FLOAT       UV0
-+8   TEXCOORD1  R32G32_FLOAT       UV1
-+16  TEXCOORD4  R8G8B8A8_SNORM     packed auxiliary data
++8   TEXCOORD1  R32G32_FLOAT       UV1, when present
++16  TEXCOORD4  R8G8B8A8_SNORM     packed auxiliary data, when present at this offset
 ```
 
-`UV1` is real source data, not filler. For `640d1c0e`, the first vertices contain values such as:
-
-```text
-0.591714621, 0.185148418
-0.594583273, 0.177773193
-0.587006032, 0.184763551
-0.0254230108, 0.334441602
-0.0340663977, 0.35172838
-```
-
-Import should create a second Blender UV layer for `TEXCOORD1`, for example `UVMap_1`. If the user later exports a mesh with only one UV layer, export may copy `UV0` into `UV1` as a compatibility fallback, but imported native models should keep the original `UV1` values.
+`UV1` is real source data when the selected import draw exposes `TEXCOORD1`. Import should create a second Blender UV layer for it, for example `UV1`. If `TEXCOORD1` is absent, import and export copy `UV0` into `UV1` as the compatibility fallback. Do not synthesize UV1 from another pass layout while reading the selected draw's `.buf`.
 
 `TEXCOORD4` is not a UV layer. It is a packed signed-normalized auxiliary field. It is used by multiple passes under different semantic names, for example `TEXCOORD4` and sometimes `TEXCOORD2` at the same byte offset. Import should keep it as a custom packed attribute or raw byte payload, not as a Blender UV map.
 
 `Blend` buffer:
 
 ```text
-stride = 12
-+0  BLENDWEIGHTS0  R16G16B16A16_UNORM
-+8  BLENDINDICES0  R8G8B8A8_UINT
+stride/slot/layout are per candidate import draw
++0   BLENDWEIGHTS0  R16G16B16A16_UNORM or R32G32B32A32_FLOAT
++8/+16 BLENDINDICES0 R8G8B8A8_UINT or R32G32B32A32_UINT
 ```
 
-`BLENDINDICES0` are source-local palette indices. They are not global bone indices. Import should keep them as local vertex groups until Build Global Bone Pool renames or maps them. Export localizes the final chunk again and writes compact local indices, while `PaletteTable.buf` maps those final local indices back to global capture-store indices.
+`BLENDINDICES0` are source-local palette indices. They are not global bone indices. Import must decode them using the current candidate's `skin_format`, never a project-wide default. Import should keep them as local vertex groups until Build Global Bone Pool renames or maps them. Export localizes the final chunk again and writes compact local indices, while `PaletteTable.buf` maps those final local indices back to global capture-store indices.
 
 The source `IB` can be `DXGI_FORMAT_R16_UINT`, even if older exported mods wrote `DXGI_FORMAT_R32_UINT`. Import should record the native index format from FrameAnalysis. Export may choose a wider format only when the generated index data requires it or when reusing an inherited mod_importer rule.
 
-#### Multi-Pass Layout Union
+#### Multi-Pass Layout Evidence
 
-The importer must gather layouts from every enabled draw hit for one candidate IB. For the tested `640d1c0e` group, the same core slices were reused across all hits:
+The importer must choose one `import_draw_index` for one candidate IB and bind every imported slot to that draw's header/layout and `.buf`. Other draw hits are evidence for pass scheduling, material marks, or diagnostics; they must not be merged into the imported skin layout because weight/index formats can differ between IBs.
+
+For the tested `640d1c0e` group, the same core slices were reused across many hits:
 
 ```text
 ib  = 640d1c0e
@@ -1206,13 +1283,21 @@ The accepted pool inputs are:
 
 ```text
 enabled candidate
-shadow_capture_ready == true
 local_bone_count > 0
 ```
 
-Candidates that were imported only for editing/reference but cannot be matched to the early shadow/capture stage are skipped. This keeps the runtime tables honest: every global-pool source must correspond to native matrices that can actually be captured before delayed replay.
+Candidates with `shadow_capture_ready == true` are capture sources and must be placed first. Candidates without early-shadow capture are still allowed into the mapping pool after all capture-ready candidates. Their child export collections are created with a visible unavailable marker, because their own bones cannot be collected; they can still host delayed/material replay for meshes that use already-captured global bones.
 
-Accepted candidates are sorted by descending `match_index_count`, with larger source chunks occupying earlier global-bone positions and earlier vertex-group naming ranges. Ties use local bone count, mesh fingerprint, first index, and hash only as deterministic tie-breakers.
+Accepted candidates are sorted by capture availability, then descending `match_index_count`, with larger source chunks occupying earlier global-bone positions and earlier vertex-group naming ranges. Ties use compact local bone count, mesh fingerprint, first index, and hash only as deterministic tie-breakers.
+
+The pool is compact:
+
+```text
+global = global_bone_base + compact_index
+compact_index = index of source_local_bone in used_local_bone_indices
+```
+
+This means imported raw vertex groups may be sparse and overlapping across IBs, but after global renaming they become compact and globally unique for the selected source identity. Runtime capture must therefore use the same sparse-source table; a continuous copy of `0..source_local_bone_count` is no longer semantically correct for compact pools.
 
 It also creates the single export root collection if it does not exist. After this step, users edit models and place final meshes under hash collections inside the export root.
 
@@ -1232,7 +1317,7 @@ The main FrameAnalysis is the source of truth for:
 ```text
 candidate IB list
 imported source models
-canonical global pool built from enabled capture-ready candidates
+canonical global pool built from enabled candidates, with capture-ready records first
 canonical global bone indices
 final export chunks and PaletteTable semantics
 ```
@@ -1247,7 +1332,7 @@ The intended user flow is:
 1. Analyze Main.
 2. Import selected main candidates.
 3. User deletes unwanted candidates from the Candidate IB list or refreshes the list from collection objects.
-4. Build Global Bone Pool from enabled, shadow-capture-ready candidates.
+4. Build Global Bone Pool from enabled candidates; capture-ready entries are first, mapping-only entries are marked unavailable.
 5. Analyze LOD.
 6. Generate runtime buffers and INI.
 ```
@@ -1258,10 +1343,10 @@ This keeps one editable list as the UI source of truth:
 Candidate IB List:
   all main candidates discovered from FrameAnalysis, plus manual or collection-refreshed entries
   enabled entries control import
-  enabled + shadow_capture_ready entries control Build Global Bone Pool
+  enabled + local_bone_count > 0 entries control Build Global Bone Pool
 ```
 
-The LOD analyzer must consume the built global pool, not the full Candidate IB list. Imported candidates that the user deleted, disabled, or that failed `shadow_capture_ready` must not pollute LOD matching.
+The LOD analyzer must consume the built global pool, not the full Candidate IB list. Imported candidates that the user deleted or disabled must not pollute LOD matching. Mapping-only/no-shadow candidates can appear in the pool, but they must not be treated as native capture sources unless an LOD mapping explicitly provides a valid capture path.
 
 ### Main To LOD Draw Linking
 

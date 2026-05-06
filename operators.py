@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import bpy
 from bpy.app.handlers import persistent
 
-from .constants import BI4_MAX_BONE_COUNT
+from .constants import (
+    BI4_MAX_BONE_COUNT,
+    BMC_GLOBAL_POOL_GENERATION_PROP,
+    BMC_GLOBAL_REMAP_PROP,
+    BMC_GLOBAL_SOURCE_KEY_PROP,
+    BMC_VERTEX_GROUP_STATE_GLOBAL,
+    BMC_VERTEX_GROUP_STATE_PROP,
+)
 from .core.blender_ops import (
     apply_group_remaps_to_meshes,
     annotate_alias_items_with_mesh_proximity,
@@ -28,12 +36,12 @@ from .core.mapping_payload import (
 from .core.presets import delete_preset, load_preset, save_preset
 from .core.export_prepare import prepare_export_collection, regenerate_bonestore_runtime_files
 from .core.frameanalysis import infer_mesh_identity_from_name
-from .core.io import read_json
+from .core.io import read_json, write_json
 from .core.import_candidates import import_selected_candidates
 from .core.lod_runtime import build_lod_mapping, scan_lod_targets_and_generate_manifest
-from .core.main_analyze import write_main_analysis_manifest
+from .core.main_analyze import build_bone_pool_order, write_main_analysis_manifest
 from .core.shadow_split import generate_shadow_split
-from .core.seam_matcher import apply_seam_mapping, build_seam_mapping
+from .core.seam_matcher import apply_seam_mapping, build_and_apply_seam_mapping, build_seam_mapping
 from .core.workflow import scan_targets_and_generate_outputs
 from .core.models import TargetObjectSpec
 
@@ -41,6 +49,7 @@ DEFAULT_TARGET_COLLECTION_NAME = "BMC Bone Palette Targets"
 DEFAULT_EXPORT_COLLECTION_NAME = "BMC Export Sources"
 DEFAULT_EXPORT_BUILD_COLLECTION_NAME = "BMC Export Build"
 _EXPORT_NORMALIZE_GUARD = False
+_EXPORT_CHUNK_NAME_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)(?:[-_](?P<chunk>\d+))?")
 
 
 def _ensure_target_collection(context):
@@ -79,8 +88,39 @@ def _ensure_export_build_collection(context):
     return collection
 
 
-def _ensure_export_chunk_collection(parent_collection, ib_hash: str, match_index_count: int = 0, chunk_index: int = 0):
+def _export_chunk_collection_name(
+    ib_hash: str,
+    match_index_count: int = 0,
+    chunk_index: int = 0,
+    *,
+    bone_capture_available: bool = True,
+) -> str:
     chunk_name = f"{ib_hash.lower()}-{int(match_index_count)}-{int(chunk_index)}"
+    if not bone_capture_available:
+        chunk_name += "-NO_CAPTURE_BONES"
+    return chunk_name
+
+
+def _ensure_export_chunk_collection(
+    parent_collection,
+    ib_hash: str,
+    match_index_count: int = 0,
+    chunk_index: int = 0,
+    *,
+    bone_capture_available: bool = True,
+):
+    chunk_name = _export_chunk_collection_name(
+        ib_hash,
+        match_index_count,
+        chunk_index,
+        bone_capture_available=bone_capture_available,
+    )
+    for child in parent_collection.children:
+        identity = _resolve_export_chunk_collection_identity(child)
+        if identity == (str(ib_hash or "").lower(), int(match_index_count), int(chunk_index)):
+            if child.name != chunk_name and bpy.data.collections.get(chunk_name) is None:
+                child.name = chunk_name
+            return child
     collection = bpy.data.collections.get(chunk_name)
     if collection is None:
         collection = bpy.data.collections.new(chunk_name)
@@ -134,11 +174,26 @@ def _ensure_export_chunk_collection_if_missing(
     ib_hash: str,
     match_index_count: int,
     chunk_index: int = 0,
+    *,
+    bone_capture_available: bool = True,
 ) -> bool:
-    chunk_name = f"{ib_hash.lower()}-{int(match_index_count)}-{int(chunk_index)}"
-    existed_under_parent = any(child.name == chunk_name for child in parent_collection.children)
-    _ensure_export_chunk_collection(parent_collection, ib_hash, match_index_count, chunk_index)
+    identity = (str(ib_hash or "").lower(), int(match_index_count), int(chunk_index))
+    existed_under_parent = any(_resolve_export_chunk_collection_identity(child) == identity for child in parent_collection.children)
+    _ensure_export_chunk_collection(
+        parent_collection,
+        ib_hash,
+        match_index_count,
+        chunk_index,
+        bone_capture_available=bone_capture_available,
+    )
     return not existed_under_parent
+
+
+def _resolve_export_chunk_collection_identity(collection) -> tuple[str, int, int] | None:
+    match = _EXPORT_CHUNK_NAME_RE.search(str(getattr(collection, "name", "") or ""))
+    if not match:
+        return None
+    return match.group("hash").lower(), int(match.group("count")), int(match.group("chunk") or 0)
 
 
 def _link_object_to_collection(mesh_obj, collection) -> None:
@@ -770,11 +825,649 @@ def _replace_candidate_items_from_manifest(scene, manifest: dict) -> None:
         item.ib_hash = str(candidate.get("ib_hash", "") or "")
         item.match_first_index = int(candidate.get("match_first_index", 0))
         item.match_index_count = int(candidate.get("match_index_count", 0))
+        item.import_draw_index = int(candidate.get("import_draw_index", -1))
         item.local_bone_count = int(candidate.get("local_bone_count", 0))
         item.draw_count = len(candidate.get("draw_indices", []) or [])
         item.shadow_draw_count = len(candidate.get("shadow_draw_indices", []) or [])
+        item.shadow_capture_ready = bool(candidate.get("shadow_capture_ready", bool(candidate.get("shadow_draw_indices"))))
+        item.status = str(candidate.get("status", "") or ("capture_ready" if item.shadow_capture_ready else "import_only_no_early_shadow"))
         item.manual = False
     scene.bmc_candidate_index = min(scene.bmc_candidate_index, max(0, len(scene.bmc_candidate_items) - 1))
+
+
+def _candidate_display_name_from_values(ib_hash: str, match_index_count: int, match_first_index: int) -> str:
+    return f"{str(ib_hash or '').lower()}-{int(match_index_count)}-{int(match_first_index)}"
+
+
+def _candidate_key_from_item(item) -> tuple[str, int, int]:
+    return (
+        str(getattr(item, "ib_hash", "") or "").strip().lower(),
+        int(getattr(item, "match_first_index", 0) or 0),
+        int(getattr(item, "match_index_count", 0) or 0),
+    )
+
+
+def _candidate_key_from_payload(candidate: dict) -> tuple[str, int, int]:
+    return (
+        str(candidate.get("ib_hash", "") or "").strip().lower(),
+        int(candidate.get("match_first_index", 0) or 0),
+        int(candidate.get("match_index_count", candidate.get("source_index_count", 0)) or 0),
+    )
+
+
+def _candidate_item_exists(scene, candidate: dict) -> bool:
+    candidate_key = _candidate_key_from_payload(candidate)
+    candidate_name = str(candidate.get("display_name", "") or "")
+    for item in scene.bmc_candidate_items:
+        if candidate_name and str(item.display_name) == candidate_name:
+            return True
+        if _candidate_key_from_item(item) == candidate_key:
+            return True
+    return False
+
+
+def _apply_candidate_payload_to_item(item, candidate: dict, *, manual: bool = False) -> None:
+    ib_hash, first_index, index_count = _candidate_key_from_payload(candidate)
+    item.enabled = bool(candidate.get("enabled", True))
+    item.ib_hash = ib_hash
+    item.match_first_index = int(first_index)
+    item.match_index_count = int(index_count)
+    item.display_name = str(candidate.get("display_name", "") or _candidate_display_name_from_values(ib_hash, index_count, first_index))
+    item.import_draw_index = int(candidate.get("import_draw_index", -1))
+    item.local_bone_count = int(candidate.get("local_bone_count", 0))
+    item.draw_count = len(candidate.get("draw_indices", []) or [])
+    item.shadow_draw_count = len(candidate.get("shadow_draw_indices", []) or [])
+    item.shadow_capture_ready = bool(candidate.get("shadow_capture_ready", bool(candidate.get("shadow_draw_indices"))))
+    item.status = str(candidate.get("status", "") or ("capture_ready" if item.shadow_capture_ready else "manual_or_import_only"))
+    item.manual = bool(manual)
+
+
+def _manifest_candidates_by_hash(manifest: dict, ib_hash: str) -> list[dict]:
+    normalized_hash = str(ib_hash or "").strip().lower()
+    return [
+        candidate
+        for candidate in manifest.get("candidate_ibs", []) or []
+        if str(candidate.get("ib_hash", "") or "").strip().lower() == normalized_hash
+    ]
+
+
+def _find_manifest_candidate_for_item(manifest: dict, item) -> dict | None:
+    item_key = _candidate_key_from_item(item)
+    item_name = str(getattr(item, "display_name", "") or "")
+    for candidate in manifest.get("candidate_ibs", []) or []:
+        if item_name and str(candidate.get("display_name", "") or "") == item_name:
+            return dict(candidate)
+        if _candidate_key_from_payload(candidate) == item_key:
+            return dict(candidate)
+    return None
+
+
+def _candidate_payload_from_item(item, manifest: dict | None = None) -> dict:
+    candidate = _find_manifest_candidate_for_item(manifest or {}, item) if manifest else None
+    if candidate is None:
+        ib_hash, first_index, index_count = _candidate_key_from_item(item)
+        candidate = {
+            "ib_hash": ib_hash,
+            "match_first_index": int(first_index),
+            "match_index_count": int(index_count),
+            "display_name": str(getattr(item, "display_name", "") or _candidate_display_name_from_values(ib_hash, index_count, first_index)),
+            "draw_indices": [],
+            "shadow_draw_indices": [],
+            "local_bone_count": int(getattr(item, "local_bone_count", 0) or 0),
+            "import_paths": {"ib": "", "vb": {}, "layout": ""},
+        }
+    candidate["enabled"] = bool(getattr(item, "enabled", True))
+    candidate["shadow_capture_ready"] = bool(getattr(item, "shadow_capture_ready", False))
+    candidate["status"] = str(getattr(item, "status", "") or candidate.get("status", ""))
+    return candidate
+
+
+def _candidate_payloads_from_ui(scene, manifest: dict | None = None) -> list[dict]:
+    payloads = []
+    seen: set[tuple[str, int, int]] = set()
+    for item in scene.bmc_candidate_items:
+        key = _candidate_key_from_item(item)
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        payloads.append(_candidate_payload_from_item(item, manifest))
+    return payloads
+
+
+def _add_candidate_from_payload(scene, candidate: dict, *, manual: bool = False) -> bool:
+    if _candidate_item_exists(scene, candidate):
+        return False
+    item = scene.bmc_candidate_items.add()
+    _apply_candidate_payload_to_item(item, candidate, manual=manual)
+    scene.bmc_candidate_index = len(scene.bmc_candidate_items) - 1
+    return True
+
+
+def _replace_candidate_items_from_payloads(scene, candidates: list[dict], *, previous_state: dict | None = None) -> None:
+    previous_state = previous_state or {}
+    previous_index = int(getattr(scene, "bmc_candidate_index", 0) or 0)
+    scene.bmc_candidate_items.clear()
+    for candidate in candidates:
+        item = scene.bmc_candidate_items.add()
+        manual = bool(candidate.get("_manual", candidate.get("manual", False)))
+        _apply_candidate_payload_to_item(item, candidate, manual=manual)
+        key = _candidate_key_from_item(item)
+        state = previous_state.get(key)
+        if state is not None:
+            item.enabled = bool(state.get("enabled", item.enabled))
+    scene.bmc_candidate_index = min(previous_index, max(0, len(scene.bmc_candidate_items) - 1))
+
+
+def _candidate_payloads_from_collection(scene, source_collection, manifest: dict) -> tuple[list[dict], dict]:
+    payloads: list[dict] = []
+    seen: set[tuple[str, int, int]] = set()
+    stats = {
+        "scanned_meshes": 0,
+        "recognized_meshes": 0,
+        "duplicate_candidates": 0,
+    }
+    for mesh_obj in _iter_collection_objects_recursive(source_collection):
+        if getattr(mesh_obj, "type", "") != "MESH":
+            continue
+        stats["scanned_meshes"] += 1
+        object_candidates = _manifest_candidates_for_object(manifest, mesh_obj)
+        if not object_candidates:
+            continue
+        stats["recognized_meshes"] += 1
+        for candidate in object_candidates:
+            key = _candidate_key_from_payload(candidate)
+            if not key[0] or key in seen:
+                stats["duplicate_candidates"] += 1
+                continue
+            seen.add(key)
+            payloads.append(dict(candidate))
+    payloads.sort(
+        key=lambda candidate: (
+            -int(candidate.get("match_index_count", candidate.get("source_index_count", 0)) or 0),
+            str(candidate.get("ib_hash", "") or ""),
+            int(candidate.get("match_first_index", 0) or 0),
+        )
+    )
+    return payloads, stats
+
+
+def _iter_collection_objects_recursive(collection):
+    if collection is None:
+        return
+    for mesh_obj in collection.objects:
+        yield mesh_obj
+    for child in collection.children:
+        yield from _iter_collection_objects_recursive(child)
+
+
+def _object_candidate_identity(mesh_obj) -> tuple[str, int, int] | None:
+    ib_hash = str(mesh_obj.get("bmc_source_ib_hash", "") or getattr(mesh_obj, "merge_ib_hash", "") or "").strip().lower()
+    if not ib_hash:
+        inferred = infer_mesh_identity_from_name(mesh_obj.name)
+        if inferred:
+            ib_hash = inferred[0].lower()
+    if not ib_hash or len(ib_hash) != 8 or any(character not in "0123456789abcdef" for character in ib_hash):
+        return None
+    first_index = int(mesh_obj.get("bmc_match_first_index", 0) or 0)
+    index_count = int(mesh_obj.get("bmc_match_index_count", 0) or getattr(mesh_obj, "merge_match_index_count", 0) or 0)
+    return ib_hash, first_index, max(0, index_count)
+
+
+def _object_source_hash(mesh_obj) -> str:
+    identity = _object_candidate_identity(mesh_obj)
+    if identity is not None:
+        return identity[0]
+    inferred = infer_mesh_identity_from_name(mesh_obj.name)
+    return inferred[0].lower() if inferred else ""
+
+
+def _global_pool_generation_id(manifest: dict, bone_pool_order: list[dict] | None = None) -> str:
+    existing = str(manifest.get("global_pool_generation", "") or "")
+    if existing:
+        return existing
+    order = bone_pool_order if bone_pool_order is not None else list(manifest.get("bone_pool_order", []) or [])
+    signature_parts = [
+        (
+            str(item.get("ib_hash", "") or "").lower(),
+            str(int(item.get("match_index_count", 0) or 0)),
+            str(int(item.get("match_first_index", 0) or 0)),
+            str(int(item.get("global_bone_base", 0) or 0)),
+            str(int(item.get("local_bone_count", 0) or 0)),
+            ",".join(str(int(value)) for value in item.get("used_local_bone_indices", []) or []),
+            "capture" if bool(item.get("bone_capture_available", item.get("shadow_capture_ready", False))) else "mapping",
+        )
+        for item in order
+    ]
+    return "|".join("-".join(part) for part in signature_parts)
+
+
+def _source_key_from_values(ib_hash: str, match_index_count: int, match_first_index: int = 0) -> str:
+    return f"{str(ib_hash or '').lower()}-{int(match_index_count)}-{int(match_first_index)}"
+
+
+def _object_remaps_from_bone_pool_order(bone_pool_order: list[dict]) -> list[dict]:
+    remaps: list[dict] = []
+    for record in bone_pool_order:
+        ib_hash = str(record.get("ib_hash", "") or "").lower()
+        match_index_count = int(record.get("match_index_count", 0) or 0)
+        match_first_index = int(record.get("match_first_index", 0) or 0)
+        used_local_bone_indices = _used_local_bone_indices_from_pool_record(record)
+        local_bone_count = len(used_local_bone_indices)
+        global_bone_base = int(record.get("global_bone_base", record.get("capture_store_base", 0)) or 0)
+        if not ib_hash or match_index_count <= 0 or local_bone_count <= 0:
+            continue
+        source_key = _source_key_from_values(ib_hash, match_index_count, match_first_index)
+        remaps.append(
+            {
+                "object_name": "",
+                "ib_hash": ib_hash,
+                "match_first_index": match_first_index,
+                "match_index_count": match_index_count,
+                "source_key": source_key,
+                "bone_capture_available": bool(record.get("bone_capture_available", record.get("shadow_capture_ready", False))),
+                "local_group_to_global_group": {
+                    str(local_index): int(global_bone_base + compact_index)
+                    for compact_index, local_index in enumerate(used_local_bone_indices)
+                },
+            }
+        )
+    return remaps
+
+
+def _used_local_bone_indices_from_pool_record(record: dict) -> list[int]:
+    raw_indices = record.get("used_local_bone_indices")
+    if isinstance(raw_indices, (list, tuple)) and raw_indices:
+        return sorted({int(value) for value in raw_indices if int(value) >= 0})
+    local_bone_count = int(record.get("local_bone_count", 0) or 0)
+    return list(range(max(0, local_bone_count)))
+
+
+def _remap_index_from_manifest(manifest: dict) -> dict[tuple[str, int, int], dict]:
+    index: dict[tuple[str, int, int], dict] = {}
+    for remap in manifest.get("object_remaps", []) or []:
+        ib_hash = str(remap.get("ib_hash", "") or "").lower()
+        if not ib_hash:
+            continue
+        match_first_index = int(remap.get("match_first_index", 0) or 0)
+        match_index_count = int(remap.get("match_index_count", 0) or 0)
+        index[(ib_hash, match_first_index, match_index_count)] = dict(remap)
+    return index
+
+
+def _remap_entries_for_hash(manifest: dict, ib_hash: str) -> list[dict]:
+    normalized_hash = str(ib_hash or "").lower()
+    return [
+        dict(remap)
+        for remap in manifest.get("object_remaps", []) or []
+        if str(remap.get("ib_hash", "") or "").lower() == normalized_hash
+    ]
+
+
+def _iter_object_name_hashes(object_name: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"[0-9A-Fa-f]{8}", str(object_name or "")):
+        value = match.group(0).lower()
+        if value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+    return values
+
+
+def _resolve_remap_for_object_name(manifest: dict, object_name: str) -> tuple[dict | None, str]:
+    normalized_name = str(object_name or "").lower()
+    remaps = [dict(remap) for remap in manifest.get("object_remaps", []) or []]
+    for remap in remaps:
+        source_key = str(remap.get("source_key", "") or _source_key_from_values(
+            str(remap.get("ib_hash", "") or ""),
+            int(remap.get("match_index_count", 0) or 0),
+            int(remap.get("match_first_index", 0) or 0),
+        )).lower()
+        if source_key and source_key in normalized_name:
+            return remap, ""
+
+    matched_entries: list[dict] = []
+    matched_keys: set[str] = set()
+    for ib_hash in _iter_object_name_hashes(normalized_name):
+        for remap in _remap_entries_for_hash(manifest, ib_hash):
+            source_key = str(remap.get("source_key", "") or _source_key_from_values(
+                str(remap.get("ib_hash", "") or ""),
+                int(remap.get("match_index_count", 0) or 0),
+                int(remap.get("match_first_index", 0) or 0),
+            ))
+            if source_key in matched_keys:
+                continue
+            matched_entries.append(remap)
+            matched_keys.add(source_key)
+
+    if not matched_entries:
+        return None, f"{object_name}: no global-pool hash in object name"
+    if len(matched_entries) > 1:
+        hashes = ", ".join(sorted({str(entry.get("ib_hash", "")).lower() for entry in matched_entries}))
+        return None, f"{object_name}: ambiguous global-pool hash {hashes}"
+    return matched_entries[0], ""
+
+
+def _hash_rename_target_meshes(context) -> list[object]:
+    selected_meshes = [obj for obj in context.selected_objects if getattr(obj, "type", "") == "MESH"]
+    if selected_meshes:
+        return selected_meshes
+    return [obj for obj in context.scene.objects if getattr(obj, "type", "") == "MESH"]
+
+
+def _resolve_remap_for_chunk_identity(manifest: dict, ib_hash: str, match_index_count: int) -> tuple[dict | None, str]:
+    matches = [
+        remap
+        for remap in _remap_entries_for_hash(manifest, ib_hash)
+        if int(remap.get("match_index_count", 0) or 0) == int(match_index_count)
+    ]
+    if not matches:
+        return None, f"{ib_hash}-{match_index_count}: no global-pool mapping"
+    source_keys = {
+        str(remap.get("source_key", "") or _source_key_from_values(
+            str(remap.get("ib_hash", "") or ""),
+            int(remap.get("match_index_count", 0) or 0),
+            int(remap.get("match_first_index", 0) or 0),
+        ))
+        for remap in matches
+    }
+    if len(source_keys) > 1:
+        return None, f"{ib_hash}-{match_index_count}: ambiguous_source_hash"
+    return dict(matches[0]), ""
+
+
+def _apply_remap_to_meshes(meshes_and_remaps: list[tuple[object, dict]], manifest: dict):
+    if not meshes_and_remaps:
+        return None
+    mesh_objects = [mesh_obj for mesh_obj, _remap in meshes_and_remaps]
+    selected_entries = []
+    for mesh_obj, remap in meshes_and_remaps:
+        remap_entry = dict(remap)
+        remap_entry["object_name"] = mesh_obj.name
+        selected_entries.append(remap_entry)
+    return apply_group_remaps_to_meshes(
+        mesh_objects,
+        {
+            "object_remaps": selected_entries,
+            "global_pool_generation": _global_pool_generation_id(manifest),
+        },
+        identity_resolver=_identity_resolver_from_entries(mesh_objects, selected_entries),
+    )
+
+
+def _collect_mesh_remap_pairs(mesh_objects, remap_resolver) -> tuple[int, list[tuple[object, dict]], list[str]]:
+    scanned_objects = 0
+    meshes_and_remaps: list[tuple[object, dict]] = []
+    skipped: list[str] = []
+    for mesh_obj in mesh_objects:
+        if getattr(mesh_obj, "type", "") != "MESH":
+            continue
+        scanned_objects += 1
+        remap, error = remap_resolver(mesh_obj)
+        if remap is None:
+            if error:
+                skipped.append(error)
+            continue
+        meshes_and_remaps.append((mesh_obj, remap))
+    return scanned_objects, meshes_and_remaps, skipped
+
+
+def _apply_global_names_for_meshes(mesh_objects, manifest: dict, remap_resolver) -> tuple[int, int, int, list[str]]:
+    scanned_objects, meshes_and_remaps, skipped = _collect_mesh_remap_pairs(mesh_objects, remap_resolver)
+    if not meshes_and_remaps:
+        return scanned_objects, 0, 0, skipped
+    result = _apply_remap_to_meshes(meshes_and_remaps, manifest)
+    if result is None:
+        return scanned_objects, 0, 0, skipped
+    skipped.extend(result.skipped_objects)
+    return scanned_objects, int(result.updated_objects), int(result.renamed_groups), skipped
+
+
+def _revert_global_names_for_meshes(mesh_objects, remap_resolver) -> tuple[int, int, int, list[str]]:
+    scanned_objects, meshes_and_remaps, skipped = _collect_mesh_remap_pairs(mesh_objects, remap_resolver)
+    updated_objects = 0
+    renamed_groups = 0
+    for mesh_obj, remap in meshes_and_remaps:
+        renamed, rename_error = _rename_global_groups_to_local(mesh_obj, remap)
+        if rename_error:
+            skipped.append(rename_error)
+            continue
+        if renamed > 0:
+            updated_objects += 1
+            renamed_groups += renamed
+    return scanned_objects, updated_objects, renamed_groups, skipped
+
+
+def _candidate_source_meshes_and_remaps(context, manifest: dict) -> list[tuple[object, dict]]:
+    remap_index = _remap_index_from_manifest(manifest)
+    meshes_and_remaps: list[tuple[object, dict]] = []
+    export_collection = context.scene.bmc_export_collection
+    if export_collection is None:
+        return meshes_and_remaps
+    for mesh_obj in _iter_collection_objects_recursive(export_collection):
+        if getattr(mesh_obj, "type", "") != "MESH":
+            continue
+        identity = _object_candidate_identity(mesh_obj)
+        if identity is None:
+            continue
+        remap = remap_index.get(identity)
+        if remap is None:
+            continue
+        meshes_and_remaps.append((mesh_obj, remap))
+    return meshes_and_remaps
+
+
+def _apply_global_names_to_candidate_source_objects(context, manifest: dict) -> tuple[int, int, list[str]]:
+    result = _apply_remap_to_meshes(_candidate_source_meshes_and_remaps(context, manifest), manifest)
+    if result is None:
+        return 0, 0, []
+    return int(result.updated_objects), int(result.renamed_groups), list(result.skipped_objects)
+
+
+def _merge_candidate_source_seam_groups(context, manifest: dict):
+    meshes = [mesh_obj for mesh_obj, _remap in _candidate_source_meshes_and_remaps(context, manifest)]
+    if len(meshes) < 2:
+        return None
+    return build_and_apply_seam_mapping(meshes)
+
+
+def _merge_selected_seam_groups(context):
+    mesh_objects = [obj for obj in context.selected_objects if getattr(obj, "type", "") == "MESH"]
+    if len(mesh_objects) < 2:
+        raise ValueError("Select at least two mesh objects")
+    return build_and_apply_seam_mapping(mesh_objects)
+
+
+def _export_chunk_collections_by_hash(export_collection) -> dict[str, list[object]]:
+    by_hash: dict[str, list[object]] = {}
+    if export_collection is None:
+        return by_hash
+    for child in export_collection.children:
+        identity = _resolve_export_chunk_collection_identity(child)
+        if identity is None:
+            continue
+        by_hash.setdefault(identity[0], []).append(child)
+    return by_hash
+
+
+def _child_collection_contains_object(collection, mesh_obj) -> bool:
+    return any(obj.name == mesh_obj.name for obj in collection.objects)
+
+
+def _unlink_object_from_export_sibling_chunks(export_collection, mesh_obj, keep_collection) -> None:
+    for child in export_collection.children:
+        if child == keep_collection:
+            continue
+        if _resolve_export_chunk_collection_identity(child) is None:
+            continue
+        if _child_collection_contains_object(child, mesh_obj):
+            child.objects.unlink(mesh_obj)
+
+
+def _apply_global_names_in_export_collection(context, manifest: dict) -> tuple[int, int, int, list[str]]:
+    export_collection = context.scene.bmc_export_collection
+    if export_collection is None:
+        raise ValueError("Export source collection is not set")
+    skipped: list[str] = []
+    scanned_objects = 0
+    objects_by_name: dict[str, tuple[object, dict, str]] = {}
+    conflict_names: set[str] = set()
+
+    for child in export_collection.children:
+        identity = _resolve_export_chunk_collection_identity(child)
+        if identity is None:
+            continue
+        remap, error = _resolve_remap_for_chunk_identity(manifest, identity[0], identity[1])
+        if remap is None:
+            skipped.append(error)
+            continue
+        for mesh_obj in _iter_collection_objects_recursive(child):
+            if getattr(mesh_obj, "type", "") != "MESH":
+                continue
+            scanned_objects += 1
+            if mesh_obj.name in conflict_names:
+                continue
+            previous = objects_by_name.get(mesh_obj.name)
+            if previous is not None and previous[2] != child.name:
+                skipped.append(f"{mesh_obj.name}: multiple export chunks")
+                objects_by_name.pop(mesh_obj.name, None)
+                conflict_names.add(mesh_obj.name)
+                continue
+            objects_by_name[mesh_obj.name] = (mesh_obj, remap, child.name)
+
+    result = _apply_remap_to_meshes(
+        [(mesh_obj, remap) for mesh_obj, remap, _child_name in objects_by_name.values()],
+        manifest,
+    )
+    if result is None:
+        return scanned_objects, 0, 0, skipped
+    skipped.extend(result.skipped_objects)
+    return scanned_objects, int(result.updated_objects), int(result.renamed_groups), skipped
+
+
+def _apply_global_names_by_object_hash(context, manifest: dict) -> tuple[int, int, int, list[str]]:
+    return _apply_global_names_for_meshes(
+        _hash_rename_target_meshes(context),
+        manifest,
+        lambda mesh_obj: _resolve_remap_for_object_name(manifest, mesh_obj.name),
+    )
+
+
+def _revert_global_names_by_object_hash(context, manifest: dict) -> tuple[int, int, int, list[str]]:
+    return _revert_global_names_for_meshes(
+        _hash_rename_target_meshes(context),
+        lambda mesh_obj: _resolve_remap_for_object_name(manifest, mesh_obj.name),
+    )
+
+
+def _rename_global_groups_to_local(mesh_obj, remap: dict) -> tuple[int, str]:
+    local_to_global = {
+        int(local_index): int(global_index)
+        for local_index, global_index in dict(remap.get("local_group_to_global_group", {}) or {}).items()
+    }
+    if not local_to_global:
+        return 0, f"{mesh_obj.name}: no local/global remap"
+    global_to_local = {global_index: local_index for local_index, global_index in local_to_global.items()}
+
+    rename_pairs: list[tuple[str, str]] = []
+    current_names = {str(vertex_group.name) for vertex_group in mesh_obj.vertex_groups}
+    source_names: set[str] = set()
+    for vertex_group in mesh_obj.vertex_groups:
+        numeric_name = _parse_vertex_group_int(vertex_group.name)
+        if numeric_name is None:
+            continue
+        local_index = global_to_local.get(numeric_name)
+        if local_index is None:
+            continue
+        source_name = str(vertex_group.name)
+        target_name = str(int(local_index))
+        if source_name == target_name:
+            continue
+        rename_pairs.append((source_name, target_name))
+        source_names.add(source_name)
+
+    if not rename_pairs:
+        return 0, ""
+
+    for _source_name, target_name in rename_pairs:
+        if target_name in current_names and target_name not in source_names:
+            return 0, f"{mesh_obj.name}: target local group {target_name} already exists"
+
+    temp_name_by_source: dict[str, str] = {}
+    for source_name, _target_name in rename_pairs:
+        vertex_group = mesh_obj.vertex_groups.get(source_name)
+        if vertex_group is None:
+            continue
+        temp_name = f"__bmc_tmp_local__{vertex_group.index}__{source_name}"
+        vertex_group.name = temp_name
+        temp_name_by_source[source_name] = temp_name
+
+    renamed_count = 0
+    for source_name, target_name in rename_pairs:
+        temp_name = temp_name_by_source.get(source_name, "")
+        if not temp_name:
+            continue
+        mesh_obj.vertex_groups[temp_name].name = target_name
+        renamed_count += 1
+
+    for prop_name in (
+        BMC_GLOBAL_REMAP_PROP,
+        BMC_GLOBAL_SOURCE_KEY_PROP,
+        BMC_GLOBAL_POOL_GENERATION_PROP,
+        BMC_VERTEX_GROUP_STATE_PROP,
+    ):
+        if prop_name in mesh_obj:
+            del mesh_obj[prop_name]
+    return renamed_count, ""
+
+
+def _parse_vertex_group_int(value: str) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _manifest_candidates_for_object(manifest: dict, mesh_obj) -> list[dict]:
+    identity = _object_candidate_identity(mesh_obj)
+    if identity is None:
+        return []
+    ib_hash, first_index, index_count = identity
+    hash_matches = _manifest_candidates_by_hash(manifest, ib_hash)
+    if index_count > 0:
+        exact_matches = [
+            candidate
+            for candidate in hash_matches
+            if int(candidate.get("match_index_count", candidate.get("source_index_count", 0)) or 0) == index_count
+            and int(candidate.get("match_first_index", 0) or 0) == first_index
+        ]
+        if exact_matches:
+            return exact_matches
+    if hash_matches:
+        return hash_matches if index_count <= 0 else [
+            candidate
+            for candidate in hash_matches
+            if int(candidate.get("match_index_count", candidate.get("source_index_count", 0)) or 0) == index_count
+        ] or hash_matches
+    return [
+        {
+            "enabled": True,
+            "ib_hash": ib_hash,
+            "match_first_index": int(first_index),
+            "match_index_count": int(index_count),
+            "display_name": _candidate_display_name_from_values(ib_hash, index_count, first_index),
+            "draw_indices": [],
+            "shadow_draw_indices": [],
+            "shadow_capture_ready": False,
+            "local_bone_count": int(infer_local_bone_count_from_mesh(mesh_obj)),
+            "status": "manual_from_collection",
+            "import_paths": {"ib": "", "vb": {}, "layout": ""},
+        }
+    ]
 
 
 def _update_scene_mapping_payload(scene, manifest_path: str | None = None) -> dict:
@@ -1162,13 +1855,8 @@ class BMC_OT_create_export_collection(bpy.types.Operator):
     def execute(self, context):
         source_collection = _ensure_export_collection(context)
         build_collection = _ensure_export_build_collection(context)
-        _refresh_target_items(context.scene)
-        created_count = _ensure_export_chunk_collections_from_targets(context, source_collection)
         message = f"Export source: {source_collection.name}; build: {build_collection.name}"
-        if created_count:
-            message += f"; created {created_count} chunk collection(s)"
-        else:
-            message += "; no new chunk collections"
+        message += "; build global pool to create chunk collections"
         self.report({"INFO"}, message)
         return {"FINISHED"}
 
@@ -1176,7 +1864,7 @@ class BMC_OT_create_export_collection(bpy.types.Operator):
 class BMC_OT_add_selected_export_objects(bpy.types.Operator):
     bl_idname = "object.bmc_add_selected_export_objects"
     bl_label = "Add Selected To Export"
-    bl_description = "Add selected meshes to a host chunk child collection inside the export collection"
+    bl_description = "Add selected meshes to the unique existing export child collection with the same source IB hash"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1185,35 +1873,188 @@ class BMC_OT_add_selected_export_objects(bpy.types.Operator):
 
     def execute(self, context):
         added_count = 0
-        skipped_names: list[str] = []
+        moved_count = 0
+        skipped_messages: list[str] = []
         collection = _ensure_export_collection(context)
+        chunks_by_hash = _export_chunk_collections_by_hash(collection)
 
         for mesh_obj in context.selected_objects:
             if mesh_obj.type != "MESH":
                 continue
-            identity = resolve_mesh_identity(mesh_obj)
-            if identity is None:
-                skipped_names.append(mesh_obj.name)
+            ib_hash = _object_source_hash(mesh_obj)
+            if not ib_hash:
+                skipped_messages.append(f"{mesh_obj.name}: no source hash")
                 continue
-            match_index_count = _resolve_target_match_index_count(context.scene, identity[0], mesh_obj.name, int(identity[1]))
-            if match_index_count <= 0:
-                skipped_names.append(mesh_obj.name)
+            matching_collections = chunks_by_hash.get(ib_hash, [])
+            if not matching_collections:
+                skipped_messages.append(f"{mesh_obj.name}: no export child for {ib_hash}")
                 continue
-            chunk_collection = _ensure_export_chunk_collection(collection, identity[0], match_index_count, 0)
+            if len(matching_collections) > 1:
+                skipped_messages.append(f"{mesh_obj.name}: ambiguous_source_hash {ib_hash}")
+                continue
+            chunk_collection = matching_collections[0]
+            already_in_chunk = _child_collection_contains_object(chunk_collection, mesh_obj)
             _link_object_to_collection(mesh_obj, chunk_collection)
-            added_count += 1
-
-        if added_count == 0:
-            if skipped_names:
-                self.report({"WARNING"}, f"Skipped {len(skipped_names)} mesh(es): cannot infer ib_hash or scanned match count")
+            _unlink_object_from_export_sibling_chunks(collection, mesh_obj, chunk_collection)
+            if already_in_chunk:
+                moved_count += 1
             else:
-                self.report({"WARNING"}, "No new mesh objects were added to export source collection")
+                added_count += 1
+
+        touched_count = added_count + moved_count
+        if touched_count == 0:
+            if skipped_messages:
+                self.report({"WARNING"}, " | ".join(skipped_messages[:3]))
+            else:
+                self.report({"WARNING"}, "No selected mesh objects matched an export child collection")
             return {"CANCELLED"}
 
-        message = f"Added {added_count} object(s) to export source collection"
-        if skipped_names:
-            message += f"; skipped {len(skipped_names)}"
+        message = f"Placed {touched_count} selected object(s) into matching export collection(s)"
+        if skipped_messages:
+            message += f"; skipped {len(skipped_messages)}"
         self.report({"INFO"}, message)
+        if skipped_messages:
+            self.report({"WARNING"}, " | ".join(skipped_messages[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_apply_export_collection_global_names(bpy.types.Operator):
+    bl_idname = "object.bmc_apply_export_collection_global_names"
+    bl_label = "Apply Export Global Names"
+    bl_description = "Rename mesh vertex groups under export child collections using the child collection's global-pool mapping"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_manifest_path and context.scene.bmc_export_collection)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist; build the global pool first")
+            return {"CANCELLED"}
+        try:
+            manifest = read_json(manifest_path)
+            scanned_count, updated_count, renamed_groups, skipped_messages = _apply_global_names_in_export_collection(
+                context,
+                manifest,
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Apply export global names failed: {exc}")
+            return {"CANCELLED"}
+
+        if scanned_count <= 0:
+            self.report({"WARNING"}, "No mesh objects found under export child collections")
+            return {"CANCELLED"}
+        message = f"Applied global names to {updated_count}/{scanned_count} export mesh object(s); renamed {renamed_groups} group(s)"
+        if skipped_messages:
+            message += f"; skipped {len(skipped_messages)}"
+        self.report({"INFO"}, message)
+        if skipped_messages:
+            self.report({"WARNING"}, " | ".join(skipped_messages[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_apply_global_names_by_object_hash(bpy.types.Operator):
+    bl_idname = "object.bmc_apply_global_names_by_object_hash"
+    bl_label = "Rename To Global Groups"
+    bl_description = "Rename selected meshes to global vertex-group indices by matching object-name hashes to the global pool"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_manifest_path)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist; build the global pool first")
+            return {"CANCELLED"}
+        try:
+            manifest = read_json(manifest_path)
+            scanned_count, updated_count, renamed_groups, skipped_messages = _apply_global_names_by_object_hash(
+                context,
+                manifest,
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Rename To Global failed: {exc}")
+            return {"CANCELLED"}
+        if scanned_count <= 0:
+            self.report({"WARNING"}, "No mesh objects found")
+            return {"CANCELLED"}
+        message = f"Rename To Global updated {updated_count}/{scanned_count} mesh object(s); renamed {renamed_groups} group(s)"
+        if skipped_messages:
+            message += f"; skipped {len(skipped_messages)}"
+        self.report({"INFO"}, message)
+        if skipped_messages:
+            self.report({"WARNING"}, " | ".join(skipped_messages[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_revert_global_names_by_object_hash(bpy.types.Operator):
+    bl_idname = "object.bmc_revert_global_names_by_object_hash"
+    bl_label = "Rename To Local Groups"
+    bl_description = "Rename selected meshes from global vertex-group indices back to source-local indices by object-name hash"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_manifest_path)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist; build the global pool first")
+            return {"CANCELLED"}
+        try:
+            manifest = read_json(manifest_path)
+            scanned_count, updated_count, renamed_groups, skipped_messages = _revert_global_names_by_object_hash(
+                context,
+                manifest,
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Rename To Local failed: {exc}")
+            return {"CANCELLED"}
+        if scanned_count <= 0:
+            self.report({"WARNING"}, "No mesh objects found")
+            return {"CANCELLED"}
+        message = f"Rename To Local updated {updated_count}/{scanned_count} mesh object(s); renamed {renamed_groups} group(s)"
+        if skipped_messages:
+            message += f"; skipped {len(skipped_messages)}"
+        self.report({"INFO"}, message)
+        if skipped_messages:
+            self.report({"WARNING"}, " | ".join(skipped_messages[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_merge_selected_seam_groups(bpy.types.Operator):
+    bl_idname = "object.bmc_merge_selected_seam_groups"
+    bl_label = "Merge Seam Groups"
+    bl_description = "Build and apply seam vertex-group rename mapping for selected mesh objects"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        selected_meshes = [obj for obj in context.selected_objects if getattr(obj, "type", "") == "MESH"]
+        return len(selected_meshes) >= 2
+
+    def execute(self, context):
+        try:
+            result = _merge_selected_seam_groups(context)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Merge Seam Groups failed: {exc}")
+            return {"CANCELLED"}
+
+        message = (
+            f"Merge Seam Groups matched {len(result.aliases)} mapping(s); "
+            f"renamed {result.renamed_groups} group(s) on {result.updated_objects} object(s)"
+        )
+        self.report({"INFO"}, message)
+        if result.skipped_messages:
+            self.report({"WARNING"}, " | ".join(result.skipped_messages[:3]))
         return {"FINISHED"}
 
 
@@ -1764,6 +2605,215 @@ class BMC_OT_seam_apply_mapping(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BMC_OT_candidate_add_hash(bpy.types.Operator):
+    bl_idname = "object.bmc_candidate_add_hash"
+    bl_label = "Add Candidate IB"
+    bl_description = "Add the typed IB hash to the Candidate IB list, restoring matching analyzed slices when available"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            hashes = _parse_hash_list(str(getattr(scene, "bmc_candidate_add_hash", "") or ""))
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        if not hashes:
+            self.report({"ERROR"}, "Type an 8-hex IB hash before pressing Add")
+            return {"CANCELLED"}
+
+        manifest = _read_manifest_payload(scene.bmc_manifest_path)
+        added_count = 0
+        for ib_hash in hashes:
+            matches = _manifest_candidates_by_hash(manifest, ib_hash)
+            if matches:
+                for candidate in matches:
+                    if _add_candidate_from_payload(scene, candidate, manual=False):
+                        added_count += 1
+                continue
+            manual_candidate = {
+                "enabled": True,
+                "ib_hash": ib_hash,
+                "match_first_index": 0,
+                "match_index_count": 0,
+                "display_name": _candidate_display_name_from_values(ib_hash, 0, 0),
+                "draw_indices": [],
+                "shadow_draw_indices": [],
+                "shadow_capture_ready": False,
+                "local_bone_count": 0,
+                "status": "manual_hash_missing_analysis",
+                "import_paths": {"ib": "", "vb": {}, "layout": ""},
+            }
+            if _add_candidate_from_payload(scene, manual_candidate, manual=True):
+                added_count += 1
+
+        if added_count:
+            self.report({"INFO"}, f"Added {added_count} candidate IB entr{'y' if added_count == 1 else 'ies'}")
+            return {"FINISHED"}
+        self.report({"INFO"}, "Candidate IB already exists in the list")
+        return {"FINISHED"}
+
+
+class BMC_OT_candidate_remove(bpy.types.Operator):
+    bl_idname = "object.bmc_candidate_remove"
+    bl_label = "Remove Candidate IB"
+    bl_description = "Remove the selected Candidate IB list entry"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_candidate_items)
+
+    def execute(self, context):
+        scene = context.scene
+        index = int(scene.bmc_candidate_index)
+        if index < 0 or index >= len(scene.bmc_candidate_items):
+            self.report({"ERROR"}, "No candidate IB is selected")
+            return {"CANCELLED"}
+        removed_name = str(scene.bmc_candidate_items[index].display_name or scene.bmc_candidate_items[index].ib_hash)
+        scene.bmc_candidate_items.remove(index)
+        scene.bmc_candidate_index = min(index, max(0, len(scene.bmc_candidate_items) - 1))
+        self.report({"INFO"}, f"Removed candidate {removed_name}")
+        return {"FINISHED"}
+
+
+class BMC_OT_candidate_refresh_from_collection(bpy.types.Operator):
+    bl_idname = "object.bmc_candidate_refresh_from_collection"
+    bl_label = "Refresh Candidates From Collection"
+    bl_description = "Replace the Candidate IB list with IB identities from objects under the export/root collection"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest = _read_manifest_payload(scene.bmc_manifest_path)
+        source_collection = scene.bmc_export_collection or context.collection
+        if source_collection is None:
+            self.report({"ERROR"}, "No collection is available for candidate refresh")
+            return {"CANCELLED"}
+        previous_state = {
+            _candidate_key_from_item(item): {"enabled": bool(getattr(item, "enabled", True))}
+            for item in scene.bmc_candidate_items
+        }
+        previous_keys = set(previous_state)
+        candidates, stats = _candidate_payloads_from_collection(scene, source_collection, manifest)
+        next_keys = {_candidate_key_from_payload(candidate) for candidate in candidates}
+        _replace_candidate_items_from_payloads(scene, candidates, previous_state=previous_state)
+        synced_count = len(scene.bmc_candidate_items)
+        added_count = len(next_keys - previous_keys)
+        removed_count = len(previous_keys - next_keys)
+        self.report(
+            {"INFO"},
+            (
+                f"Synced {synced_count} candidate IB(s) from {stats['recognized_meshes']}/"
+                f"{stats['scanned_meshes']} mesh object(s); added {added_count}; removed {removed_count}"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class BMC_OT_build_global_bone_pool(bpy.types.Operator):
+    bl_idname = "object.bmc_build_global_bone_pool"
+    bl_label = "Build Global Bone Pool"
+    bl_description = "Build a compact global bone pool from enabled Candidate IBs; capture-ready entries are ordered first"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_manifest_path and scene.bmc_candidate_items)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist; run Analyze Main first")
+            return {"CANCELLED"}
+        seam_result = None
+        seam_warnings: list[str] = []
+        try:
+            manifest = read_json(manifest_path)
+            candidates = _candidate_payloads_from_ui(scene, manifest)
+            bone_pool_order = build_bone_pool_order(candidates)
+            if not bone_pool_order:
+                self.report({"ERROR"}, "No enabled candidate has usable bone weights for the global pool")
+                return {"CANCELLED"}
+            object_remaps = _object_remaps_from_bone_pool_order(bone_pool_order)
+            generation_id = _global_pool_generation_id({"bone_pool_order": bone_pool_order}, bone_pool_order)
+            manifest["candidate_ibs"] = candidates
+            manifest["bone_pool_order"] = bone_pool_order
+            manifest["object_remaps"] = object_remaps
+            manifest["global_pool_generation"] = generation_id
+            manifest.setdefault("buffer_tables", {})["global_bone_count"] = sum(
+                int(item.get("local_bone_count", 0)) for item in bone_pool_order
+            )
+            manifest.setdefault("validation", []).append(
+                {
+                    "severity": "info",
+                    "code": "global_pool_built_from_candidate_list",
+                    "message": f"Built compact global pool from {len(bone_pool_order)} enabled candidate(s).",
+                    "draw_indices": [],
+                }
+            )
+            write_json(manifest_path, manifest)
+            export_collection = _ensure_export_collection(context)
+            created_count = 0
+            unavailable_count = 0
+            for record in bone_pool_order:
+                capture_available = bool(record.get("bone_capture_available", record.get("shadow_capture_ready", False)))
+                if not capture_available:
+                    unavailable_count += 1
+                if _ensure_export_chunk_collection_if_missing(
+                    export_collection,
+                    str(record.get("ib_hash", "") or ""),
+                    int(record.get("match_index_count", 0) or 0),
+                    0,
+                    bone_capture_available=capture_available,
+                ):
+                    created_count += 1
+            _update_scene_mapping_payload(scene, manifest_path)
+            updated_objects, renamed_groups, rename_warnings = _apply_global_names_to_candidate_source_objects(
+                context,
+                manifest,
+            )
+            try:
+                seam_result = _merge_candidate_source_seam_groups(context, manifest)
+            except Exception as seam_exc:
+                seam_warnings.append(f"Seam merge skipped: {seam_exc}")
+        except Exception as exc:
+            self.report({"ERROR"}, f"Build Global Bone Pool failed: {exc}")
+            return {"CANCELLED"}
+
+        skipped_count = len([item for item in candidates if item.get("enabled", True)]) - len(bone_pool_order)
+        message = f"Built global pool with {len(bone_pool_order)} source IB(s)"
+        message += f"; collections {created_count}"
+        message += f"; compact bones {sum(int(item.get('local_bone_count', 0)) for item in bone_pool_order)}"
+        if updated_objects:
+            message += f"; global-renamed {updated_objects} object(s), {renamed_groups} group(s)"
+        if seam_result is not None:
+            message += f"; seam-merged {seam_result.updated_objects} object(s), {seam_result.renamed_groups} group(s)"
+        if unavailable_count > 0:
+            message += f"; {unavailable_count} mapping-only IB(s)"
+        if skipped_count > 0:
+            message += f"; skipped {skipped_count} invalid IB(s)"
+        self.report({"INFO"}, message)
+        warnings = list(rename_warnings)
+        if seam_result is not None:
+            warnings.extend(str(message) for message in seam_result.skipped_messages)
+        warnings.extend(seam_warnings)
+        if warnings:
+            self.report({"WARNING"}, " | ".join(warnings[:3]))
+        return {"FINISHED"}
+
+
 class BMC_OT_analyze_main_frameanalysis(bpy.types.Operator):
     bl_idname = "object.bmc_analyze_main_frameanalysis"
     bl_label = "Analyze Main"
@@ -1778,10 +2828,8 @@ class BMC_OT_analyze_main_frameanalysis(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         try:
-            target_hashes = _main_analyze_target_hashes(scene)
             payload, manifest_path = write_main_analysis_manifest(
                 frameanalysis_dir=bpy.path.abspath(scene.bmc_frameanalysis_dir),
-                target_ib_hashes=target_hashes,
                 output_dir=bpy.path.abspath(scene.bmc_output_dir) if scene.bmc_output_dir else "",
             )
         except Exception as exc:
@@ -1835,7 +2883,13 @@ class BMC_OT_import_selected_candidates(bpy.types.Operator):
         try:
             manifest = read_json(manifest_path)
             target_collection = _ensure_export_collection(context)
-            imported_objects = import_selected_candidates(context, manifest, selected_names, target_collection)
+            imported_objects = import_selected_candidates(
+                context,
+                manifest,
+                selected_names,
+                target_collection,
+                mirror_flip=bool(getattr(scene, "bmc_mirror_flip", True)),
+            )
         except Exception as exc:
             self.report({"ERROR"}, f"Import Selected IBs failed: {exc}")
             return {"CANCELLED"}

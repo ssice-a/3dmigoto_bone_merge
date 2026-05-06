@@ -8,7 +8,9 @@ from math import floor
 from ..constants import (
     BMC_EXPORT_CHUNK_PROP,
     BMC_EXPORT_PALETTE_PROP,
+    BMC_GLOBAL_POOL_GENERATION_PROP,
     BMC_GLOBAL_REMAP_PROP,
+    BMC_GLOBAL_SOURCE_KEY_PROP,
     BMC_ORIGINAL_LOCAL_BONE_COUNT_PROP,
     BMC_VERTEX_GROUP_STATE_GLOBAL,
     BMC_VERTEX_GROUP_STATE_PROP,
@@ -118,12 +120,24 @@ def _dense_remap_sequence(local_to_global: dict[int, int]) -> tuple[int, ...]:
     return tuple(int(local_to_global.get(local_index, -1)) for local_index in range(max_local + 1))
 
 
-def _set_global_remap_metadata(mesh_obj, local_to_global: dict[int, int]) -> None:
+def _set_global_remap_metadata(
+    mesh_obj,
+    local_to_global: dict[int, int],
+    *,
+    source_key: str = "",
+    generation_id: str = "",
+) -> None:
     remap_sequence = _dense_remap_sequence(local_to_global)
     if remap_sequence:
         mesh_obj[BMC_GLOBAL_REMAP_PROP] = list(remap_sequence)
         mesh_obj[BMC_ORIGINAL_LOCAL_BONE_COUNT_PROP] = len(remap_sequence)
     mesh_obj[BMC_VERTEX_GROUP_STATE_PROP] = BMC_VERTEX_GROUP_STATE_GLOBAL
+    if source_key:
+        setattr(mesh_obj, BMC_GLOBAL_SOURCE_KEY_PROP, str(source_key))
+        mesh_obj[BMC_GLOBAL_SOURCE_KEY_PROP] = str(source_key)
+    if generation_id:
+        setattr(mesh_obj, BMC_GLOBAL_POOL_GENERATION_PROP, str(generation_id))
+        mesh_obj[BMC_GLOBAL_POOL_GENERATION_PROP] = str(generation_id)
     _clear_export_local_metadata(mesh_obj)
 
 
@@ -133,10 +147,22 @@ def _clear_export_local_metadata(mesh_obj) -> None:
             del mesh_obj[prop_name]
 
 
-def _mesh_has_expected_global_remap(mesh_obj, local_to_global: dict[int, int]) -> bool:
+def _mesh_has_expected_global_remap(
+    mesh_obj,
+    local_to_global: dict[int, int],
+    *,
+    source_key: str = "",
+    generation_id: str = "",
+) -> bool:
     expected = _dense_remap_sequence(local_to_global)
     current = _read_int_sequence_prop(mesh_obj, BMC_GLOBAL_REMAP_PROP)
     if not expected or current != expected or mesh_obj.get(BMC_VERTEX_GROUP_STATE_PROP) != BMC_VERTEX_GROUP_STATE_GLOBAL:
+        return False
+    current_source_key = str(mesh_obj.get(BMC_GLOBAL_SOURCE_KEY_PROP, "") or getattr(mesh_obj, BMC_GLOBAL_SOURCE_KEY_PROP, "") or "")
+    if source_key and current_source_key != str(source_key):
+        return False
+    current_generation_id = str(mesh_obj.get(BMC_GLOBAL_POOL_GENERATION_PROP, "") or getattr(mesh_obj, BMC_GLOBAL_POOL_GENERATION_PROP, "") or "")
+    if generation_id and current_generation_id != str(generation_id):
         return False
 
     expected_global_names = {int(global_index) for global_index in expected if int(global_index) >= 0}
@@ -467,8 +493,20 @@ def apply_group_remaps_to_meshes(mesh_objects, manifest: dict, identity_resolver
             continue
 
         local_to_global = _normalize_local_to_global(remap_entry.get("local_group_to_global_group", {}))
-        renamed = _apply_group_rename(mesh_obj, local_to_global)
-        if renamed or _mesh_has_expected_global_remap(mesh_obj, local_to_global):
+        source_key = str(remap_entry.get("source_key", "") or "")
+        generation_id = str(manifest.get("global_pool_generation", "") or manifest.get("generation_id", "") or "")
+        renamed = _apply_group_rename(
+            mesh_obj,
+            local_to_global,
+            source_key=source_key,
+            generation_id=generation_id,
+        )
+        if renamed or _mesh_has_expected_global_remap(
+            mesh_obj,
+            local_to_global,
+            source_key=source_key,
+            generation_id=generation_id,
+        ):
             updated_objects += 1
             renamed_groups += renamed
         else:
@@ -482,11 +520,22 @@ def apply_group_remaps_to_meshes(mesh_objects, manifest: dict, identity_resolver
     )
 
 
-def _apply_group_rename(mesh_obj, local_to_global: dict[int, int]) -> int:
+def _apply_group_rename(
+    mesh_obj,
+    local_to_global: dict[int, int],
+    *,
+    source_key: str = "",
+    generation_id: str = "",
+) -> int:
     if not local_to_global:
         return 0
 
-    if _mesh_has_expected_global_remap(mesh_obj, local_to_global):
+    if _mesh_has_expected_global_remap(
+        mesh_obj,
+        local_to_global,
+        source_key=source_key,
+        generation_id=generation_id,
+    ):
         return 0
 
     rename_pairs = _build_rename_pairs_for_current_state(mesh_obj, local_to_global)
@@ -498,7 +547,12 @@ def _apply_group_rename(mesh_obj, local_to_global: dict[int, int]) -> int:
             if _parse_numeric_group(vertex_group.name) is not None
         }
         if existing_global_names and existing_global_names.issubset(current_numeric_names):
-            _set_global_remap_metadata(mesh_obj, local_to_global)
+            _set_global_remap_metadata(
+                mesh_obj,
+                local_to_global,
+                source_key=source_key,
+                generation_id=generation_id,
+            )
         return 0
 
     temp_name_by_source: dict[str, str] = {}
@@ -517,7 +571,12 @@ def _apply_group_rename(mesh_obj, local_to_global: dict[int, int]) -> int:
             continue
         mesh_obj.vertex_groups[temp_name].name = target_name
         renamed_count += 1
-    _set_global_remap_metadata(mesh_obj, local_to_global)
+    _set_global_remap_metadata(
+        mesh_obj,
+        local_to_global,
+        source_key=source_key,
+        generation_id=generation_id,
+    )
     return renamed_count
 
 

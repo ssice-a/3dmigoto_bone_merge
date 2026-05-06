@@ -6,7 +6,7 @@ bl_info = {
     "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Bone Merge Capture",
-    "description": "Build global bone remaps and standalone BoneStore capture configs from a target object list.",
+    "description": "Analyze FrameAnalysis captures, import candidate IBs, and build global bone pools for Bone Merge workflows.",
     "category": "Animation",
 }
 
@@ -49,6 +49,10 @@ def register():
         operators.BMC_OT_refresh_target_identity,
         operators.BMC_OT_create_export_collection,
         operators.BMC_OT_add_selected_export_objects,
+        operators.BMC_OT_apply_export_collection_global_names,
+        operators.BMC_OT_apply_global_names_by_object_hash,
+        operators.BMC_OT_revert_global_names_by_object_hash,
+        operators.BMC_OT_merge_selected_seam_groups,
         operators.BMC_OT_prepare_export_collection,
         operators.BMC_OT_generate_shadow_split,
         operators.BMC_OT_remove_target,
@@ -56,7 +60,11 @@ def register():
         operators.BMC_OT_remove_lod_target,
         operators.BMC_OT_clear_lod_targets,
         operators.BMC_OT_analyze_main_frameanalysis,
+        operators.BMC_OT_candidate_add_hash,
+        operators.BMC_OT_candidate_remove,
+        operators.BMC_OT_candidate_refresh_from_collection,
         operators.BMC_OT_import_selected_candidates,
+        operators.BMC_OT_build_global_bone_pool,
         operators.BMC_OT_scan_targets,
         operators.BMC_OT_scan_lod_targets,
         operators.BMC_OT_analyze_duplicate_bones,
@@ -76,6 +84,7 @@ def register():
         operators.BMC_OT_load_preset,
         operators.BMC_OT_delete_preset,
         panel.VIEW3D_PT_bone_merge_capture,
+        panel.VIEW3D_PT_bone_merge_hash_tools,
     )
     _PROPERTIES_MODULE = properties
 

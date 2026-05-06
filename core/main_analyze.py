@@ -106,21 +106,21 @@ class BufferHeader:
 
 def write_main_analysis_manifest(
     frameanalysis_dir: str,
-    target_ib_hashes: Iterable[str],
+    target_ib_hashes: Iterable[str] | None = None,
     output_dir: str | None = None,
 ) -> tuple[dict, str]:
     """Analyze the main FrameAnalysis folder and write the redesigned manifest."""
 
     normalized_frameanalysis_dir = os.path.abspath(frameanalysis_dir)
     normalized_output_dir = os.path.abspath(output_dir or normalized_frameanalysis_dir)
-    payload = analyze_main_frameanalysis(normalized_frameanalysis_dir, target_ib_hashes)
+    payload = analyze_main_frameanalysis(normalized_frameanalysis_dir, target_ib_hashes or [])
     manifest_path = write_json(os.path.join(normalized_output_dir, CAPTURE_MANIFEST_FILE_NAME), payload)
     return payload, manifest_path
 
 
-def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterable[str]) -> dict:
+def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterable[str] | None = None) -> dict:
     normalized_frameanalysis_dir = os.path.abspath(frameanalysis_dir)
-    target_hashes = _normalize_target_hashes(target_ib_hashes)
+    target_hashes = _normalize_target_hashes(target_ib_hashes or [])
     log_path = os.path.join(normalized_frameanalysis_dir, "log.txt")
     if not os.path.exists(log_path):
         raise ValueError(f"log.txt not found in {normalized_frameanalysis_dir}")
@@ -130,90 +130,111 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
     draw_states = _parse_draw_states(log_path)
     warnings: list[dict] = []
 
-    discovery = _discover_shadow_vs_hashes(files_by_draw, draw_states, target_hashes, warnings)
+    all_ib_dumps = _all_ib_txt_dumps(files_by_draw)
+    if not all_ib_dumps:
+        raise ValueError("No IB txt dumps found in FrameAnalysis")
+    key_index = _group_ib_dumps_by_key(all_ib_dumps)
+
+    visible_anchor = _discover_visible_anchor_keys(all_ib_dumps, draw_states, target_hashes, warnings)
+    discovery = _discover_shadow_stage_from_visible_anchors(
+        files_by_draw=files_by_draw,
+        draw_states=draw_states,
+        all_ib_dumps=all_ib_dumps,
+        key_index=key_index,
+        visible_anchor=visible_anchor,
+        warnings=warnings,
+    )
     shadow_vs_hashes = list(discovery["shadow_vs_hashes"])
     if not shadow_vs_hashes:
         raise ValueError("Could not infer shadow VS hash pair from FrameAnalysis")
     normal_vs_hash = shadow_vs_hashes[0]
     transparent_vs_hash = shadow_vs_hashes[1] if len(shadow_vs_hashes) > 1 else ""
+    stage_draw_start = int(discovery.get("stage_draw_start", 0) or 0)
+    stage_draw_end = int(discovery.get("stage_draw_end", 0) or 0)
 
     shadow_hits = [
         dump_file
-        for dump_files in files_by_draw.values()
-        for dump_file in dump_files
-        if dump_file.slot == "ib"
-        and dump_file.extension == "txt"
-        and _state_vs_hash(draw_states, dump_file) in shadow_vs_hashes
+        for dump_file in all_ib_dumps
+        if _state_vs_hash(draw_states, dump_file) in shadow_vs_hashes
+        and _draw_in_stage_window(dump_file.draw_index, stage_draw_start, stage_draw_end)
     ]
     shadow_hits.sort(key=lambda item: item.draw_index)
     if not shadow_hits:
         raise ValueError("No IB draw hits matched the inferred shadow VS hash pair")
 
-    candidate_keys = {_candidate_key_from_ib_dump(dump_file) for dump_file in shadow_hits}
-    all_ib_dumps = [
-        dump_file
-        for dump_files in files_by_draw.values()
-        for dump_file in dump_files
-        if dump_file.slot == "ib" and dump_file.extension == "txt"
-    ]
-    all_hits_by_key: dict[tuple[str, int, int], list[DumpFile]] = {key: [] for key in candidate_keys}
-    for dump_file in all_ib_dumps:
-        key = _candidate_key_from_ib_dump(dump_file)
-        if key in all_hits_by_key:
-            all_hits_by_key[key].append(dump_file)
+    shadow_hits_by_key = _group_ib_dumps_by_key(shadow_hits)
+    candidate_entries = _build_candidate_entries(
+        frameanalysis_dir=normalized_frameanalysis_dir,
+        files_by_draw=files_by_draw,
+        draw_states=draw_states,
+        key_index=key_index,
+        shadow_hits_by_key=shadow_hits_by_key,
+        shadow_vs_hashes=shadow_vs_hashes,
+        warnings=warnings,
+    )
+    if not candidate_entries:
+        raise ValueError("No importable skinned candidate IBs found in FrameAnalysis")
 
     shadow_draw_indices = sorted({dump_file.draw_index for dump_file in shadow_hits})
     host_draw_index = max(shadow_draw_indices)
     host_dump = next(dump_file for dump_file in reversed(shadow_hits) if dump_file.draw_index == host_draw_index)
     host_key = _candidate_key_from_ib_dump(host_dump)
 
-    draw_hits = [
-        _build_draw_hit_payload(
-            frameanalysis_dir=normalized_frameanalysis_dir,
-            dump_file=dump_file,
-            draw_state=draw_states.get(dump_file.draw_index),
-            draw_files=files_by_draw.get(dump_file.draw_index, []),
-            pass_role=_pass_role_for_vs(_state_vs_hash(draw_states, dump_file), normal_vs_hash, transparent_vs_hash),
+    draw_hits = []
+    for entry in candidate_entries:
+        for dump_file in entry["manifest_hits"]:
+            vs_hash = _state_vs_hash(draw_states, dump_file)
+            is_shadow_hit = dump_file.draw_index in set(entry["shadow_draw_indices"])
+            pass_role = _pass_role_for_vs(vs_hash, normal_vs_hash, transparent_vs_hash)
+            if not is_shadow_hit and pass_role == "shadow_unknown":
+                pass_role = _pass_role_for_material(draw_states.get(dump_file.draw_index))
+            payload = _build_draw_hit_payload(
+                frameanalysis_dir=normalized_frameanalysis_dir,
+                dump_file=dump_file,
+                draw_state=draw_states.get(dump_file.draw_index),
+                draw_files=files_by_draw.get(dump_file.draw_index, []),
+                pass_role=pass_role,
+            )
+            payload["use_role"] = "both" if is_shadow_hit and dump_file.draw_index == entry["import_draw_index"] else (
+                "capture" if is_shadow_hit else "import"
+            )
+            draw_hits.append(payload)
+        entry.pop("manifest_hits", None)
+
+    candidates = [
+        entry
+        for entry in sorted(
+            candidate_entries,
+            key=lambda item: (
+                -int(item.get("match_index_count", 0)),
+                str(item.get("ib_hash", "")),
+                int(item.get("match_first_index", 0)),
+            ),
         )
-        for dump_file in shadow_hits
     ]
 
-    candidates = []
-    for key in sorted(candidate_keys, key=lambda item: (-item[2], item[0], item[1])):
-        ib_hash, first_index, index_count = key
-        all_hits = sorted(all_hits_by_key.get(key, []), key=lambda item: item.draw_index)
-        key_shadow_hits = [dump_file for dump_file in shadow_hits if _candidate_key_from_ib_dump(dump_file) == key]
-        local_bone_count = _infer_candidate_local_bone_count(files_by_draw, all_hits, warnings)
-        candidates.append(
-            {
-                "enabled": True,
-                "ib_hash": ib_hash,
-                "match_first_index": int(first_index),
-                "match_index_count": int(index_count),
-                "display_name": f"{ib_hash}-{index_count}-{first_index}",
-                "draw_indices": [dump_file.draw_index for dump_file in all_hits],
-                "shadow_draw_indices": [dump_file.draw_index for dump_file in key_shadow_hits],
-                "source_index_count": int(index_count),
-                "local_bone_count": int(local_bone_count),
-                "texture_region_key": f"{ib_hash}-{index_count}-{first_index}",
-                "import_paths": _build_import_paths_payload(files_by_draw, all_hits),
-            }
-        )
-
-    texture_candidates = _build_texture_candidates(files_by_draw, all_hits_by_key)
-    bone_pool_order = _build_bone_pool_order(candidates)
+    included_key_index = {
+        (str(candidate["ib_hash"]), int(candidate["match_first_index"]), int(candidate["match_index_count"])): key_index[
+            (str(candidate["ib_hash"]), int(candidate["match_first_index"]), int(candidate["match_index_count"]))
+        ]
+        for candidate in candidates
+        if (str(candidate["ib_hash"]), int(candidate["match_first_index"]), int(candidate["match_index_count"])) in key_index
+    }
+    texture_candidates = _build_texture_candidates(files_by_draw, included_key_index)
+    bone_pool_order = build_bone_pool_order(candidates)
     payload = {
         "schema_version": 1,
         "frameanalysis_dir": normalized_frameanalysis_dir,
         "target": {
+            "visible_anchor_ibs": [f"{key[0]}-{key[2]}-{key[1]}" for key in visible_anchor.get("anchor_keys", [])],
             "source_ib_hashes": target_hashes,
             "selection_mode": discovery["selection_mode"],
             "auto_discovery": discovery,
         },
         "shadow_stage": {
             "shadow_vs_hashes": shadow_vs_hashes,
-            "stage_draw_start": min(shadow_draw_indices),
-            "stage_draw_end": max(shadow_draw_indices),
+            "stage_draw_start": int(stage_draw_start or min(shadow_draw_indices)),
+            "stage_draw_end": int(stage_draw_end or max(shadow_draw_indices)),
             "normal_vs_hash": normal_vs_hash,
             "transparent_vs_hash": transparent_vs_hash,
             "host_draw_index": int(host_draw_index),
@@ -234,6 +255,398 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
     }
     _validate_payload(payload)
     return payload
+
+
+def _all_ib_txt_dumps(files_by_draw: dict[int, list[DumpFile]]) -> list[DumpFile]:
+    dumps = [
+        dump_file
+        for dump_files in files_by_draw.values()
+        for dump_file in dump_files
+        if dump_file.slot == "ib" and dump_file.extension == "txt"
+    ]
+    dumps.sort(key=lambda item: item.draw_index)
+    return dumps
+
+
+def _group_ib_dumps_by_key(dump_files: Iterable[DumpFile]) -> dict[tuple[str, int, int], list[DumpFile]]:
+    grouped: dict[tuple[str, int, int], list[DumpFile]] = {}
+    for dump_file in dump_files:
+        key = _candidate_key_from_ib_dump(dump_file)
+        if not key[0] or key[2] <= 0:
+            continue
+        grouped.setdefault(key, []).append(dump_file)
+    for hits in grouped.values():
+        hits.sort(key=lambda item: item.draw_index)
+    return grouped
+
+
+def _draw_in_stage_window(draw_index: int, stage_draw_start: int, stage_draw_end: int) -> bool:
+    if stage_draw_start <= 0 or stage_draw_end <= 0:
+        return True
+    return int(stage_draw_start) <= int(draw_index) <= int(stage_draw_end)
+
+
+def _discover_visible_anchor_keys(
+    all_ib_dumps: list[DumpFile],
+    draw_states: dict[int, DrawState],
+    target_hashes: list[str],
+    warnings: list[dict],
+) -> dict:
+    if target_hashes:
+        manual_hits = [
+            dump_file
+            for dump_file in all_ib_dumps
+            if dump_file.resource_hash.lower() in target_hashes
+        ]
+        if manual_hits:
+            return {
+                "selection_mode": "manual_hash_anchor",
+                "anchor_keys": sorted(
+                    {_candidate_key_from_ib_dump(dump_file) for dump_file in manual_hits},
+                    key=lambda item: (-item[2], item[0], item[1]),
+                ),
+                "anchor_draw_indices": [dump_file.draw_index for dump_file in manual_hits[:32]],
+                "max_rt_count": max((_state_rt_count(draw_states, dump_file) for dump_file in manual_hits), default=-1),
+            }
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "manual_anchor_missing",
+                "message": f"Manual anchor IB hash(es) were not found: {', '.join(target_hashes)}.",
+                "draw_indices": [],
+            }
+        )
+
+    rt_counts = [
+        _state_rt_count(draw_states, dump_file)
+        for dump_file in all_ib_dumps
+        if _state_rt_count(draw_states, dump_file) > 0
+    ]
+    max_rt_count = max(rt_counts, default=-1)
+    if max_rt_count > 0:
+        anchor_hits = [
+            dump_file
+            for dump_file in all_ib_dumps
+            if _state_rt_count(draw_states, dump_file) == max_rt_count
+        ]
+    else:
+        anchor_hits = []
+    if not anchor_hits:
+        anchor_hits = [
+            dump_file
+            for dump_file in all_ib_dumps
+            if _state_rt_count(draw_states, dump_file) > 0
+        ]
+    if not anchor_hits:
+        anchor_hits = list(all_ib_dumps)
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "gbuffer_anchor_missing",
+                "message": "No visible/g-buffer IB draws with RT output were found; using all dumped IBs as weak anchors.",
+                "draw_indices": [],
+            }
+        )
+    return {
+        "selection_mode": "auto_gbuffer_anchor" if max_rt_count > 0 else "auto_any_ib_anchor",
+        "anchor_keys": sorted(
+            {_candidate_key_from_ib_dump(dump_file) for dump_file in anchor_hits},
+            key=lambda item: (-item[2], item[0], item[1]),
+        ),
+        "anchor_draw_indices": [dump_file.draw_index for dump_file in anchor_hits[:64]],
+        "max_rt_count": int(max_rt_count),
+    }
+
+
+def _discover_shadow_stage_from_visible_anchors(
+    *,
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    all_ib_dumps: list[DumpFile],
+    key_index: dict[tuple[str, int, int], list[DumpFile]],
+    visible_anchor: dict,
+    warnings: list[dict],
+) -> dict:
+    anchor_keys = set(visible_anchor.get("anchor_keys", []) or [])
+    first_anchor_draw_by_key: dict[tuple[str, int, int], int] = {}
+    for key in anchor_keys:
+        anchor_draws = [
+            dump_file.draw_index
+            for dump_file in key_index.get(key, [])
+            if _state_rt_count(draw_states, dump_file) > 0
+        ]
+        if anchor_draws:
+            first_anchor_draw_by_key[key] = min(anchor_draws)
+
+    backtrack_hits = [
+        dump_file
+        for key, first_draw in first_anchor_draw_by_key.items()
+        for dump_file in key_index.get(key, [])
+        if dump_file.draw_index < first_draw
+    ]
+    selected_pair = _best_shadow_vs_pair_from_hits(backtrack_hits, files_by_draw, draw_states, key_index)
+    if selected_pair:
+        return {
+            **selected_pair,
+            "selection_mode": f"{visible_anchor.get('selection_mode', 'auto_anchor')}_backtrack_shadow_vs",
+            "anchor_draw_indices": list(visible_anchor.get("anchor_draw_indices", []) or []),
+            "anchor_keys": [f"{key[0]}-{key[2]}-{key[1]}" for key in sorted(anchor_keys)],
+        }
+
+    auto_candidates = _auto_shadow_vs_pair_candidates(files_by_draw, draw_states, warnings)
+    if not auto_candidates:
+        raise ValueError("No skinned shadow VS candidate pair found in FrameAnalysis")
+    selected_candidate = auto_candidates[0]
+    warnings.append(
+        {
+            "severity": "warning",
+            "code": "shadow_vs_pair_fallback",
+            "message": "Could not backtrack shadow VS from visible anchors; used structural shadow-pair fallback.",
+            "draw_indices": [],
+        }
+    )
+    return {
+        "selection_mode": "auto_shadow_vs_pair_fallback",
+        "shadow_vs_hashes": list(selected_candidate["shadow_vs_hashes"]),
+        "stage_draw_start": int(selected_candidate.get("draw_start", 0)),
+        "stage_draw_end": int(selected_candidate.get("draw_end", 0)),
+        "anchor_draw_indices": list(visible_anchor.get("anchor_draw_indices", []) or []),
+        "anchor_keys": [f"{key[0]}-{key[2]}-{key[1]}" for key in sorted(anchor_keys)],
+        "auto_candidates": auto_candidates[:8],
+    }
+
+
+def _best_shadow_vs_pair_from_hits(
+    hits: list[DumpFile],
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    key_index: dict[tuple[str, int, int], list[DumpFile]],
+) -> dict | None:
+    hits_by_vs: dict[str, list[DumpFile]] = {}
+    for dump_file in hits:
+        vs_hash = _state_vs_hash(draw_states, dump_file)
+        if not vs_hash:
+            continue
+        hits_by_vs.setdefault(vs_hash, []).append(dump_file)
+    if not hits_by_vs:
+        return None
+    vs_infos = {
+        vs_hash: _build_vs_group_info(vs_hash, vs_hits, files_by_draw, draw_states, key_index)
+        for vs_hash, vs_hits in hits_by_vs.items()
+    }
+    pairs: list[dict] = []
+    vs_hashes = sorted(vs_infos, key=lambda value: vs_infos[value]["draw_start"])
+    for left_index, left_vs in enumerate(vs_hashes):
+        for right_vs in vs_hashes[left_index + 1 :]:
+            left_info = vs_infos[left_vs]
+            right_info = vs_infos[right_vs]
+            left_start = int(left_info["draw_start"])
+            right_start = int(right_info["draw_start"])
+            if abs(left_start - right_start) > 260:
+                continue
+            union_keys = left_info["candidate_keys"] | right_info["candidate_keys"]
+            skinned_keys = left_info["skinned_keys"] | right_info["skinned_keys"]
+            overlap_keys = left_info["candidate_keys"] & right_info["candidate_keys"]
+            if not skinned_keys:
+                continue
+            score = (
+                len(skinned_keys) * 100000
+                + len(overlap_keys) * 50000
+                + min(sum(key[2] for key in union_keys), 800000)
+                + max(0, 260 - min(left_start, right_start)) * 2000
+            )
+            pairs.append(
+                {
+                    "shadow_vs_hashes": [left_vs, right_vs],
+                    "score": int(score),
+                    "stage_draw_start": min(left_info["draw_start"], right_info["draw_start"]),
+                    "stage_draw_end": max(left_info["draw_end"], right_info["draw_end"]),
+                    "candidate_count": int(len(union_keys)),
+                    "skinned_candidate_count": int(len(skinned_keys)),
+                    "overlap_count": int(len(overlap_keys)),
+                }
+            )
+    if pairs:
+        pairs.sort(
+            key=lambda item: (
+                int(item["score"]),
+                int(item["skinned_candidate_count"]),
+                int(item["overlap_count"]),
+                -int(item["stage_draw_start"]),
+            ),
+            reverse=True,
+        )
+        return {**pairs[0], "auto_candidates": pairs[:8]}
+
+    single_infos = sorted(
+        vs_infos.values(),
+        key=lambda item: (len(item["skinned_keys"]), int(item["index_count_sum"]), -int(item["draw_start"])),
+        reverse=True,
+    )
+    if single_infos and single_infos[0]["skinned_keys"]:
+        info = single_infos[0]
+        return {
+            "shadow_vs_hashes": [str(info["vs_hash"])],
+            "score": int(info["index_count_sum"]),
+            "stage_draw_start": int(info["draw_start"]),
+            "stage_draw_end": int(info["draw_end"]),
+            "candidate_count": int(len(info["candidate_keys"])),
+            "skinned_candidate_count": int(len(info["skinned_keys"])),
+            "overlap_count": 0,
+            "auto_candidates": [],
+        }
+    return None
+
+
+def _build_candidate_entries(
+    *,
+    frameanalysis_dir: str,
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    key_index: dict[tuple[str, int, int], list[DumpFile]],
+    shadow_hits_by_key: dict[tuple[str, int, int], list[DumpFile]],
+    shadow_vs_hashes: list[str],
+    warnings: list[dict],
+) -> list[dict]:
+    candidates: list[dict] = []
+    skipped_no_bones = 0
+    skipped_no_import = 0
+    for key, all_hits in sorted(key_index.items(), key=lambda item: (-item[0][2], item[0][0], item[0][1])):
+        import_hit = _select_import_hit(files_by_draw, draw_states, all_hits)
+        if import_hit is None:
+            skipped_no_import += 1
+            continue
+        ordered_hits = [import_hit] + [hit for hit in all_hits if hit.draw_index != import_hit.draw_index]
+        local_warnings: list[dict] = []
+        source_local_bone_count = _infer_candidate_local_bone_count(files_by_draw, ordered_hits, local_warnings)
+        if source_local_bone_count <= 0:
+            skipped_no_bones += 1
+            continue
+        ib_hash, first_index, index_count = key
+        key_shadow_hits = [
+            dump_file
+            for dump_file in shadow_hits_by_key.get(key, [])
+            if _state_vs_hash(draw_states, dump_file) in shadow_vs_hashes
+        ]
+        import_state = draw_states.get(import_hit.draw_index)
+        manifest_hits = [import_hit] + [
+            dump_file
+            for dump_file in key_shadow_hits
+            if dump_file.draw_index != import_hit.draw_index
+        ]
+        candidate = {
+            "enabled": True,
+            "ib_hash": ib_hash,
+            "match_first_index": int(first_index),
+            "match_index_count": int(index_count),
+            "display_name": f"{ib_hash}-{index_count}-{first_index}",
+            "draw_indices": [dump_file.draw_index for dump_file in all_hits],
+            "import_draw_index": int(import_hit.draw_index),
+            "import_vs_hash": str(import_state.vs_hash if import_state else import_hit.vs_hash),
+            "import_ps_hash": str(import_state.ps_hash if import_state else import_hit.ps_hash),
+            "shadow_capture_ready": bool(key_shadow_hits),
+            "shadow_draw_indices": [dump_file.draw_index for dump_file in key_shadow_hits],
+            "source_index_count": int(index_count),
+            "source_local_bone_count": int(source_local_bone_count),
+            "local_bone_count": int(source_local_bone_count),
+            "texture_region_key": f"{ib_hash}-{index_count}-{first_index}",
+            "status": "capture_ready" if key_shadow_hits else "import_only_no_early_shadow",
+            "import_paths": _build_import_paths_payload(files_by_draw, ordered_hits),
+            "skin_format": _build_skin_format_payload(files_by_draw, import_hit),
+            "manifest_hits": manifest_hits,
+        }
+        used_local_bone_indices = _infer_candidate_used_local_bone_indices(
+            files_by_draw,
+            import_hit,
+            candidate,
+            warnings,
+        )
+        if not used_local_bone_indices:
+            skipped_no_bones += 1
+            continue
+        candidate["used_local_bone_indices"] = used_local_bone_indices
+        candidate["local_bone_count"] = len(used_local_bone_indices)
+        used_source_local_bone_count = max(used_local_bone_indices) + 1
+        candidate["source_local_bone_count"] = max(
+            int(source_local_bone_count) if 0 < int(source_local_bone_count) <= 256 else 0,
+            used_source_local_bone_count,
+        )
+        candidates.append(candidate)
+    if skipped_no_import:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "skipped_no_import_buffers",
+                "message": f"Skipped {skipped_no_import} IB candidate(s) without enough dumped IB/VB data.",
+                "draw_indices": [],
+            }
+        )
+    if skipped_no_bones:
+        warnings.append(
+            {
+                "severity": "info",
+                "code": "skipped_no_blendindices",
+                "message": f"Skipped {skipped_no_bones} non-skinned or unsupported IB candidate(s).",
+                "draw_indices": [],
+            }
+        )
+    return candidates
+
+
+def _select_import_hit(
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    hits: list[DumpFile],
+) -> DumpFile | None:
+    importable_hits = [
+        dump_file
+        for dump_file in hits
+        if _draw_has_minimum_import_buffers(files_by_draw.get(dump_file.draw_index, []))
+    ]
+    if not importable_hits:
+        return None
+    return max(importable_hits, key=lambda dump_file: _import_hit_score(files_by_draw, draw_states, dump_file))
+
+
+def _draw_has_minimum_import_buffers(draw_files: list[DumpFile]) -> bool:
+    if not _binary_data_path_for_slot(draw_files, "ib"):
+        return False
+    has_vb0_txt = any(dump_file.slot == "vb0" and dump_file.extension == "txt" for dump_file in draw_files)
+    has_vb0_buf = bool(_binary_data_path_for_slot(draw_files, "vb0"))
+    return has_vb0_txt and has_vb0_buf
+
+
+def _import_hit_score(
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    dump_file: DumpFile,
+) -> tuple[int, int, int, int, int, int]:
+    draw_files = files_by_draw.get(dump_file.draw_index, [])
+    draw_state = draw_states.get(dump_file.draw_index)
+    rt_count = int(draw_state.rt_count if draw_state else -1)
+    vb_slot_count = len({item.slot for item in draw_files if item.slot.startswith("vb") and item.extension == "txt"})
+    has_vb1 = any(item.slot == "vb1" and item.extension == "txt" for item in draw_files)
+    has_vb2 = any(item.slot == "vb2" and item.extension == "txt" for item in draw_files)
+    has_ps = 1 if draw_state and draw_state.ps_hash else 0
+    return (
+        1 if rt_count > 0 else 0,
+        min(max(rt_count, 0), 8),
+        1 if has_vb2 else 0,
+        1 if has_vb1 else 0,
+        vb_slot_count + has_ps,
+        int(dump_file.draw_index),
+    )
+
+
+def _state_rt_count(draw_states: dict[int, DrawState], dump_file: DumpFile) -> int:
+    draw_state = draw_states.get(dump_file.draw_index)
+    return int(draw_state.rt_count if draw_state else -1)
+
+
+def _pass_role_for_material(draw_state: DrawState | None) -> str:
+    if draw_state and int(draw_state.rt_count) > 0:
+        return "visible_material"
+    return "unknown"
 
 
 def _normalize_target_hashes(target_ib_hashes: Iterable[str]) -> list[str]:
@@ -763,8 +1176,7 @@ def _build_import_paths_payload(files_by_draw: dict[int, list[DumpFile]], all_hi
         return {"ib": "", "vb": {}, "layout": ""}
     first_hit = all_hits[0]
     first_draw_files = files_by_draw.get(first_hit.draw_index, [])
-    all_draw_files = [dump_file for hit in all_hits for dump_file in files_by_draw.get(hit.draw_index, [])]
-    vb_slots = sorted({dump_file.slot for dump_file in all_draw_files if dump_file.slot.startswith("vb")})
+    vb_slots = sorted({dump_file.slot for dump_file in first_draw_files if dump_file.slot.startswith("vb")})
     return {
         "ib": first_hit.path,
         "ib_buf": _binary_data_path_for_slot(first_draw_files, "ib"),
@@ -772,12 +1184,12 @@ def _build_import_paths_payload(files_by_draw: dict[int, list[DumpFile]], all_hi
             slot: {
                 "txt": [
                     dump_file.path
-                    for dump_file in all_draw_files
+                    for dump_file in first_draw_files
                     if dump_file.slot == slot and dump_file.extension == "txt"
                 ],
                 "layout_txt": [
                     dump_file.data_path
-                    for dump_file in all_draw_files
+                    for dump_file in first_draw_files
                     if dump_file.slot == slot
                     and dump_file.extension == "txt"
                     and dump_file.data_path
@@ -786,7 +1198,7 @@ def _build_import_paths_payload(files_by_draw: dict[int, list[DumpFile]], all_hi
                 "buf": next(
                     (
                         dump_file.data_path
-                        for dump_file in all_draw_files
+                        for dump_file in first_draw_files
                         if dump_file.slot == slot and dump_file.extension == "buf" and dump_file.data_path
                     ),
                     "",
@@ -796,6 +1208,192 @@ def _build_import_paths_payload(files_by_draw: dict[int, list[DumpFile]], all_hi
         },
         "layout": "",
     }
+
+
+def _build_skin_format_payload(files_by_draw: dict[int, list[DumpFile]], import_hit: DumpFile) -> dict:
+    for dump_file in files_by_draw.get(import_hit.draw_index, []):
+        if not dump_file.slot.startswith("vb") or dump_file.extension != "txt":
+            continue
+        header_path = dump_file.data_path if dump_file.data_path and dump_file.data_path.endswith(".txt") else dump_file.path
+        header = _parse_buffer_header(header_path)
+        slot_index = _slot_index(dump_file.slot)
+        blend_indices = next(
+            (
+                element
+                for element in header.elements
+                if element.input_slot == slot_index and element.semantic_name == "BLENDINDICES"
+            ),
+            None,
+        )
+        if blend_indices is None:
+            continue
+        blend_weights = next(
+            (
+                element
+                for element in header.elements
+                if element.input_slot == slot_index and element.semantic_name == "BLENDWEIGHTS"
+            ),
+            None,
+        )
+        return {
+            "slot": dump_file.slot,
+            "slot_index": int(slot_index),
+            "stride": int(header.stride),
+            "vertex_count": int(header.vertex_count),
+            "blend_weights_format": str(blend_weights.fmt if blend_weights else ""),
+            "blend_weights_offset": int(blend_weights.aligned_byte_offset if blend_weights else -1),
+            "blend_indices_format": str(blend_indices.fmt),
+            "blend_indices_offset": int(blend_indices.aligned_byte_offset),
+            "source_txt": dump_file.path,
+            "source_layout_txt": header_path,
+        }
+    return {}
+
+
+def _infer_candidate_used_local_bone_indices(
+    files_by_draw: dict[int, list[DumpFile]],
+    import_hit: DumpFile,
+    candidate: dict,
+    warnings: list[dict],
+) -> list[int]:
+    source_local_bone_count = int(candidate.get("source_local_bone_count", candidate.get("local_bone_count", 0)) or 0)
+    fallback = list(range(min(max(0, source_local_bone_count), 256)))
+    try:
+        used_indices = _read_used_local_bone_indices_from_import_draw(
+            files_by_draw.get(import_hit.draw_index, []),
+            import_hit,
+            dict(candidate.get("skin_format", {}) or {}),
+        )
+    except Exception as exc:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "compact_palette_scan_failed",
+                "message": (
+                    f"Could not compact local bone palette for "
+                    f"{candidate.get('display_name') or candidate.get('ib_hash')}: {exc}"
+                ),
+                "draw_indices": [int(candidate.get("import_draw_index", -1) or -1)],
+            }
+        )
+        return fallback
+
+    if used_indices:
+        return sorted({int(value) for value in used_indices if int(value) >= 0})
+    return []
+
+
+def _read_used_local_bone_indices_from_import_draw(
+    draw_files: list[DumpFile],
+    import_hit: DumpFile,
+    skin_format: dict,
+) -> list[int]:
+    ib_buf_path = _binary_data_path_for_slot(draw_files, "ib")
+    if not ib_buf_path:
+        return []
+    ib_header_path = import_hit.data_path if import_hit.data_path and import_hit.data_path.endswith(".txt") else import_hit.path
+    ib_header = _parse_buffer_header(ib_header_path)
+    indices = _read_index_values(
+        data_path=ib_buf_path,
+        header=ib_header,
+    )
+    vertex_ids = sorted({int(index) for index in indices if int(index) >= 0})
+    if not vertex_ids:
+        return []
+
+    slot_name = str(skin_format.get("slot", "") or "vb2").lower()
+    slot_index = _slot_index(slot_name)
+    skin_txt = next(
+        (
+            dump_file
+            for dump_file in draw_files
+            if dump_file.slot == slot_name and dump_file.extension == "txt"
+        ),
+        None,
+    )
+    if skin_txt is None:
+        return []
+    header_path = skin_txt.data_path if skin_txt.data_path and skin_txt.data_path.endswith(".txt") else skin_txt.path
+    header = _parse_buffer_header(header_path)
+    weight_element = next(
+        (
+            element
+            for element in header.elements
+            if element.input_slot == slot_index and element.semantic_name == "BLENDWEIGHTS"
+        ),
+        None,
+    )
+    index_element = next(
+        (
+            element
+            for element in header.elements
+            if element.input_slot == slot_index and element.semantic_name == "BLENDINDICES"
+        ),
+        None,
+    )
+    if weight_element is None or index_element is None:
+        return []
+    data_path = _binary_data_path_for_slot(draw_files, slot_name)
+    if not data_path:
+        return []
+    base_offset = _infer_buffer_data_base_offset(
+        data_path=data_path,
+        header_path=header_path,
+        header=header,
+        slot=slot_name,
+        slot_index=slot_index,
+    )
+    weight_size = _vertex_format_size(weight_element.fmt)
+    index_size = _vertex_format_size(index_element.fmt)
+    if weight_size <= 0 or index_size <= 0 or header.stride <= 0:
+        return []
+    with open(data_path, "rb") as file_handle:
+        file_handle.seek(base_offset)
+        raw_vertex_data = file_handle.read(int(header.vertex_count) * int(header.stride))
+
+    used_indices: set[int] = set()
+    for vertex_id in vertex_ids:
+        if vertex_id >= int(header.vertex_count):
+            continue
+        vertex_offset = int(vertex_id) * int(header.stride)
+        weight_offset = vertex_offset + int(weight_element.aligned_byte_offset)
+        index_offset = vertex_offset + int(index_element.aligned_byte_offset)
+        weight_bytes = raw_vertex_data[weight_offset : weight_offset + weight_size]
+        index_bytes = raw_vertex_data[index_offset : index_offset + index_size]
+        if len(weight_bytes) < weight_size or len(index_bytes) < index_size:
+            continue
+        weights = _unpack_vertex_format(weight_bytes, weight_element.fmt)
+        blend_indices = _unpack_vertex_format(index_bytes, index_element.fmt)
+        for weight, palette_index in zip(weights[:4], blend_indices[:4]):
+            if float(weight) > 0.0:
+                used_indices.add(int(palette_index))
+    return sorted(used_indices)
+
+
+def _read_index_values(data_path: str, header: BufferHeader) -> list[int]:
+    index_count = int(header.index_count)
+    if not data_path or not os.path.exists(data_path) or index_count <= 0:
+        return []
+    fmt = str(header.fmt or "").upper()
+    if "R16_UINT" in fmt:
+        stride = 2
+        unpack = "<H"
+    elif "R32_UINT" in fmt:
+        stride = 4
+        unpack = "<I"
+    else:
+        return []
+    import struct
+
+    first_index = int(header.first_index)
+    with open(data_path, "rb") as file_handle:
+        file_handle.seek(int(header.byte_offset) + first_index * stride)
+        raw_data = file_handle.read(index_count * stride)
+    return [
+        int(struct.unpack_from(unpack, raw_data, index * stride)[0])
+        for index in range(index_count)
+        if index * stride + stride <= len(raw_data)
+    ]
 
 
 def _infer_candidate_local_bone_count(
@@ -819,7 +1417,7 @@ def _infer_candidate_local_bone_count(
                 ),
                 None,
             )
-            if blend_index_element is None or not _header_format_is(blend_index_element.fmt, "R8G8B8A8_UINT"):
+            if blend_index_element is None or not _is_supported_blend_index_format(blend_index_element.fmt):
                 continue
             binary_data_path = _binary_data_path_for_slot(draw_files, dump_file.slot)
             base_offset = _infer_buffer_data_base_offset(
@@ -835,6 +1433,7 @@ def _infer_candidate_local_bone_count(
                 stride=header.stride,
                 vertex_count=header.vertex_count,
                 blend_offset=blend_index_element.aligned_byte_offset,
+                blend_format=blend_index_element.fmt,
             )
             if max_index >= 0:
                 return int(max_index + 1)
@@ -857,37 +1456,20 @@ def _infer_buffer_data_base_offset(
     slot: str,
     slot_index: int,
 ) -> int:
+    header_offset = max(0, int(header.byte_offset))
     if not data_path or not os.path.exists(data_path):
-        return int(header.byte_offset)
-    samples = _first_vertex_samples_from_path(header_path, slot, slot_index)
-    if not samples:
-        return int(header.byte_offset)
-    keyed_by_offset = {
-        int(element.aligned_byte_offset): element
-        for element in header.elements
-        if element.input_slot == slot_index and element.aligned_byte_offset >= 0
-    }
-    comparable_samples = [
-        (field_offset, keyed_by_offset[field_offset], values)
-        for field_offset, values in samples.items()
-        if field_offset in keyed_by_offset
-    ]
-    if not comparable_samples:
-        return int(header.byte_offset)
+        return header_offset
+    required_size = header_offset + int(header.vertex_count) * int(header.stride)
     try:
-        with open(data_path, "rb") as file_handle:
-            for delta in range(-64, 65):
-                base_offset = int(header.byte_offset) + delta
-                if base_offset < 0:
-                    continue
-                if all(
-                    _buffer_sample_matches(file_handle, base_offset + field_offset, element, values)
-                    for field_offset, element, values in comparable_samples
-                ):
-                    return base_offset
+        file_size = os.path.getsize(data_path)
     except OSError:
-        return int(header.byte_offset)
-    return int(header.byte_offset)
+        return header_offset
+    if required_size <= file_size:
+        return header_offset
+    slice_size = int(header.vertex_count) * int(header.stride)
+    if slice_size <= file_size:
+        return 0
+    return header_offset
 
 
 def _first_vertex_samples_from_path(header_path: str, slot: str, slot_index: int) -> dict[int, list[float]]:
@@ -962,6 +1544,8 @@ def _vertex_format_size(fmt: str) -> int:
         return 12
     if upper_fmt in {"R32G32B32A32_FLOAT", "DXGI_FORMAT_R32G32B32A32_FLOAT"}:
         return 16
+    if upper_fmt in {"R32G32B32A32_UINT", "DXGI_FORMAT_R32G32B32A32_UINT"}:
+        return 16
     if upper_fmt in {"R16G16B16A16_UNORM", "DXGI_FORMAT_R16G16B16A16_UNORM"}:
         return 8
     if upper_fmt in {"R8G8B8A8_UINT", "DXGI_FORMAT_R8G8B8A8_UINT"}:
@@ -977,6 +1561,10 @@ def _header_format_is(fmt: str, name: str) -> bool:
     return upper_fmt == upper_name or upper_fmt == f"DXGI_FORMAT_{upper_name}"
 
 
+def _is_supported_blend_index_format(fmt: str) -> bool:
+    return _header_format_is(fmt, "R8G8B8A8_UINT") or _header_format_is(fmt, "R32G32B32A32_UINT")
+
+
 def _unpack_vertex_format(raw_data: bytes, fmt: str) -> tuple[float, ...]:
     import struct
 
@@ -989,6 +1577,8 @@ def _unpack_vertex_format(raw_data: bytes, fmt: str) -> tuple[float, ...]:
         return tuple(float(value) for value in struct.unpack_from("<3f", raw_data, 0))
     if upper_fmt in {"R32G32B32A32_FLOAT", "DXGI_FORMAT_R32G32B32A32_FLOAT"}:
         return tuple(float(value) for value in struct.unpack_from("<4f", raw_data, 0))
+    if upper_fmt in {"R32G32B32A32_UINT", "DXGI_FORMAT_R32G32B32A32_UINT"}:
+        return tuple(float(value) for value in struct.unpack_from("<4I", raw_data, 0))
     if upper_fmt in {"R16G16B16A16_UNORM", "DXGI_FORMAT_R16G16B16A16_UNORM"}:
         return tuple(float(value) / 65535.0 for value in struct.unpack_from("<4H", raw_data, 0))
     if upper_fmt in {"R8G8B8A8_UINT", "DXGI_FORMAT_R8G8B8A8_UINT"}:
@@ -1011,8 +1601,12 @@ def _read_max_blend_index(
     stride: int,
     vertex_count: int,
     blend_offset: int,
+    blend_format: str,
 ) -> int:
     if not data_path or not os.path.exists(data_path) or stride <= 0 or vertex_count <= 0:
+        return -1
+    record_size = _vertex_format_size(blend_format)
+    if record_size <= 0:
         return -1
     max_index = -1
     try:
@@ -1022,10 +1616,13 @@ def _read_max_blend_index(
     except OSError:
         return -1
     for vertex_offset in range(blend_offset, len(raw_vertex_data), stride):
-        raw_indices = raw_vertex_data[vertex_offset : vertex_offset + 4]
-        if len(raw_indices) < 4:
+        raw_indices = raw_vertex_data[vertex_offset : vertex_offset + record_size]
+        if len(raw_indices) < record_size:
             break
-        max_index = max(max_index, raw_indices[0], raw_indices[1], raw_indices[2], raw_indices[3])
+        values = _unpack_vertex_format(raw_indices, blend_format)
+        if len(values) < 4:
+            continue
+        max_index = max(max_index, *(int(value) for value in values[:4]))
     return max_index
 
 
@@ -1069,12 +1666,19 @@ def _build_texture_candidates(
     return candidates
 
 
-def _build_bone_pool_order(candidates: list[dict]) -> list[dict]:
+def build_bone_pool_order(candidates: list[dict]) -> list[dict]:
     ordered = sorted(
-        candidates,
+        [
+            candidate
+            for candidate in candidates
+            if bool(candidate.get("enabled", True))
+            and int(candidate.get("local_bone_count", 0)) > 0
+        ],
         key=lambda item: (
-            -int(item.get("source_index_count", 0)),
+            0 if bool(item.get("shadow_capture_ready", False)) else 1,
+            -int(item.get("match_index_count", item.get("source_index_count", 0))),
             -int(item.get("local_bone_count", 0)),
+            str(item.get("mesh_fingerprint", "")),
             str(item.get("ib_hash", "")),
             int(item.get("match_first_index", 0)),
         ),
@@ -1082,7 +1686,15 @@ def _build_bone_pool_order(candidates: list[dict]) -> list[dict]:
     next_base = 0
     payload = []
     for candidate in ordered:
-        local_bone_count = int(candidate.get("local_bone_count", 0))
+        used_local_bone_indices = _candidate_used_local_bone_indices(candidate)
+        local_bone_count = len(used_local_bone_indices)
+        if local_bone_count <= 0:
+            continue
+        source_local_bone_count = max(
+            int(candidate.get("source_local_bone_count", candidate.get("local_bone_count", 0)) or 0),
+            max(used_local_bone_indices) + 1,
+        )
+        capture_available = bool(candidate.get("shadow_capture_ready", False))
         payload.append(
             {
                 "ib_hash": str(candidate.get("ib_hash", "")),
@@ -1091,11 +1703,24 @@ def _build_bone_pool_order(candidates: list[dict]) -> list[dict]:
                 "producer_dispatch_index": -1,
                 "global_bone_base": int(next_base),
                 "local_bone_count": local_bone_count,
+                "source_local_bone_count": int(source_local_bone_count),
+                "used_local_bone_indices": used_local_bone_indices,
                 "capture_store_base": int(next_base),
+                "shadow_capture_ready": capture_available,
+                "bone_capture_available": capture_available,
+                "status": "capture_ready" if capture_available else "bone_mapping_only_no_shadow_capture",
             }
         )
         next_base += max(0, local_bone_count)
     return payload
+
+
+def _candidate_used_local_bone_indices(candidate: dict) -> list[int]:
+    raw_indices = candidate.get("used_local_bone_indices")
+    if isinstance(raw_indices, (list, tuple)) and raw_indices:
+        return sorted({int(value) for value in raw_indices if int(value) >= 0})
+    local_bone_count = int(candidate.get("local_bone_count", 0) or 0)
+    return list(range(max(0, local_bone_count)))
 
 
 def _validate_payload(payload: dict) -> None:

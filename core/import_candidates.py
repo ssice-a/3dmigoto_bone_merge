@@ -15,6 +15,7 @@ from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
 _VERTEX_DATA_RE = re.compile(
     r"^vb(?P<slot>\d+)\[(?P<vertex>\d+)\]\+(?P<offset>\d+)\s+[^:]+:\s*(?P<values>.+)$"
 )
+DEFAULT_MIRROR_FLIP = True
 
 
 @dataclass(frozen=True)
@@ -114,16 +115,18 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         uv1 = list(uv0)
         texcoord4_raw = [(0, 0, 0, 0) for _ in original_vertex_ids]
 
-    vb2 = _load_slot_slice(vb_payload, "vb2", 2, frameanalysis_dir, warnings)
-    if vb2 is not None:
-        blend_weights = _read_blend_weights(vb2, original_vertex_ids)
-        blend_indices = _read_blend_indices(vb2, original_vertex_ids)
+    skin_slot_name, skin_slot_index = _skin_slot_from_candidate(candidate)
+    skin_slot = _load_slot_slice(vb_payload, skin_slot_name, skin_slot_index, frameanalysis_dir, warnings)
+    if skin_slot is not None:
+        _validate_skin_format(skin_slot, dict(candidate.get("skin_format", {}) or {}), warnings)
+        blend_weights = _read_blend_weights(skin_slot, original_vertex_ids)
+        blend_indices = _read_blend_indices(skin_slot, original_vertex_ids)
         if not _blend_indices_are_valid(blend_indices):
-            warnings.append(f"{vb2.slot_name}: BLENDINDICES0 contains values outside 0..255; weights skipped")
+            warnings.append(f"{skin_slot.slot_name}: BLENDINDICES0 contains values outside 0..255; weights skipped")
             blend_weights = [(0.0, 0.0, 0.0, 0.0) for _ in original_vertex_ids]
             blend_indices = [(0, 0, 0, 0) for _ in original_vertex_ids]
     else:
-        warnings.append("vb2 is missing; blend weights and indices use fallback values")
+        warnings.append(f"{skin_slot_name} is missing; blend weights and indices use fallback values")
         blend_weights = [(0.0, 0.0, 0.0, 0.0) for _ in original_vertex_ids]
         blend_indices = [(0, 0, 0, 0) for _ in original_vertex_ids]
 
@@ -146,7 +149,14 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
     )
 
 
-def import_selected_candidates(context, manifest: dict, selected_display_names: Iterable[str], target_collection):
+def import_selected_candidates(
+    context,
+    manifest: dict,
+    selected_display_names: Iterable[str],
+    target_collection,
+    *,
+    mirror_flip: bool = DEFAULT_MIRROR_FLIP,
+):
     """Create Blender mesh objects for selected candidate display names."""
 
     import bpy  # type: ignore
@@ -167,6 +177,7 @@ def import_selected_candidates(context, manifest: dict, selected_display_names: 
             target_collection,
             draw_indices=list(candidate.get("draw_indices", []) or []),
             shadow_draw_indices=list(candidate.get("shadow_draw_indices", []) or []),
+            mirror_flip=mirror_flip,
         )
         imported_objects.append(imported_object)
 
@@ -186,14 +197,16 @@ def create_blender_object_from_geometry(
     *,
     draw_indices: list[int],
     shadow_draw_indices: list[int],
+    mirror_flip: bool = DEFAULT_MIRROR_FLIP,
 ):
     mesh = bpy_module.data.meshes.new(geometry.display_name)
     imported_object = bpy_module.data.objects.new(geometry.display_name, mesh)
     target_collection.objects.link(imported_object)
 
-    # Flip winding for Blender front faces while keeping source vertex data intact.
-    blender_triangles = [(a, c, b) for a, b, c in geometry.triangles]
-    mesh.from_pydata(geometry.positions, [], blender_triangles)
+    blender_positions = _positions_for_blender(geometry.positions, mirror_flip=mirror_flip)
+    blender_normals = _normals_for_blender(geometry.normals, mirror_flip=mirror_flip)
+    blender_triangles = _triangles_for_blender(geometry.triangles, mirror_flip=mirror_flip)
+    mesh.from_pydata(blender_positions, [], blender_triangles)
     mesh.validate(verbose=False, clean_customdata=False)
     mesh.update()
     for polygon in mesh.polygons:
@@ -201,7 +214,7 @@ def create_blender_object_from_geometry(
 
     _apply_uv_layer(mesh, "UV0", geometry.uv0)
     _apply_uv_layer(mesh, "UV1", geometry.uv1)
-    _apply_custom_normals(mesh, geometry.normals)
+    _apply_custom_normals(mesh, blender_normals)
     _store_int_attribute(mesh, "bmc_orig_vertex_id", geometry.original_vertex_ids)
     _store_uint32_split_attributes(mesh, "bmc_normal_packed", geometry.normal_packed)
     for channel_index in range(4):
@@ -230,9 +243,50 @@ def create_blender_object_from_geometry(
     imported_object["bmc_match_index_count"] = int(geometry.match_index_count)
     imported_object["bmc_draw_indices"] = ",".join(str(value) for value in draw_indices)
     imported_object["bmc_shadow_draw_indices"] = ",".join(str(value) for value in shadow_draw_indices)
+    imported_object["bmc_mirror_flip"] = bool(mirror_flip)
+    imported_object["modimp_mirror_flip"] = bool(mirror_flip)
     if geometry.warnings:
         imported_object["bmc_import_warnings"] = "\n".join(geometry.warnings)
     return imported_object
+
+
+def _mirror_x_vector(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (-float(vector[0]), float(vector[1]), float(vector[2]))
+
+
+def _reverse_triangle_winding(triangle: tuple[int, int, int]) -> tuple[int, int, int]:
+    return (int(triangle[0]), int(triangle[2]), int(triangle[1]))
+
+
+def _positions_for_blender(
+    positions: list[tuple[float, float, float]],
+    *,
+    mirror_flip: bool,
+) -> list[tuple[float, float, float]]:
+    if not mirror_flip:
+        return list(positions)
+    return [_mirror_x_vector(position) for position in positions]
+
+
+def _normals_for_blender(
+    normals: list[tuple[float, float, float]],
+    *,
+    mirror_flip: bool,
+) -> list[tuple[float, float, float]]:
+    if not mirror_flip:
+        return list(normals)
+    return [_mirror_x_vector(normal) for normal in normals]
+
+
+def _triangles_for_blender(
+    triangles: list[tuple[int, int, int]],
+    *,
+    mirror_flip: bool,
+) -> list[tuple[int, int, int]]:
+    # Direct3D and Blender disagree on the visible winding for these dumps.
+    # Mirror Flip only changes coordinate handedness; Blender mesh faces still
+    # need the source IB order reversed to display the same front side.
+    return [_reverse_triangle_winding(triangle) for triangle in triangles]
 
 
 def decode_game_packed_normal(value: int) -> tuple[float, float, float]:
@@ -258,6 +312,14 @@ def _candidate_display_name(candidate: dict) -> str:
         f"{int(candidate.get('match_index_count', candidate.get('source_index_count', 0)) or 0)}-"
         f"{int(candidate.get('match_first_index', 0) or 0)}"
     )
+
+
+def _skin_slot_from_candidate(candidate: dict) -> tuple[str, int]:
+    skin_format = dict(candidate.get("skin_format", {}) or {})
+    slot_name = str(skin_format.get("slot", "") or "vb2").lower()
+    if not re.match(r"^vb\d+$", slot_name):
+        slot_name = "vb2"
+    return slot_name, int(slot_name[2:])
 
 
 def _resolve_path(path: str, frameanalysis_dir: str = "") -> str:
@@ -325,9 +387,7 @@ def _load_slot_slice(
     if not buf_path or not os.path.exists(buf_path):
         warnings.append(f"{slot_name}: missing buf path")
         return None
-    base_offset = _infer_slot_base_offset(buf_path, header, slot_name, slot_index, elements, header_paths)
-    if base_offset != header.byte_offset:
-        warnings.append(f"{slot_name}: corrected byte offset by {base_offset - int(header.byte_offset)} bytes")
+    base_offset = _resolve_slot_base_offset(buf_path, header)
     return _SlotSlice(
         slot_name=slot_name,
         slot_index=slot_index,
@@ -381,40 +441,50 @@ def _element_rank(element: HeaderElement) -> int:
     return rank
 
 
-def _infer_slot_base_offset(
-    buf_path: str,
-    header: BufferHeader,
-    slot_name: str,
-    slot_index: int,
-    elements: dict[tuple[str, int], HeaderElement],
-    txt_paths: list[str],
-) -> int:
-    samples = _first_vertex_samples(slot_name, txt_paths)
-    if not samples:
-        return int(header.byte_offset)
-    keyed_by_offset = {
-        int(element.aligned_byte_offset): element
-        for element in elements.values()
-        if element.aligned_byte_offset >= 0
-    }
-    comparable_samples = [
-        (field_offset, keyed_by_offset[field_offset], values)
-        for field_offset, values in samples.items()
-        if field_offset in keyed_by_offset
-    ]
-    if not comparable_samples:
-        return int(header.byte_offset)
-    with open(buf_path, "rb") as file_handle:
-        for delta in range(-64, 65):
-            base_offset = int(header.byte_offset) + delta
-            if base_offset < 0:
-                continue
-            if all(
-                _sample_matches(file_handle, base_offset + field_offset, element, values)
-                for field_offset, element, values in comparable_samples
-            ):
-                return base_offset
-    return int(header.byte_offset)
+def _validate_skin_format(slot: _SlotSlice, skin_format: dict, warnings: list[str]) -> None:
+    if not skin_format:
+        return
+    expected_slot = str(skin_format.get("slot", "") or "").lower()
+    if expected_slot and expected_slot != slot.slot_name:
+        warnings.append(f"{slot.slot_name}: skin slot differs from manifest {expected_slot}")
+
+    expectations = (
+        ("BLENDWEIGHTS", 0, "blend_weights_format", "blend_weights_offset"),
+        ("BLENDINDICES", 0, "blend_indices_format", "blend_indices_offset"),
+    )
+    for semantic, semantic_index, format_key, offset_key in expectations:
+        expected_format = str(skin_format.get(format_key, "") or "").upper()
+        expected_offset = int(skin_format.get(offset_key, -1) or -1)
+        if not expected_format and expected_offset < 0:
+            continue
+        element = _find_element(slot, semantic, semantic_index)
+        if element is None:
+            warnings.append(f"{slot.slot_name}: {semantic}{semantic_index} missing for manifest skin format")
+            continue
+        actual_format = str(element.fmt or "").upper()
+        if expected_format and actual_format != expected_format:
+            warnings.append(
+                f"{slot.slot_name}: {semantic}{semantic_index} format {actual_format} differs from manifest {expected_format}"
+            )
+        if expected_offset >= 0 and int(element.aligned_byte_offset) != expected_offset:
+            warnings.append(
+                f"{slot.slot_name}: {semantic}{semantic_index} offset {element.aligned_byte_offset} differs from manifest {expected_offset}"
+            )
+
+
+def _resolve_slot_base_offset(buf_path: str, header: BufferHeader) -> int:
+    header_offset = max(0, int(header.byte_offset))
+    required_size = header_offset + int(header.vertex_count) * int(header.stride)
+    try:
+        file_size = os.path.getsize(buf_path)
+    except OSError:
+        return header_offset
+    if required_size <= file_size:
+        return header_offset
+    slice_size = int(header.vertex_count) * int(header.stride)
+    if slice_size <= file_size:
+        return 0
+    return header_offset
 
 
 def _first_vertex_samples(slot_name: str, txt_paths: list[str]) -> dict[int, list[float]]:

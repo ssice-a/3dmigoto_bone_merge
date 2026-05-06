@@ -22,8 +22,9 @@ class BMC_UL_candidate_items(bpy.types.UIList):
             row = layout.row(align=True)
             row.prop(item, "enabled", text="")
             row.label(text=item.display_name or item.ib_hash or "(candidate)")
+            row.label(text=f"idx {int(item.match_index_count)}")
             row.label(text=f"bones {int(item.local_bone_count)}")
-            row.label(text=f"draws {int(item.draw_count)}")
+            row.label(text="capture" if item.shadow_capture_ready else "map")
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text=item.ib_hash or "?")
@@ -99,77 +100,17 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
 
-        target_box = layout.box()
-        target_box.label(text="Target Objects", icon="OUTLINER_OB_MESH")
-        target_box.prop(scene, "bmc_target_collection")
-        collection_row = target_box.row(align=True)
-        collection_row.operator("object.bmc_create_target_collection", icon="COLLECTION_NEW")
-        collection_row.operator("object.bmc_sync_targets_from_collection", icon="FILE_REFRESH")
-        row = target_box.row()
-        row.template_list(
-            "BMC_UL_target_items",
-            "",
-            scene,
-            "bmc_target_items",
-            scene,
-            "bmc_target_index",
-            rows=6,
-        )
-        col = row.column(align=True)
-        col.operator("object.bmc_add_selected_targets", icon="ADD", text="")
-        col.operator("object.bmc_remove_target", icon="REMOVE", text="")
-        col.operator("object.bmc_clear_targets", icon="TRASH", text="")
-
-        if scene.bmc_target_items and 0 <= scene.bmc_target_index < len(scene.bmc_target_items):
-            target = scene.bmc_target_items[scene.bmc_target_index]
-            target_box.prop(target, "object_ref")
-            target_box.prop(target, "ib_hash")
-            target_box.prop(target, "local_bone_count")
-            target_box.prop(target, "autodetected")
-            target_box.operator("object.bmc_refresh_target_identity", icon="FILE_REFRESH")
-
-        seam_box = layout.box()
-        seam_box.label(text="Seam Group Matcher", icon="AUTOMERGE_ON")
-        row = seam_box.row()
-        row.template_list(
-            "BMC_UL_seam_match_items",
-            "",
-            scene,
-            "bmc_seam_match_items",
-            scene,
-            "bmc_seam_match_index",
-            rows=5,
-        )
-        col = row.column(align=True)
-        col.operator("object.bmc_seam_add_selected_objects", icon="ADD", text="")
-        col.operator("object.bmc_seam_remove_object", icon="REMOVE", text="")
-        col.operator("object.bmc_seam_clear_objects", icon="TRASH", text="")
-
-        action_row = seam_box.row(align=True)
-        action_row.operator("object.bmc_seam_build_mapping", icon="VIEWZOOM")
-        action_row.operator("object.bmc_seam_apply_mapping", icon="FILE_TICK")
-        if scene.bmc_seam_pair_summary:
-            for summary_line in str(scene.bmc_seam_pair_summary).splitlines()[:6]:
-                seam_box.label(text=summary_line, icon="LINKED")
-        row = seam_box.row()
-        row.template_list(
-            "BMC_UL_seam_alias_items",
-            "",
-            scene,
-            "bmc_seam_alias_items",
-            scene,
-            "bmc_seam_alias_index",
-            rows=6,
-        )
-
         scan_box = layout.box()
         scan_box.label(text="Main Analyze", icon="VIEWZOOM")
         scan_box.prop(scene, "bmc_frameanalysis_dir")
-        scan_box.prop(scene, "bmc_target_ib_hash")
         scan_box.prop(scene, "bmc_output_dir")
+        scan_box.prop(scene, "bmc_mirror_flip")
         scan_actions = scan_box.row(align=True)
         scan_actions.operator("object.bmc_analyze_main_frameanalysis", icon="VIEWZOOM")
         scan_actions.operator("object.bmc_import_selected_candidates", icon="IMPORT")
+        scan_actions.operator("object.bmc_build_global_bone_pool", icon="MOD_ARMATURE")
+        add_row = scan_box.row(align=True)
+        add_row.prop(scene, "bmc_candidate_add_hash", text="")
         row = scan_box.row()
         row.template_list(
             "BMC_UL_candidate_items",
@@ -180,73 +121,19 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
             "bmc_candidate_index",
             rows=6,
         )
+        col = row.column(align=True)
+        col.operator("object.bmc_candidate_add_hash", icon="ADD", text="")
+        col.operator("object.bmc_candidate_remove", icon="REMOVE", text="")
+        col.operator("object.bmc_candidate_refresh_from_collection", icon="FILE_REFRESH", text="")
         if scene.bmc_candidate_items and 0 <= scene.bmc_candidate_index < len(scene.bmc_candidate_items):
             candidate = scene.bmc_candidate_items[scene.bmc_candidate_index]
             scan_box.prop(candidate, "ib_hash")
             scan_box.prop(candidate, "match_first_index")
             scan_box.prop(candidate, "match_index_count")
+            scan_box.prop(candidate, "import_draw_index")
             scan_box.prop(candidate, "local_bone_count")
-
-        legacy_scan_box = layout.box()
-        legacy_scan_box.label(text="Legacy Scan / Freeze Mapping", icon="FILE_FOLDER")
-        legacy_scan_box.prop(scene, "bmc_frameanalysis_dir")
-        legacy_scan_box.prop(scene, "bmc_output_dir")
-        legacy_scan_box.prop(scene, "bmc_scan_auto_apply_mapping")
-        legacy_scan_box.operator("object.bmc_scan_targets", icon="VIEWZOOM")
-
-        mapping_box = layout.box()
-        mapping_box.label(text="Legacy Target Remap", icon="MODIFIER")
-        mapping_box.operator("object.bmc_apply_vertex_group_remap", icon="DRIVER")
-
-        lod_box = layout.box()
-        lod_box.label(text="LOD", icon="MESH_GRID")
-        lod_box.prop(scene, "bmc_lod_frameanalysis_dir")
-        row = lod_box.row()
-        row.template_list(
-            "BMC_UL_lod_target_items",
-            "",
-            scene,
-            "bmc_lod_target_items",
-            scene,
-            "bmc_lod_target_index",
-            rows=5,
-        )
-        col = row.column(align=True)
-        col.operator("object.bmc_add_selected_lod_targets", icon="ADD", text="")
-        col.operator("object.bmc_remove_lod_target", icon="REMOVE", text="")
-        col.operator("object.bmc_clear_lod_targets", icon="TRASH", text="")
-        lod_actions = lod_box.row(align=True)
-        lod_actions.operator("object.bmc_scan_lod_targets", icon="VIEWZOOM")
-        lod_actions.operator("object.bmc_apply_lod_vertex_group_remap", icon="DRIVER")
-        lod_actions = lod_box.row(align=True)
-        lod_actions.operator("object.bmc_build_lod_mapping", icon="TRACKING")
-        lod_actions.operator("object.bmc_generate_lod_runtime_map", icon="MOD_ARRAY")
-        row = lod_box.row()
-        row.template_list(
-            "BMC_UL_lod_mapping_items",
-            "",
-            scene,
-            "bmc_lod_mapping_items",
-            scene,
-            "bmc_lod_mapping_index",
-            rows=6,
-        )
-        if scene.bmc_lod_mapping_items and 0 <= scene.bmc_lod_mapping_index < len(scene.bmc_lod_mapping_items):
-            lod_mapping = scene.bmc_lod_mapping_items[scene.bmc_lod_mapping_index]
-            lod_box.prop(lod_mapping, "canonical_global_bone")
-            lod_box.prop(lod_mapping, "mapped_lod_global_bone")
-            lod_box.prop(lod_mapping, "status")
-            lod_box.prop(lod_mapping, "score")
-            lod_box.prop(lod_mapping, "note")
-
-        preset_box = layout.box()
-        preset_box.label(text="Mapping Preset", icon="BOOKMARKS")
-        preset_box.prop(scene, "bmc_preset_choice")
-        preset_box.prop(scene, "bmc_preset_name")
-        row = preset_box.row(align=True)
-        row.operator("object.bmc_save_preset", icon="FILE_TICK")
-        row.operator("object.bmc_load_preset", icon="IMPORT")
-        row.operator("object.bmc_delete_preset", icon="TRASH")
+            scan_box.prop(candidate, "shadow_capture_ready")
+            scan_box.prop(candidate, "status")
 
         export_box = layout.box()
         export_box.label(text="3Dmigoto Export", icon="EXPORT")
@@ -256,6 +143,7 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         row = export_box.row(align=True)
         row.operator("object.bmc_create_export_collection", icon="COLLECTION_NEW")
         row.operator("object.bmc_add_selected_export_objects", icon="ADD")
+        export_box.operator("object.bmc_apply_export_collection_global_names", icon="GROUP_VERTEX")
         export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT")
 
         shadow_box = layout.box()
@@ -265,3 +153,18 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         shadow_box.prop(scene, "bmc_shadow_host_match_index_count")
         shadow_box.prop(scene, "bmc_shadow_host_vs_hash")
         shadow_box.operator("object.bmc_generate_shadow_split", icon="SHADING_RENDERED")
+
+
+class VIEW3D_PT_bone_merge_hash_tools(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Bone Merge Capture"
+    bl_label = "Vertex Group Tools"
+    bl_parent_id = "VIEW3D_PT_bone_merge_capture"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.operator("object.bmc_apply_global_names_by_object_hash", icon="GROUP_VERTEX", text="Rename To Global")
+        layout.operator("object.bmc_revert_global_names_by_object_hash", icon="FILE_REFRESH", text="Rename To Local")
+        layout.operator("object.bmc_merge_selected_seam_groups", icon="AUTOMERGE_ON", text="Merge Seam Groups")

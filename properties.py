@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bpy
 
+from .constants import BMC_GLOBAL_POOL_GENERATION_PROP, BMC_GLOBAL_SOURCE_KEY_PROP
 from .core.mapping_payload import apply_mapping_payload_to_scene
 from .core.presets import list_preset_names
 
@@ -39,9 +40,12 @@ class BMC_CandidateItem(bpy.types.PropertyGroup):
     ib_hash: bpy.props.StringProperty(name="IB Hash", default="")
     match_first_index: bpy.props.IntProperty(name="First Index", default=0, min=0)
     match_index_count: bpy.props.IntProperty(name="Index Count", default=0, min=0)
-    local_bone_count: bpy.props.IntProperty(name="Local Bones", default=0, min=0)
+    import_draw_index: bpy.props.IntProperty(name="Import Draw", default=-1, min=-1)
+    local_bone_count: bpy.props.IntProperty(name="Compact Bones", default=0, min=0)
     draw_count: bpy.props.IntProperty(name="Draws", default=0, min=0)
     shadow_draw_count: bpy.props.IntProperty(name="Shadow Draws", default=0, min=0)
+    shadow_capture_ready: bpy.props.BoolProperty(name="Shadow Capture", default=False)
+    status: bpy.props.StringProperty(name="Status", default="")
     manual: bpy.props.BoolProperty(name="Manual", default=False)
 
 
@@ -100,6 +104,8 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Object, "merge_ib_hash"),
     (bpy.types.Object, "merge_match_index_count"),
     (bpy.types.Object, "merge_ib_autodetected"),
+    (bpy.types.Object, BMC_GLOBAL_POOL_GENERATION_PROP),
+    (bpy.types.Object, BMC_GLOBAL_SOURCE_KEY_PROP),
     (bpy.types.Scene, "bmc_frameanalysis_dir"),
     (bpy.types.Scene, "bmc_target_ib_hash"),
     (bpy.types.Scene, "bmc_lod_frameanalysis_dir"),
@@ -124,6 +130,8 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_target_index"),
     (bpy.types.Scene, "bmc_candidate_items"),
     (bpy.types.Scene, "bmc_candidate_index"),
+    (bpy.types.Scene, "bmc_candidate_add_hash"),
+    (bpy.types.Scene, "bmc_mirror_flip"),
     (bpy.types.Scene, "bmc_lod_target_items"),
     (bpy.types.Scene, "bmc_lod_target_index"),
     (bpy.types.Scene, "bmc_alias_items"),
@@ -156,6 +164,24 @@ def register_addon_properties():
         name="IB Auto",
         default=True,
         description="Whether IB hash is currently inferred from the object name.",
+    )
+    setattr(
+        bpy.types.Object,
+        BMC_GLOBAL_POOL_GENERATION_PROP,
+        bpy.props.StringProperty(
+            name="Global Pool Generation",
+            default="",
+            description="Generation id of the global bone pool used to rename this object's vertex groups.",
+        ),
+    )
+    setattr(
+        bpy.types.Object,
+        BMC_GLOBAL_SOURCE_KEY_PROP,
+        bpy.props.StringProperty(
+            name="Global Source Key",
+            default="",
+            description="IB/count/first source key used to rename this object's vertex groups.",
+        ),
     )
 
     bpy.types.Scene.bmc_frameanalysis_dir = bpy.props.StringProperty(
@@ -273,6 +299,16 @@ def register_addon_properties():
     bpy.types.Scene.bmc_target_index = bpy.props.IntProperty(name="Target Index", default=0, min=0)
     bpy.types.Scene.bmc_candidate_items = bpy.props.CollectionProperty(type=BMC_CandidateItem)
     bpy.types.Scene.bmc_candidate_index = bpy.props.IntProperty(name="Candidate Index", default=0, min=0)
+    bpy.types.Scene.bmc_candidate_add_hash = bpy.props.StringProperty(
+        name="Candidate IB",
+        default="",
+        description="IB hash to add to the Candidate IB list. If the latest manifest contains several slices for the hash, all missing slices are added.",
+    )
+    bpy.types.Scene.bmc_mirror_flip = bpy.props.BoolProperty(
+        name="Mirror Flip",
+        default=True,
+        description="Mirror imported geometry on the X axis. This matches the default game-to-Blender import orientation.",
+    )
     bpy.types.Scene.bmc_lod_target_items = bpy.props.CollectionProperty(type=BMC_LodTargetItem)
     bpy.types.Scene.bmc_lod_target_index = bpy.props.IntProperty(name="LOD Target Index", default=0, min=0)
     bpy.types.Scene.bmc_alias_items = bpy.props.CollectionProperty(type=BMC_AliasItem)

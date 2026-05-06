@@ -21,12 +21,16 @@ from .core.mapping_payload import (
     apply_mapping_payload_to_scene,
     build_mapping_payload,
     load_mapping_payload_from_scene,
+    serialize_lod_mapping_items,
     serialize_alias_items,
     store_mapping_payload_on_scene,
 )
 from .core.presets import delete_preset, load_preset, save_preset
-from .core.export_prepare import prepare_export_collection
-from .core.frameanalysis import detect_last_shadow_host, infer_mesh_identity_from_name
+from .core.export_prepare import prepare_export_collection, regenerate_bonestore_runtime_files
+from .core.frameanalysis import infer_mesh_identity_from_name
+from .core.io import read_json
+from .core.lod_runtime import build_lod_mapping, scan_lod_targets_and_generate_manifest
+from .core.main_analyze import write_main_analysis_manifest
 from .core.shadow_split import generate_shadow_split
 from .core.seam_matcher import apply_seam_mapping, build_seam_mapping
 from .core.workflow import scan_targets_and_generate_outputs
@@ -74,7 +78,7 @@ def _ensure_export_build_collection(context):
     return collection
 
 
-def _ensure_export_chunk_collection(parent_collection, ib_hash: str, match_index_count: int, chunk_index: int = 0):
+def _ensure_export_chunk_collection(parent_collection, ib_hash: str, match_index_count: int = 0, chunk_index: int = 0):
     chunk_name = f"{ib_hash.lower()}-{int(match_index_count)}-{int(chunk_index)}"
     collection = bpy.data.collections.get(chunk_name)
     if collection is None:
@@ -90,9 +94,12 @@ def _ensure_export_chunk_collections_from_targets(context, parent_collection) ->
     scene = context.scene
 
     for item in scene.bmc_target_items:
-        if not (item.enabled and item.ib_hash and int(item.match_index_count) >= 0):
+        if not (item.enabled and item.ib_hash):
             continue
-        key = (item.ib_hash.lower(), int(item.match_index_count), 0)
+        match_index_count = _resolve_target_match_index_count(scene, item.ib_hash, item.object_name, int(item.match_index_count))
+        if match_index_count <= 0:
+            continue
+        key = (item.ib_hash.lower(), int(match_index_count), 0)
         if key in seen_keys:
             continue
         seen_keys.add(key)
@@ -108,7 +115,10 @@ def _ensure_export_chunk_collections_from_targets(context, parent_collection) ->
         identity = resolve_mesh_identity(mesh_obj)
         if identity is None:
             continue
-        key = (identity[0].lower(), int(identity[1]), 0)
+        match_index_count = _resolve_target_match_index_count(scene, identity[0], mesh_obj.name, int(identity[1]))
+        if match_index_count <= 0:
+            continue
+        key = (identity[0].lower(), int(match_index_count), 0)
         if key in seen_keys:
             continue
         seen_keys.add(key)
@@ -136,6 +146,87 @@ def _link_object_to_collection(mesh_obj, collection) -> None:
     collection.objects.link(mesh_obj)
 
 
+def _resolve_target_match_index_count(scene, ib_hash: str, object_name: str = "", fallback: int = 0) -> int:
+    normalized_hash = str(ib_hash or "").lower()
+    normalized_name = str(object_name or "")
+    if not normalized_hash:
+        return int(fallback)
+
+    for item in scene.bmc_target_items:
+        if str(getattr(item, "ib_hash", "") or "").lower() != normalized_hash:
+            continue
+        item_object = getattr(item, "object_ref", None)
+        item_name = item_object.name if item_object is not None else str(getattr(item, "object_name", "") or "")
+        if normalized_name and item_name and item_name != normalized_name:
+            continue
+        item_count = int(getattr(item, "match_index_count", 0))
+        if item_count > 0:
+            return item_count
+
+    manifest_path = bpy.path.abspath(str(getattr(scene, "bmc_manifest_path", "") or ""))
+    if manifest_path and os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as file_handle:
+                manifest = json.load(file_handle)
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        fallback_count = 0
+        identity_records = list(manifest.get("part_records", []) or [])
+        identity_records.extend(manifest.get("candidate_ibs", []) or [])
+        for part_record in identity_records:
+            if str(part_record.get("ib_hash", "")).lower() != normalized_hash:
+                continue
+            count = int(part_record.get("match_index_count", 0))
+            if count <= 0:
+                continue
+            if normalized_name and str(part_record.get("object_name", "")) == normalized_name:
+                return count
+            if fallback_count <= 0:
+                fallback_count = count
+        if fallback_count > 0:
+            return fallback_count
+
+    return max(0, int(fallback))
+
+
+def _sync_target_match_counts_from_manifest(scene, manifest_path: str, collection_name: str = "bmc_target_items") -> None:
+    normalized_manifest_path = bpy.path.abspath(str(manifest_path or ""))
+    if not normalized_manifest_path or not os.path.exists(normalized_manifest_path):
+        return
+    try:
+        with open(normalized_manifest_path, "r", encoding="utf-8") as file_handle:
+            manifest = json.load(file_handle)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    records_by_name: dict[str, dict] = {}
+    records_by_hash: dict[str, dict] = {}
+    identity_records = list(manifest.get("part_records", []) or [])
+    identity_records.extend(manifest.get("candidate_ibs", []) or [])
+    for part_record in identity_records:
+        ib_hash = str(part_record.get("ib_hash", "")).lower()
+        if not ib_hash:
+            continue
+        object_name = str(part_record.get("object_name", ""))
+        if object_name:
+            records_by_name[object_name] = part_record
+        records_by_hash.setdefault(ib_hash, part_record)
+
+    items = getattr(scene, collection_name, None)
+    if items is None:
+        return
+    for item in items:
+        ib_hash = str(getattr(item, "ib_hash", "") or "").lower()
+        if not ib_hash:
+            continue
+        mesh_obj = _resolve_lod_target_item_object(scene, item) if collection_name == "bmc_lod_target_items" else _resolve_target_item_object(scene, item)
+        object_name = mesh_obj.name if mesh_obj is not None else str(getattr(item, "object_name", "") or "")
+        part_record = records_by_name.get(object_name) or records_by_hash.get(ib_hash)
+        if not part_record:
+            continue
+        item.match_index_count = int(part_record.get("match_index_count", 0))
+
+
 def _resolve_target_item_object(scene, item):
     mesh_obj = getattr(item, "object_ref", None)
     if mesh_obj is not None and mesh_obj.type == "MESH":
@@ -157,11 +248,11 @@ def _refresh_target_item(scene, item):
         return None
 
     item.object_name = mesh_obj.name
-    if not item.ib_hash or int(item.match_index_count) < 0:
+    if not item.ib_hash:
         identity = resolve_mesh_identity(mesh_obj)
         if identity is not None:
             item.ib_hash = identity[0]
-            item.match_index_count = int(identity[1])
+            item.match_index_count = 0
         else:
             item.ib_hash = ""
             item.match_index_count = 0
@@ -216,11 +307,15 @@ def _normalize_export_collection_membership(scene) -> dict[str, int]:
             skipped_count += 1
             continue
 
-        chunk_name = f"{identity[0].lower()}-{int(identity[1])}-0"
+        match_index_count = _resolve_target_match_index_count(scene, identity[0], mesh_obj.name, int(identity[1]))
+        if match_index_count <= 0:
+            skipped_count += 1
+            continue
+        chunk_name = f"{identity[0].lower()}-{int(match_index_count)}-0"
         if chunk_name not in existing_chunk_names:
             created_count += 1
             existing_chunk_names.add(chunk_name)
-        chunk_collection = _ensure_export_chunk_collection(export_collection, identity[0], int(identity[1]), 0)
+        chunk_collection = _ensure_export_chunk_collection(export_collection, identity[0], match_index_count, 0)
 
         moved_here = False
         if all(obj.name != mesh_obj.name for obj in chunk_collection.objects):
@@ -309,7 +404,7 @@ def _add_mesh_object_to_target_list(scene, mesh_obj, existing_names: set[str]) -
     item.object_name = mesh_obj.name
     item.object_ref = mesh_obj
     item.ib_hash = identity[0]
-    item.match_index_count = identity[1]
+    item.match_index_count = 0
     item.local_bone_count = int(local_bone_count)
     item.autodetected = bool(getattr(mesh_obj, "merge_ib_autodetected", True))
     item.enabled = True
@@ -317,11 +412,172 @@ def _add_mesh_object_to_target_list(scene, mesh_obj, existing_names: set[str]) -
     return True
 
 
+def _resolve_lod_target_item_object(scene, item):
+    mesh_obj = getattr(item, "object_ref", None)
+    if mesh_obj is not None and mesh_obj.type == "MESH":
+        return mesh_obj
+
+    object_name = str(getattr(item, "object_name", "") or "")
+    if not object_name:
+        return None
+    mesh_obj = scene.objects.get(object_name)
+    if mesh_obj is None or mesh_obj.type != "MESH":
+        return None
+    item.object_ref = mesh_obj
+    return mesh_obj
+
+
+def _refresh_lod_target_item(scene, item):
+    mesh_obj = _resolve_lod_target_item_object(scene, item)
+    if mesh_obj is None:
+        return None
+    item.object_name = mesh_obj.name
+    if not item.ib_hash:
+        identity = resolve_mesh_identity(mesh_obj)
+        if identity is not None:
+            item.ib_hash = identity[0]
+            item.match_index_count = 0
+        else:
+            item.ib_hash = ""
+            item.match_index_count = 0
+    if int(getattr(item, "local_bone_count", 0)) <= 0:
+        try:
+            item.local_bone_count = int(infer_local_bone_count_from_mesh(mesh_obj))
+        except ValueError:
+            pass
+    return mesh_obj
+
+
+def _add_mesh_object_to_lod_target_list(scene, mesh_obj, existing_names: set[str]) -> bool:
+    identity = resolve_mesh_identity(mesh_obj)
+    if identity is None:
+        return False
+    try:
+        local_bone_count = infer_local_bone_count_from_mesh(mesh_obj)
+    except ValueError:
+        return False
+    if mesh_obj.name in existing_names:
+        return False
+    item = scene.bmc_lod_target_items.add()
+    item.object_name = mesh_obj.name
+    item.object_ref = mesh_obj
+    item.ib_hash = identity[0]
+    item.match_index_count = 0
+    item.local_bone_count = int(local_bone_count)
+    item.enabled = True
+    existing_names.add(mesh_obj.name)
+    return True
+
+
+def _enabled_lod_target_specs(context) -> list[TargetObjectSpec]:
+    scene = context.scene
+    target_specs: list[TargetObjectSpec] = []
+    seen_hashes: set[str] = set()
+    for item in scene.bmc_lod_target_items:
+        if not (item.enabled and item.ib_hash and item.object_name):
+            continue
+        normalized_hash = str(item.ib_hash).lower()
+        if normalized_hash in seen_hashes:
+            continue
+        mesh_obj = _refresh_lod_target_item(scene, item)
+        if mesh_obj is None:
+            raise ValueError(f"{item.object_name}: LOD mesh object not found in current scene")
+        local_bone_count = int(getattr(item, "local_bone_count", 0))
+        if local_bone_count <= 0:
+            raise ValueError(f"{mesh_obj.name}: frozen LOD local bone count is missing")
+        target_specs.append(
+            TargetObjectSpec(
+                object_name=mesh_obj.name,
+                ib_hash=normalized_hash,
+                match_index_count=-1,
+                local_bone_count=local_bone_count,
+            )
+        )
+        seen_hashes.add(normalized_hash)
+    return target_specs
+
+
+def _enabled_lod_target_mesh_objects(scene) -> list[object]:
+    mesh_objects: list[object] = []
+    for item in scene.bmc_lod_target_items:
+        if not item.enabled:
+            continue
+        mesh_obj = _resolve_lod_target_item_object(scene, item)
+        if mesh_obj is None or mesh_obj.type != "MESH":
+            continue
+        mesh_objects.append(mesh_obj)
+    return mesh_objects
+
+
+def _select_lod_object_remap_entries(scene, payload: dict) -> tuple[list[object], list[dict], list[str]]:
+    lod_variant = dict(payload.get("lod_variant", {}) or {})
+    entries_by_identity: dict[str, list[dict]] = {}
+    for entry in lod_variant.get("object_remaps", []) or []:
+        key = str(entry.get("ib_hash", "")).lower()
+        entries_by_identity.setdefault(key, []).append(entry)
+
+    matched_meshes: list[object] = []
+    selected_entries: list[dict] = []
+    skipped_messages: list[str] = []
+    for item in scene.bmc_lod_target_items:
+        if not item.enabled:
+            continue
+        mesh_obj = _resolve_lod_target_item_object(scene, item)
+        if mesh_obj is None or mesh_obj.type != "MESH":
+            skipped_messages.append(f"{item.object_name}: LOD target mesh object not found in scene")
+            continue
+        identity = str(item.ib_hash or "").lower()
+        remap_entries = entries_by_identity.get(identity, [])
+        if not remap_entries:
+            skipped_messages.append(f"{mesh_obj.name}: no LOD mapping entry for {identity}")
+            continue
+        chosen_entry = _choose_identity_remap_entry(remap_entries, mesh_obj.name)
+        if chosen_entry is None:
+            skipped_messages.append(f"{mesh_obj.name}: multiple LOD mapping entries exist for {identity}")
+            continue
+        matched_meshes.append(mesh_obj)
+        selected_entries.append(chosen_entry)
+    return matched_meshes, selected_entries, skipped_messages
+
+
+def _replace_lod_mapping_items(scene, mapping_entries: list[dict]) -> None:
+    scene.bmc_lod_mapping_items.clear()
+    for mapping_entry in mapping_entries:
+        item = scene.bmc_lod_mapping_items.add()
+        item.enabled = bool(mapping_entry.get("enabled", True))
+        item.canonical_global_bone = int(mapping_entry.get("canonical_global_bone", 0))
+        item.mapped_lod_global_bone = int(mapping_entry.get("mapped_lod_global_bone", -1))
+        item.status = str(mapping_entry.get("status", ""))
+        item.score = float(mapping_entry.get("score", 0.0))
+        item.note = str(mapping_entry.get("note", ""))
+    scene.bmc_lod_mapping_index = min(scene.bmc_lod_mapping_index, max(0, len(scene.bmc_lod_mapping_items) - 1))
+
+
+def _canonical_mesh_entries_for_lod_build(scene, payload: dict) -> list[tuple[object, dict]]:
+    matched_meshes, selected_entries, _skipped_messages = _select_object_remap_entries_for_targets(scene, payload)
+    return list(zip(matched_meshes, selected_entries))
+
+
+def _lod_mesh_entries_for_build(scene, payload: dict) -> list[tuple[object, dict]]:
+    matched_meshes, selected_entries, _skipped_messages = _select_lod_object_remap_entries(scene, payload)
+    return list(zip(matched_meshes, selected_entries))
+
+
+def _sync_scene_payload(scene) -> dict:
+    payload = build_mapping_payload(scene, manifest_payload=_read_manifest_payload(scene.bmc_manifest_path), base_payload=load_mapping_payload_from_scene(scene))
+    store_mapping_payload_on_scene(scene, payload)
+    return payload
+
+
 def _enabled_target_specs(context) -> list[TargetObjectSpec]:
     scene = context.scene
     target_specs: list[TargetObjectSpec] = []
+    seen_hashes: set[str] = set()
     for item in scene.bmc_target_items:
-        if not (item.enabled and item.ib_hash and int(item.match_index_count) >= 0 and item.object_name):
+        if not (item.enabled and item.ib_hash and item.object_name):
+            continue
+        normalized_hash = str(item.ib_hash).lower()
+        if normalized_hash in seen_hashes:
             continue
         mesh_obj = _refresh_target_item(scene, item)
         if mesh_obj is None:
@@ -330,7 +586,7 @@ def _enabled_target_specs(context) -> list[TargetObjectSpec]:
         manifest_bone_count = _lookup_capture_bone_count_from_manifest(
             scene,
             item.ib_hash.lower(),
-            int(item.match_index_count),
+            -1,
             display_name,
         )
         local_bone_count = int(getattr(item, "local_bone_count", 0))
@@ -352,11 +608,12 @@ def _enabled_target_specs(context) -> list[TargetObjectSpec]:
         target_specs.append(
             TargetObjectSpec(
                 object_name=display_name,
-                ib_hash=item.ib_hash.lower(),
-                match_index_count=int(item.match_index_count),
+                ib_hash=normalized_hash,
+                match_index_count=-1,
                 local_bone_count=local_bone_count,
             )
         )
+        seen_hashes.add(normalized_hash)
     return target_specs
 
 
@@ -372,12 +629,9 @@ def _lookup_capture_bone_count_from_manifest(scene, ib_hash: str, match_index_co
         return None
 
     normalized_hash = str(ib_hash).lower()
-    normalized_count = int(match_index_count)
     fallback_count = None
     for part_record in manifest.get("part_records", []):
         if str(part_record.get("ib_hash", "")).lower() != normalized_hash:
-            continue
-        if int(part_record.get("match_index_count", -1)) != normalized_count:
             continue
         bone_count = int(part_record.get("capture_bone_count", part_record.get("bone_count", 0)))
         if bone_count <= 0:
@@ -466,6 +720,59 @@ def _read_manifest_payload(manifest_path: str) -> dict:
         return {}
     with open(normalized_manifest_path, "r", encoding="utf-8") as file_handle:
         return json.load(file_handle)
+
+
+def _parse_hash_list(raw_value: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for token in str(raw_value or "").replace(",", " ").replace(";", " ").split():
+        normalized = token.strip().lower()
+        if not normalized:
+            continue
+        if len(normalized) != 8 or any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError(f"Invalid IB hash: {token}")
+        if normalized in seen:
+            continue
+        values.append(normalized)
+        seen.add(normalized)
+    return values
+
+
+def _main_analyze_target_hashes(scene) -> list[str]:
+    explicit_hashes = _parse_hash_list(str(getattr(scene, "bmc_target_ib_hash", "") or ""))
+    if explicit_hashes:
+        return explicit_hashes
+
+    hashes: list[str] = []
+    seen: set[str] = set()
+    for item in scene.bmc_target_items:
+        if not item.enabled:
+            continue
+        normalized = str(getattr(item, "ib_hash", "") or "").strip().lower()
+        if not normalized:
+            continue
+        if len(normalized) != 8 or any(character not in "0123456789abcdef" for character in normalized):
+            continue
+        if normalized in seen:
+            continue
+        hashes.append(normalized)
+        seen.add(normalized)
+    return hashes
+
+
+def _replace_candidate_items_from_manifest(scene, manifest: dict) -> None:
+    scene.bmc_candidate_items.clear()
+    for candidate in manifest.get("candidate_ibs", []):
+        item = scene.bmc_candidate_items.add()
+        item.enabled = bool(candidate.get("enabled", True))
+        item.display_name = str(candidate.get("display_name", "") or "")
+        item.ib_hash = str(candidate.get("ib_hash", "") or "")
+        item.match_first_index = int(candidate.get("match_first_index", 0))
+        item.match_index_count = int(candidate.get("match_index_count", 0))
+        item.local_bone_count = int(candidate.get("local_bone_count", 0))
+        item.draw_count = len(candidate.get("draw_indices", []) or [])
+        item.shadow_draw_count = len(candidate.get("shadow_draw_indices", []) or [])
+    scene.bmc_candidate_index = min(scene.bmc_candidate_index, max(0, len(scene.bmc_candidate_items) - 1))
 
 
 def _update_scene_mapping_payload(scene, manifest_path: str | None = None) -> dict:
@@ -573,9 +880,9 @@ def _choose_identity_remap_entry(remap_entries: list[dict], mesh_name: str) -> d
 
 
 def _select_object_remap_entries_for_meshes(mesh_objects: list[object], payload: dict) -> tuple[list[object], list[dict], list[str]]:
-    entries_by_identity: dict[tuple[str, int], list[dict]] = {}
+    entries_by_identity: dict[str, list[dict]] = {}
     for entry in payload.get("object_remaps", []):
-        key = (str(entry.get("ib_hash", "")).lower(), int(entry.get("match_index_count", -1)))
+        key = str(entry.get("ib_hash", "")).lower()
         entries_by_identity.setdefault(key, []).append(entry)
 
     matched_meshes: list[object] = []
@@ -585,15 +892,15 @@ def _select_object_remap_entries_for_meshes(mesh_objects: list[object], payload:
     for mesh_obj in mesh_objects:
         identity = _mesh_identity_from_name(mesh_obj)
         if identity is None:
-            skipped_messages.append(f"{mesh_obj.name}: object name does not contain hash-count")
+            skipped_messages.append(f"{mesh_obj.name}: object name does not contain ib hash")
             continue
-        remap_entries = entries_by_identity.get(identity, [])
+        remap_entries = entries_by_identity.get(identity[0], [])
         if not remap_entries:
-            skipped_messages.append(f"{mesh_obj.name}: no mapping entry for {identity[0]}-{identity[1]}")
+            skipped_messages.append(f"{mesh_obj.name}: no mapping entry for {identity[0]}")
             continue
         chosen_entry = _choose_identity_remap_entry(remap_entries, mesh_obj.name)
         if chosen_entry is None:
-            skipped_messages.append(f"{mesh_obj.name}: multiple mapping entries exist for {identity[0]}-{identity[1]}")
+            skipped_messages.append(f"{mesh_obj.name}: multiple mapping entries exist for {identity[0]}")
             continue
         matched_meshes.append(mesh_obj)
         selected_entries.append(chosen_entry)
@@ -602,9 +909,9 @@ def _select_object_remap_entries_for_meshes(mesh_objects: list[object], payload:
 
 
 def _select_object_remap_entries_for_targets(scene, payload: dict) -> tuple[list[object], list[dict], list[str]]:
-    entries_by_identity: dict[tuple[str, int], list[dict]] = {}
+    entries_by_identity: dict[str, list[dict]] = {}
     for entry in payload.get("object_remaps", []):
-        key = (str(entry.get("ib_hash", "")).lower(), int(entry.get("match_index_count", -1)))
+        key = str(entry.get("ib_hash", "")).lower()
         entries_by_identity.setdefault(key, []).append(entry)
 
     matched_meshes: list[object] = []
@@ -619,18 +926,18 @@ def _select_object_remap_entries_for_targets(scene, payload: dict) -> tuple[list
             skipped_messages.append(f"{item.object_name}: target mesh object not found in scene")
             continue
 
-        identity = (str(item.ib_hash or "").lower(), int(item.match_index_count))
-        if not identity[0] or identity[1] < 0:
+        identity = str(item.ib_hash or "").lower()
+        if not identity:
             skipped_messages.append(f"{mesh_obj.name}: frozen target identity is incomplete")
             continue
 
         remap_entries = entries_by_identity.get(identity, [])
         if not remap_entries:
-            skipped_messages.append(f"{mesh_obj.name}: no mapping entry for {identity[0]}-{identity[1]}")
+            skipped_messages.append(f"{mesh_obj.name}: no mapping entry for {identity}")
             continue
         chosen_entry = _choose_identity_remap_entry(remap_entries, mesh_obj.name)
         if chosen_entry is None:
-            skipped_messages.append(f"{mesh_obj.name}: multiple mapping entries exist for {identity[0]}-{identity[1]}")
+            skipped_messages.append(f"{mesh_obj.name}: multiple mapping entries exist for {identity}")
             continue
         matched_meshes.append(mesh_obj)
         selected_entries.append(chosen_entry)
@@ -640,13 +947,13 @@ def _select_object_remap_entries_for_targets(scene, payload: dict) -> tuple[list
 
 def _identity_resolver_from_entries(mesh_objects: list[object], selected_entries: list[dict]):
     identity_by_name = {
-        mesh_obj.name: (str(entry.get("ib_hash", "")).lower(), int(entry.get("match_index_count", -1)))
+        mesh_obj.name: (str(entry.get("ib_hash", "")).lower(), 0)
         for mesh_obj, entry in zip(mesh_objects, selected_entries)
     }
 
     def _resolver(mesh_obj):
         identity = identity_by_name.get(mesh_obj.name)
-        if identity is not None and identity[0] and identity[1] >= 0:
+        if identity is not None and identity[0]:
             return identity
         return resolve_mesh_identity(mesh_obj)
 
@@ -662,9 +969,8 @@ def _identity_resolver_from_targets(scene):
         if mesh_obj is None:
             continue
         ib_hash = str(item.ib_hash or "").lower()
-        match_index_count = int(item.match_index_count)
-        if ib_hash and match_index_count >= 0:
-            identity_by_name[mesh_obj.name] = (ib_hash, match_index_count)
+        if ib_hash:
+            identity_by_name[mesh_obj.name] = (ib_hash, 0)
 
     def _resolver(mesh_obj):
         identity = identity_by_name.get(mesh_obj.name)
@@ -743,7 +1049,7 @@ class BMC_OT_add_selected_targets(bpy.types.Operator):
             if mesh_obj.name in existing_names:
                 continue
             if not _add_mesh_object_to_target_list(scene, mesh_obj, existing_names):
-                self.report({"WARNING"}, f"{mesh_obj.name}: cannot infer ib_hash/index_count")
+                self.report({"WARNING"}, f"{mesh_obj.name}: cannot infer ib_hash")
                 continue
             added_count += 1
 
@@ -805,7 +1111,7 @@ class BMC_OT_sync_targets_from_collection(bpy.types.Operator):
 class BMC_OT_refresh_target_identity(bpy.types.Operator):
     bl_idname = "object.bmc_refresh_target_identity"
     bl_label = "Refresh Target Identity"
-    bl_description = "Explicitly re-freeze the active target's IB hash, match count, and local bone count from the current object"
+    bl_description = "Explicitly re-freeze the active target's IB hash and local bone count from the current object"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -823,7 +1129,7 @@ class BMC_OT_refresh_target_identity(bpy.types.Operator):
 
         identity = resolve_mesh_identity(mesh_obj)
         if identity is None:
-            self.report({"ERROR"}, f"{mesh_obj.name}: cannot infer ib_hash/index_count")
+            self.report({"ERROR"}, f"{mesh_obj.name}: cannot infer ib_hash")
             return {"CANCELLED"}
 
         try:
@@ -835,12 +1141,12 @@ class BMC_OT_refresh_target_identity(bpy.types.Operator):
         item.object_ref = mesh_obj
         item.object_name = mesh_obj.name
         item.ib_hash = identity[0]
-        item.match_index_count = int(identity[1])
+        item.match_index_count = 0
         item.local_bone_count = local_bone_count
         item.autodetected = bool(getattr(mesh_obj, "merge_ib_autodetected", True))
         self.report(
             {"INFO"},
-            f"Frozen target {mesh_obj.name} as {item.ib_hash}-{item.match_index_count} with {item.local_bone_count} local bones",
+            f"Frozen target {mesh_obj.name} as {item.ib_hash} with {item.local_bone_count} local bones",
         )
         return {"FINISHED"}
 
@@ -887,13 +1193,17 @@ class BMC_OT_add_selected_export_objects(bpy.types.Operator):
             if identity is None:
                 skipped_names.append(mesh_obj.name)
                 continue
-            chunk_collection = _ensure_export_chunk_collection(collection, identity[0], int(identity[1]), 0)
+            match_index_count = _resolve_target_match_index_count(context.scene, identity[0], mesh_obj.name, int(identity[1]))
+            if match_index_count <= 0:
+                skipped_names.append(mesh_obj.name)
+                continue
+            chunk_collection = _ensure_export_chunk_collection(collection, identity[0], match_index_count, 0)
             _link_object_to_collection(mesh_obj, chunk_collection)
             added_count += 1
 
         if added_count == 0:
             if skipped_names:
-                self.report({"WARNING"}, f"Skipped {len(skipped_names)} mesh(es): cannot infer ib_hash/index_count")
+                self.report({"WARNING"}, f"Skipped {len(skipped_names)} mesh(es): cannot infer ib_hash or scanned match count")
             else:
                 self.report({"WARNING"}, "No new mesh objects were added to export source collection")
             return {"CANCELLED"}
@@ -935,6 +1245,13 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         scene.bmc_export_manifest_path = result["manifest_path"]
         if result.get("bonestore_ini_path"):
             scene.bmc_ini_path = result["bonestore_ini_path"]
+        try:
+            export_manifest = read_json(result["manifest_path"])
+            payload = load_mapping_payload_from_scene(scene)
+            payload["lod_host_map"] = list(export_manifest.get("lod_host_map", []) or [])
+            store_mapping_payload_on_scene(scene, payload)
+        except Exception:
+            pass
         self.report(
             {"INFO"},
             f"Prepared {result['objects']} object(s), {result['palettes']} palette(s); wrote 3Dmigoto files to {result['output_dir']}",
@@ -1021,6 +1338,299 @@ class BMC_OT_clear_targets(bpy.types.Operator):
         scene = context.scene
         scene.bmc_target_items.clear()
         scene.bmc_target_index = 0
+        return {"FINISHED"}
+
+
+class BMC_OT_add_selected_lod_targets(bpy.types.Operator):
+    bl_idname = "object.bmc_add_selected_lod_targets"
+    bl_label = "Add Selected LOD Objects"
+    bl_description = "Add the current selected mesh objects to the LOD target list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return any(obj.type == "MESH" for obj in context.selected_objects)
+
+    def execute(self, context):
+        scene = context.scene
+        existing_names = {
+            (item.object_ref.name if getattr(item, "object_ref", None) else item.object_name)
+            for item in scene.bmc_lod_target_items
+        }
+        added_count = 0
+        for mesh_obj in context.selected_objects:
+            if mesh_obj.type != "MESH":
+                continue
+            if _add_mesh_object_to_lod_target_list(scene, mesh_obj, existing_names):
+                added_count += 1
+        if added_count:
+            scene.bmc_lod_target_index = len(scene.bmc_lod_target_items) - 1
+            self.report({"INFO"}, f"Added {added_count} LOD target object(s)")
+        else:
+            self.report({"WARNING"}, "No new mesh objects were added to the LOD target list")
+        return {"FINISHED"}
+
+
+class BMC_OT_remove_lod_target(bpy.types.Operator):
+    bl_idname = "object.bmc_remove_lod_target"
+    bl_label = "Remove LOD Target"
+    bl_description = "Remove the active object from the LOD target list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_lod_target_items)
+
+    def execute(self, context):
+        scene = context.scene
+        scene.bmc_lod_target_items.remove(scene.bmc_lod_target_index)
+        scene.bmc_lod_target_index = min(scene.bmc_lod_target_index, max(0, len(scene.bmc_lod_target_items) - 1))
+        return {"FINISHED"}
+
+
+class BMC_OT_clear_lod_targets(bpy.types.Operator):
+    bl_idname = "object.bmc_clear_lod_targets"
+    bl_label = "Clear LOD Targets"
+    bl_description = "Clear the LOD target list and mapping table"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_lod_target_items)
+
+    def execute(self, context):
+        scene = context.scene
+        scene.bmc_lod_target_items.clear()
+        scene.bmc_lod_target_index = 0
+        scene.bmc_lod_mapping_items.clear()
+        scene.bmc_lod_mapping_index = 0
+        return {"FINISHED"}
+
+
+class BMC_OT_scan_lod_targets(bpy.types.Operator):
+    bl_idname = "object.bmc_scan_lod_targets"
+    bl_label = "Scan LOD"
+    bl_description = "Scan the chosen LOD FrameAnalysis directory for the frozen LOD target list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(
+            scene
+            and scene.bmc_lod_frameanalysis_dir
+            and any(
+                item.enabled and item.ib_hash and item.object_name
+                for item in scene.bmc_lod_target_items
+            )
+        )
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            target_specs = _enabled_lod_target_specs(context)
+            result = scan_lod_targets_and_generate_manifest(
+                frameanalysis_dir=scene.bmc_lod_frameanalysis_dir,
+                target_specs=target_specs,
+                output_dir=scene.bmc_output_dir,
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Scan LOD failed: {exc}")
+            return {"CANCELLED"}
+
+        scene.bmc_lod_manifest_path = result["manifest_path"]
+        _sync_target_match_counts_from_manifest(scene, scene.bmc_lod_manifest_path, collection_name="bmc_lod_target_items")
+        scene.bmc_lod_mapping_items.clear()
+        scene.bmc_lod_mapping_index = 0
+        payload = dict(result["payload"])
+        scene.bmc_lod_shadow_host_hash = str(payload.get("shadow_host_hash", "") or "")
+        scene.bmc_lod_shadow_host_match_index_count = int(payload.get("shadow_host_match_index_count", -1))
+        scene.bmc_lod_shadow_host_vs_hash = str(payload.get("shadow_host_vs_hash", "") or "")
+
+        base_payload = load_mapping_payload_from_scene(scene)
+        base_payload["canonical_global_to_lod_global"] = []
+        base_payload["lod_host_map"] = []
+        mapping_payload = build_mapping_payload(
+            scene,
+            manifest_payload=_read_manifest_payload(scene.bmc_manifest_path),
+            base_payload=base_payload,
+        )
+        store_mapping_payload_on_scene(scene, mapping_payload)
+
+        if scene.bmc_manifest_path:
+            try:
+                scene.bmc_ini_path = regenerate_bonestore_runtime_files(
+                    output_dir=scene.bmc_output_dir or os.path.dirname(bpy.path.abspath(scene.bmc_manifest_path)),
+                    capture_manifest_path=bpy.path.abspath(scene.bmc_manifest_path),
+                    export_manifest_path=(
+                        bpy.path.abspath(scene.bmc_export_manifest_path) if scene.bmc_export_manifest_path else ""
+                    ),
+                    mapping_payload=mapping_payload,
+                )
+            except Exception as exc:
+                self.report({"WARNING"}, f"LOD runtime refresh skipped: {exc}")
+
+        info_message = (
+            f"Scanned {int(result['scanned_parts'])} LOD parts; total LOD globals {int(result['total_lod_global_bones'])}"
+        )
+        if scene.bmc_lod_shadow_host_hash:
+            info_message += (
+                f"; LOD shadow host {scene.bmc_lod_shadow_host_hash}-{scene.bmc_lod_shadow_host_match_index_count}"
+                f" vs={scene.bmc_lod_shadow_host_vs_hash or '?'}"
+            )
+        self.report({"INFO"}, info_message)
+        if result.get("warnings"):
+            self.report({"WARNING"}, " | ".join(result["warnings"][:3]))
+        if result.get("shadow_host_warning"):
+            self.report({"WARNING"}, str(result["shadow_host_warning"]))
+        return {"FINISHED"}
+
+
+class BMC_OT_apply_lod_vertex_group_remap(bpy.types.Operator):
+    bl_idname = "object.bmc_apply_lod_vertex_group_remap"
+    bl_label = "Rename LOD Groups"
+    bl_description = "Rename enabled LOD target objects' local vertex groups to LOD global indices"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.bmc_lod_target_items)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            payload = _sync_scene_payload(scene)
+            matched_meshes, selected_entries, skipped_before_apply = _select_lod_object_remap_entries(scene, payload)
+            if not matched_meshes:
+                raise ValueError("No enabled LOD Target objects matched any LOD remap entry")
+            remap_result = apply_group_remaps_to_meshes(
+                matched_meshes,
+                {"object_remaps": selected_entries},
+                identity_resolver=_identity_resolver_from_entries(matched_meshes, selected_entries),
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"LOD remap failed: {exc}")
+            return {"CANCELLED"}
+
+        skipped_after_apply = list(remap_result.skipped_objects)
+        skipped_after_apply.extend(skipped_before_apply)
+        self.report(
+            {"INFO"},
+            f"Renamed {remap_result.updated_objects}/{len(matched_meshes)} LOD target meshes; renamed {remap_result.renamed_groups} groups",
+        )
+        if skipped_after_apply:
+            self.report({"WARNING"}, " | ".join(skipped_after_apply[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_build_lod_mapping(bpy.types.Operator):
+    bl_idname = "object.bmc_build_lod_mapping"
+    bl_label = "Build LOD Mapping"
+    bl_description = "Build canonical_global -> lod_global mappings from main and LOD meshes"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(
+            scene
+            and scene.bmc_manifest_path
+            and scene.bmc_lod_manifest_path
+            and scene.bmc_target_items
+            and scene.bmc_lod_target_items
+        )
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            payload = _sync_scene_payload(scene)
+            canonical_manifest = dict(payload.get("capture_manifest", {}) or {})
+            lod_variant = dict(payload.get("lod_variant", {}) or {})
+            canonical_mesh_entries = _canonical_mesh_entries_for_lod_build(scene, payload)
+            lod_mesh_entries = _lod_mesh_entries_for_build(scene, payload)
+            if not canonical_mesh_entries:
+                raise ValueError("No enabled main Target objects matched the frozen canonical remap entries")
+            if not lod_mesh_entries:
+                raise ValueError("No enabled LOD Target objects matched the frozen LOD remap entries")
+            mapping_records = build_lod_mapping(
+                canonical_manifest=canonical_manifest,
+                lod_variant=lod_variant,
+                canonical_mesh_entries=canonical_mesh_entries,
+                lod_mesh_entries=lod_mesh_entries,
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Build LOD mapping failed: {exc}")
+            return {"CANCELLED"}
+
+        mapping_entries = [
+            {
+                "enabled": True,
+                "canonical_global_bone": int(record.canonical_global_bone),
+                "mapped_lod_global_bone": int(record.mapped_lod_global_bone),
+                "status": str(record.status),
+                "score": float(record.score),
+                "note": str(record.note),
+            }
+            for record in mapping_records
+        ]
+        _replace_lod_mapping_items(scene, mapping_entries)
+        payload = _sync_scene_payload(scene)
+        exact_count = sum(1 for item in mapping_entries if str(item["status"]) == "exact")
+        grouped_count = sum(1 for item in mapping_entries if str(item["status"]) == "grouped")
+        unmatched_count = sum(1 for item in mapping_entries if int(item["mapped_lod_global_bone"]) < 0)
+        self.report(
+            {"INFO"},
+            f"Built LOD mapping: exact {exact_count}; grouped {grouped_count}; unmatched {unmatched_count}",
+        )
+        if unmatched_count:
+            unresolved_notes = [
+                entry
+                for entry in mapping_entries
+                if int(entry["mapped_lod_global_bone"]) < 0 and str(entry["note"])
+            ]
+            if unresolved_notes:
+                self.report({"WARNING"}, " | ".join(str(entry["note"]) for entry in unresolved_notes[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_generate_lod_runtime_map(bpy.types.Operator):
+    bl_idname = "object.bmc_generate_lod_runtime_map"
+    bl_label = "Generate LOD Runtime Map"
+    bl_description = "Regenerate BoneStore.ini and export manifest LOD resources from the current canonical->LOD mapping"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_manifest_path and scene.bmc_ini_path)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            payload = _sync_scene_payload(scene)
+            output_dir = scene.bmc_output_dir or os.path.dirname(bpy.path.abspath(scene.bmc_ini_path or scene.bmc_manifest_path))
+            ini_path = regenerate_bonestore_runtime_files(
+                output_dir=output_dir,
+                capture_manifest_path=bpy.path.abspath(scene.bmc_manifest_path),
+                export_manifest_path=(
+                    bpy.path.abspath(scene.bmc_export_manifest_path) if scene.bmc_export_manifest_path else ""
+                ),
+                mapping_payload=payload,
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Generate LOD runtime map failed: {exc}")
+            return {"CANCELLED"}
+
+        scene.bmc_ini_path = ini_path
+        if scene.bmc_export_manifest_path:
+            try:
+                export_manifest = read_json(bpy.path.abspath(scene.bmc_export_manifest_path))
+                payload = load_mapping_payload_from_scene(scene)
+                payload["lod_host_map"] = list(export_manifest.get("lod_host_map", []) or [])
+                store_mapping_payload_on_scene(scene, payload)
+            except Exception:
+                pass
+        self.report({"INFO"}, f"LOD runtime resources regenerated: {ini_path}")
         return {"FINISHED"}
 
 
@@ -1152,6 +1762,49 @@ class BMC_OT_seam_apply_mapping(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BMC_OT_analyze_main_frameanalysis(bpy.types.Operator):
+    bl_idname = "object.bmc_analyze_main_frameanalysis"
+    bl_label = "Analyze Main"
+    bl_description = "Analyze Main FrameAnalysis and build the redesigned candidate IB manifest"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_frameanalysis_dir)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            target_hashes = _main_analyze_target_hashes(scene)
+            payload, manifest_path = write_main_analysis_manifest(
+                frameanalysis_dir=bpy.path.abspath(scene.bmc_frameanalysis_dir),
+                target_ib_hashes=target_hashes,
+                output_dir=bpy.path.abspath(scene.bmc_output_dir) if scene.bmc_output_dir else "",
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Analyze Main failed: {exc}")
+            return {"CANCELLED"}
+
+        scene.bmc_manifest_path = manifest_path
+        shadow_stage = payload.get("shadow_stage", {})
+        scene.bmc_shadow_host_hash = str(shadow_stage.get("host_ib_hash", "") or "")
+        scene.bmc_shadow_host_match_index_count = int(shadow_stage.get("host_match_index_count", -1))
+        shadow_vs_hashes = list(shadow_stage.get("shadow_vs_hashes", []) or [])
+        scene.bmc_shadow_host_vs_hash = shadow_vs_hashes[-1] if shadow_vs_hashes else ""
+        _replace_candidate_items_from_manifest(scene, payload)
+
+        warning_count = sum(1 for item in payload.get("validation", []) if item.get("severity") == "warning")
+        message = (
+            f"Analyzed {len(payload.get('candidate_ibs', []))} candidate IB(s); "
+            f"shadow VS {len(shadow_vs_hashes)}; manifest {os.path.basename(manifest_path)}"
+        )
+        if warning_count:
+            message += f"; warnings {warning_count}"
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
 class BMC_OT_scan_targets(bpy.types.Operator):
     bl_idname = "object.bmc_scan_targets"
     bl_label = "Scan / Freeze Mapping"
@@ -1165,7 +1818,7 @@ class BMC_OT_scan_targets(bpy.types.Operator):
             scene
             and scene.bmc_frameanalysis_dir
             and any(
-                item.enabled and item.ib_hash and int(item.match_index_count) >= 0 and item.object_name
+                item.enabled and item.ib_hash and item.object_name
                 for item in scene.bmc_target_items
             )
         )
@@ -1183,7 +1836,7 @@ class BMC_OT_scan_targets(bpy.types.Operator):
                 frameanalysis_dir=scene.bmc_frameanalysis_dir,
                 target_specs=target_specs,
                 output_dir=scene.bmc_output_dir,
-                merge_same_bone_groups=False,
+                mapping_payload=load_mapping_payload_from_scene(scene),
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Scan failed: {exc}")
@@ -1191,17 +1844,10 @@ class BMC_OT_scan_targets(bpy.types.Operator):
 
         scene.bmc_manifest_path = result.manifest_path
         scene.bmc_ini_path = result.ini_path
-        shadow_host_warning = ""
-        scene.bmc_shadow_host_hash = ""
-        scene.bmc_shadow_host_match_index_count = -1
-        scene.bmc_shadow_host_vs_hash = ""
-        try:
-            shadow_host = detect_last_shadow_host(scene.bmc_frameanalysis_dir)
-            scene.bmc_shadow_host_hash = shadow_host.ib_hash
-            scene.bmc_shadow_host_match_index_count = int(shadow_host.match_index_count)
-            scene.bmc_shadow_host_vs_hash = shadow_host.vs_hash
-        except Exception as exc:
-            shadow_host_warning = f"Last shadow host detection failed: {exc}"
+        _sync_target_match_counts_from_manifest(scene, scene.bmc_manifest_path)
+        scene.bmc_shadow_host_hash = str(result.shadow_host_hash or "")
+        scene.bmc_shadow_host_match_index_count = int(result.shadow_host_match_index_count)
+        scene.bmc_shadow_host_vs_hash = str(result.shadow_host_vs_hash or "")
 
         alias_warning = ""
         scene.bmc_alias_items.clear()
@@ -1281,8 +1927,6 @@ class BMC_OT_scan_targets(bpy.types.Operator):
         self.report({"INFO"}, info_message)
         if result.warnings:
             self.report({"WARNING"}, " | ".join(result.warnings[:3]))
-        if shadow_host_warning:
-            self.report({"WARNING"}, shadow_host_warning)
         if alias_warning:
             self.report({"WARNING"}, alias_warning)
         if auto_apply_warning:

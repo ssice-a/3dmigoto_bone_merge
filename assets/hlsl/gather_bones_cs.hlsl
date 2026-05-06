@@ -1,13 +1,13 @@
 // =========================================================
 // gather_bones_cs.hlsl
 // Local palette gather:
-//   t0 = Global FakeT0 / BoneStore SRV
-//   t2 = LocalPalette buffer, palette[localBone] = globalBone
+//   t0 = Shared native capture store / BoneStore SRV
+//   t2 = LocalPalette buffer, palette[localBone] = captureStoreIndex
 //   t3.x = local_bone_count
 //
-// Global palette layout:
-//   current:  3 + globalBone*3 + {0,1,2}
-//   previous: 100000 + 3 + globalBone*3 + {0,1,2}
+// Capture store layout:
+//   current:  3 + captureStoreIndex*3 + {0,1,2}
+//   previous: 100000 + 3 + captureStoreIndex*3 + {0,1,2}
 //
 // Local gathered palette layout:
 //   current:  3 + localBone*3 + {0,1,2}
@@ -37,10 +37,10 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     uint local_bone = local_row / 3;
     uint row_in_bone = local_row % 3;
-    uint global_bone = LocalPalette[local_bone];
+    uint capture_store_index = LocalPalette[local_bone];
 
-    uint src_current_row = GLOBAL_RESERVED_ROWS + global_bone * 3 + row_in_bone;
-    uint src_previous_row = GLOBAL_PREVIOUS_ROW_OFFSET + GLOBAL_RESERVED_ROWS + global_bone * 3 + row_in_bone;
+    uint src_current_row = GLOBAL_RESERVED_ROWS + capture_store_index * 3 + row_in_bone;
+    uint src_previous_row = GLOBAL_PREVIOUS_ROW_OFFSET + GLOBAL_RESERVED_ROWS + capture_store_index * 3 + row_in_bone;
     uint dst_current_row = GLOBAL_RESERVED_ROWS + local_bone * 3 + row_in_bone;
     uint dst_previous_row = LOCAL_PREVIOUS_ROW_OFFSET + GLOBAL_RESERVED_ROWS + local_bone * 3 + row_in_bone;
 

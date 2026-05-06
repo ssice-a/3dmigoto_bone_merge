@@ -5,11 +5,10 @@ from __future__ import annotations
 import glob
 import os
 import re
-import struct
 from collections import OrderedDict
+from dataclasses import dataclass
 
-from ..constants import GLOBAL_RESERVED_ROWS
-from .models import BoneAlias, DrawRecord, LoggedDraw, PartRecord, ShadowHostRecord, TargetObjectSpec
+from .models import CapturePlan, DrawRecord, LoggedDraw, PartRecord, ShadowHostRecord, TargetObjectSpec
 
 
 _DRAW_VS_RE = re.compile(r"^(?P<draw>\d{6}) VSSetShader\(.* hash=(?P<hash>[0-9a-fA-F]+)\s*$")
@@ -17,13 +16,32 @@ _DRAW_VS_CB1_RE = re.compile(r"^(?P<draw>\d{6}) VSSetConstantBuffers1\(StartSlot
 _DRAW_CB_INFO_RE = re.compile(
     r"^\s+1: resource=.* hash=(?P<hash>[0-9a-fA-F]+) first_constant=(?P<first>\d+) num_constants=(?P<count>\d+)\s*$"
 )
-_DRAW_INDEXED_RE = re.compile(r"^(?P<draw>\d{6}) DrawIndexedInstanced\(IndexCountPerInstance:(?P<count>\d+),")
+_DRAW_INDEXED_RE = re.compile(
+    r"^(?P<draw>\d{6}) DrawIndexed(?:Instanced)?\((?:IndexCountPerInstance|IndexCount):(?P<count>\d+),"
+)
 _OM_SET_RENDER_TARGETS_RE = re.compile(r"^(?P<draw>\d{6}) OMSetRenderTargets\(NumViews:(?P<num>\d+),")
 _IB_DUMP_FILE_RE = re.compile(r"^\d{6}-ib=(?P<hash>[0-9a-fA-F]{8})")
 _TEXTURE_OVERRIDE_IB_RE = re.compile(
     r"^(?P<draw>\d{6}) 3DMigoto\s+\[TextureOverride\\.*?_IB_(?P<hash>[0-9a-fA-F]{8})_merge\]"
 )
-_OBJECT_NAME_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)")
+_OBJECT_HASH_RE = re.compile(r"(?<![0-9A-Fa-f])(?P<hash>[0-9A-Fa-f]{8})(?![0-9A-Fa-f])")
+
+
+@dataclass(frozen=True)
+class _FrameAnalysisDrawIndex:
+    logged_draws: dict[int, LoggedDraw]
+    warnings: tuple[str, ...]
+    ib_dump_files_by_hash: dict[str, list[str]]
+    override_draws_by_hash: dict[str, list[int]]
+
+    def candidate_draw_indices(self, ib_hash: str) -> set[int]:
+        normalized_hash = str(ib_hash or "").lower()
+        candidate_draw_indices = {
+            _parse_draw_index_from_path(candidate_path)
+            for candidate_path in self.ib_dump_files_by_hash.get(normalized_hash, [])
+        }
+        candidate_draw_indices.update(self.override_draws_by_hash.get(normalized_hash, ()))
+        return candidate_draw_indices
 
 
 def normalize_hash(raw_hash: str) -> str:
@@ -95,25 +113,35 @@ def find_draw_records_for_targets(
     frameanalysis_dir: str,
     target_specs: list[TargetObjectSpec],
 ) -> tuple[list[DrawRecord], tuple[str, ...]]:
+    frame_index = _build_frameanalysis_draw_index(frameanalysis_dir)
+    return _find_earliest_draw_records_for_targets(frameanalysis_dir, target_specs, frame_index)
+
+
+def _build_frameanalysis_draw_index(frameanalysis_dir: str) -> _FrameAnalysisDrawIndex:
     logged_draws, warnings = parse_logged_draws(frameanalysis_dir)
-    extra_warnings: list[str] = list(warnings)
+    return _FrameAnalysisDrawIndex(
+        logged_draws=logged_draws,
+        warnings=warnings,
+        ib_dump_files_by_hash=_index_ib_dump_files(frameanalysis_dir),
+        override_draws_by_hash=_index_textureoverride_ib_draws(frameanalysis_dir),
+    )
+
+
+def _find_earliest_draw_records_for_targets(
+    frameanalysis_dir: str,
+    target_specs: list[TargetObjectSpec],
+    frame_index: _FrameAnalysisDrawIndex,
+) -> tuple[list[DrawRecord], tuple[str, ...]]:
+    extra_warnings: list[str] = list(frame_index.warnings)
     draw_records: list[DrawRecord] = []
-    ib_dump_files = _index_ib_dump_files(frameanalysis_dir)
-    override_draws_by_ib_hash = _index_textureoverride_ib_draws(frameanalysis_dir)
 
     for target_spec in target_specs:
-        candidate_draw_indices = {
-            _parse_draw_index_from_path(candidate_path)
-            for candidate_path in ib_dump_files.get(target_spec.ib_hash.lower(), [])
-        }
-        candidate_draw_indices.update(override_draws_by_ib_hash.get(target_spec.ib_hash.lower(), ()))
+        candidate_draw_indices = frame_index.candidate_draw_indices(target_spec.ib_hash)
         chosen_draw: DrawRecord | None = None
         candidate_errors: list[str] = []
-        for draw_index in sorted(candidate_draw_indices):
-            logged_draw = logged_draws.get(draw_index)
+        for candidate_draw_index in sorted(candidate_draw_indices):
+            logged_draw = frame_index.logged_draws.get(candidate_draw_index)
             if logged_draw is None:
-                continue
-            if logged_draw.match_index_count != target_spec.match_index_count:
                 continue
             try:
                 chosen_draw = _finalize_draw_record(
@@ -123,19 +151,81 @@ def find_draw_records_for_targets(
                 )
                 break
             except ValueError as exc:
-                candidate_errors.append(f"{target_spec.object_name}: draw {draw_index:06d}: {exc}")
+                candidate_errors.append(f"{target_spec.object_name}: draw {candidate_draw_index:06d}: {exc}")
 
         if chosen_draw is None:
             extra_warnings.extend(candidate_errors[:3])
-            extra_warnings.append(
-                f"{target_spec.object_name}: no draw found for {target_spec.ib_hash}-{target_spec.match_index_count}"
-            )
+            extra_warnings.append(f"{target_spec.object_name}: no draw found for {target_spec.ib_hash}")
             continue
 
         draw_records.append(chosen_draw)
 
     draw_records.sort(key=lambda item: item.draw_index)
     return draw_records, tuple(extra_warnings)
+
+
+def _find_last_draw_record_for_targets(
+    frameanalysis_dir: str,
+    target_specs: list[TargetObjectSpec],
+    frame_index: _FrameAnalysisDrawIndex,
+) -> tuple[DrawRecord | None, tuple[str, ...]]:
+    candidates: list[tuple[int, TargetObjectSpec]] = []
+    for target_spec in target_specs:
+        for candidate_draw_index in frame_index.candidate_draw_indices(target_spec.ib_hash):
+            candidates.append((candidate_draw_index, target_spec))
+
+    candidate_errors: list[str] = []
+    seen_draw_indices: set[int] = set()
+    for candidate_draw_index, target_spec in sorted(candidates, key=lambda item: item[0], reverse=True):
+        if candidate_draw_index in seen_draw_indices:
+            continue
+        seen_draw_indices.add(candidate_draw_index)
+        logged_draw = frame_index.logged_draws.get(candidate_draw_index)
+        if logged_draw is None:
+            continue
+        try:
+            return (
+                _finalize_draw_record(
+                    frameanalysis_dir=frameanalysis_dir,
+                    target_spec=target_spec,
+                    logged_draw=logged_draw,
+                ),
+                tuple(),
+            )
+        except ValueError as exc:
+            candidate_errors.append(f"{target_spec.object_name}: draw {candidate_draw_index:06d}: {exc}")
+    return None, tuple(candidate_errors[:3])
+
+
+def build_capture_plan_from_targets(frameanalysis_dir: str, target_specs: list[TargetObjectSpec]) -> CapturePlan:
+    """Build the frozen global capture plan from target IB hashes.
+
+    The capture plan deliberately keeps the scan rule simple:
+    each target hash picks its earliest valid draw, then all picked draws are
+    sorted by draw index to form the global bone pool. The host record is the
+    latest valid draw among the same target hashes, without any game-specific
+    G-buffer or OM-state assumptions.
+    """
+
+    frame_index = _build_frameanalysis_draw_index(frameanalysis_dir)
+    draw_records, warnings = _find_earliest_draw_records_for_targets(frameanalysis_dir, target_specs, frame_index)
+    part_records = tuple(build_part_records(draw_records)) if draw_records else tuple()
+    warning_list = list(warnings)
+    last_draw_record, last_draw_warnings = _find_last_draw_record_for_targets(frameanalysis_dir, target_specs, frame_index)
+    warning_list.extend(last_draw_warnings)
+    shadow_host: ShadowHostRecord | None = None
+    if last_draw_record is not None:
+        shadow_host = ShadowHostRecord(
+            draw_index=last_draw_record.draw_index,
+            ib_hash=last_draw_record.ib_hash,
+            match_index_count=last_draw_record.match_index_count,
+            vs_hash=last_draw_record.vs_hash,
+        )
+    return CapturePlan(
+        part_records=part_records,
+        shadow_host=shadow_host,
+        warnings=tuple(warning_list),
+    )
 
 
 def _index_ib_dump_files(frameanalysis_dir: str) -> dict[str, list[str]]:
@@ -174,8 +264,11 @@ def _finalize_draw_record(frameanalysis_dir: str, target_spec: TargetObjectSpec,
         raise ValueError("missing vs-t0 dump")
     if not vs_cb1_matches:
         raise ValueError("missing vs-cb1 dump")
-    if logged_draw.vs_cb1_first_constant < 0:
-        raise ValueError("missing VS cb1 first_constant")
+    vs_cb1_first_constant = int(logged_draw.vs_cb1_first_constant)
+    vs_cb1_num_constants = int(logged_draw.vs_cb1_num_constants)
+    if vs_cb1_first_constant < 0:
+        vs_cb1_first_constant = 0
+        vs_cb1_num_constants = -1
     if target_spec.local_bone_count <= 0:
         raise ValueError("invalid local_bone_count inferred from Blender object")
 
@@ -184,8 +277,8 @@ def _finalize_draw_record(frameanalysis_dir: str, target_spec: TargetObjectSpec,
         object_name=target_spec.object_name,
         vs_hash=logged_draw.vs_hash,
         match_index_count=logged_draw.match_index_count,
-        vs_cb1_first_constant=logged_draw.vs_cb1_first_constant,
-        vs_cb1_num_constants=logged_draw.vs_cb1_num_constants,
+        vs_cb1_first_constant=vs_cb1_first_constant,
+        vs_cb1_num_constants=vs_cb1_num_constants,
         ib_hash=target_spec.ib_hash.lower(),
         local_bone_count=target_spec.local_bone_count,
         vb2_path=vb2_matches[0] if vb2_matches else "",
@@ -309,94 +402,15 @@ def detect_last_shadow_host(frameanalysis_dir: str) -> ShadowHostRecord:
     )
 
 
-def build_duplicate_bone_aliases(part_records: list[PartRecord]) -> list[BoneAlias]:
-    signature_to_canonical: dict[bytes, tuple[PartRecord, int]] = {}
-    aliases: list[BoneAlias] = []
-
-    for part_record in part_records:
-        current_base, previous_base = _read_palette_bases_from_vs_cb1(part_record.vs_cb1_path)
-        with open(part_record.vs_t0_path, "rb") as file_handle:
-            vs_t0_blob = file_handle.read()
-        total_rows = len(vs_t0_blob) // 16
-        if total_rows <= 0:
-            raise ValueError(f"vs-t0 buffer is empty: {part_record.vs_t0_path}")
-
-        for local_bone in range(part_record.bone_count):
-            signature = _build_bone_signature_from_blob(
-                vs_t0_blob=vs_t0_blob,
-                total_rows=total_rows,
-                current_base=current_base,
-                previous_base=previous_base,
-                local_bone=local_bone,
-            )
-            canonical = signature_to_canonical.get(signature)
-            if canonical is None:
-                signature_to_canonical[signature] = (part_record, local_bone)
-                continue
-
-            canonical_part, canonical_local_bone = canonical
-            if (
-                canonical_part.draw_index == part_record.draw_index
-                and canonical_part.ib_hash == part_record.ib_hash
-            ):
-                continue
-
-            aliases.append(
-                BoneAlias(
-                    src_draw_index=part_record.draw_index,
-                    src_object_name=part_record.object_name,
-                    src_ib_hash=part_record.ib_hash,
-                    src_local_bone=local_bone,
-                    src_global_bone=part_record.global_bone_base + local_bone,
-                    canonical_draw_index=canonical_part.draw_index,
-                    canonical_object_name=canonical_part.object_name,
-                    canonical_ib_hash=canonical_part.ib_hash,
-                    canonical_local_bone=canonical_local_bone,
-                    canonical_global_bone=canonical_part.global_bone_base + canonical_local_bone,
-                    confidence="exact_current_previous",
-                )
-            )
-    return aliases
-
-
-def _read_palette_bases_from_vs_cb1(vs_cb1_path: str) -> tuple[int, int]:
-    with open(vs_cb1_path, "rb") as file_handle:
-        file_handle.seek(5 * 16)
-        row_bytes = file_handle.read(16)
-    if len(row_bytes) != 16:
-        raise ValueError(f"vs-cb1 buffer too small: {vs_cb1_path}")
-    x_value, y_value, _z_value, _w_value = struct.unpack("<4I", row_bytes)
-    return x_value, y_value
-
-
-def _build_bone_signature_from_blob(
-    vs_t0_blob: bytes,
-    total_rows: int,
-    current_base: int,
-    previous_base: int,
-    local_bone: int,
-) -> bytes:
-    current_row = current_base + GLOBAL_RESERVED_ROWS + local_bone * 3
-    previous_row = previous_base + GLOBAL_RESERVED_ROWS + local_bone * 3
-    current_blob = _read_three_rows_from_blob(vs_t0_blob, current_row, total_rows)
-    previous_blob = _read_three_rows_from_blob(vs_t0_blob, previous_row, total_rows)
-    return current_blob + previous_blob
-
-
-def _read_three_rows_from_blob(vs_t0_blob: bytes, row_index: int, total_rows: int) -> bytes:
-    blobs: list[bytes] = []
-    for row_offset in range(3):
-        wrapped_row_index = (int(row_index) + row_offset) % int(total_rows)
-        byte_offset = wrapped_row_index * 16
-        row_blob = vs_t0_blob[byte_offset : byte_offset + 16]
-        if len(row_blob) != 16:
-            raise ValueError(f"vs-t0 buffer too small for row {wrapped_row_index}")
-        blobs.append(row_blob)
-    return b"".join(blobs)
+def infer_ib_hash_from_name(object_name: str) -> str | None:
+    match = _OBJECT_HASH_RE.search(str(object_name or ""))
+    if not match:
+        return None
+    return match.group("hash").lower()
 
 
 def infer_mesh_identity_from_name(object_name: str) -> tuple[str, int] | None:
-    match = _OBJECT_NAME_RE.search(str(object_name or ""))
-    if not match:
+    ib_hash = infer_ib_hash_from_name(object_name)
+    if ib_hash is None:
         return None
-    return match.group("hash").lower(), int(match.group("count"))
+    return ib_hash, 0

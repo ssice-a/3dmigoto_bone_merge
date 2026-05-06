@@ -10,10 +10,11 @@ from .blender_ops import (
     mesh_objects_from_target_names,
     merge_duplicate_alias_weights,
 )
-from .frameanalysis import build_part_records, find_draw_records_for_targets, resolve_output_dir
+from .frameanalysis import build_capture_plan_from_targets, resolve_output_dir
 from .hlsl_assets import export_required_hlsl
 from .ini_export import build_bonestore_namespace, write_bonestore_ini
 from .io import read_json, write_json
+from .lod_runtime import materialize_lod_runtime_assets
 from .models import ObjectRemap, ScanGenerateResult, TargetObjectSpec
 
 
@@ -21,22 +22,26 @@ def scan_targets_and_generate_outputs(
     frameanalysis_dir: str,
     target_specs: list[TargetObjectSpec],
     output_dir: str | None = None,
-    merge_same_bone_groups: bool = True,
+    mapping_payload: dict | None = None,
 ) -> ScanGenerateResult:
     normalized_frameanalysis_dir = os.path.abspath(frameanalysis_dir)
     normalized_output_dir = resolve_output_dir(normalized_frameanalysis_dir, output_dir)
 
-    draw_records, warnings = find_draw_records_for_targets(normalized_frameanalysis_dir, target_specs)
-    if not draw_records:
+    capture_plan = build_capture_plan_from_targets(normalized_frameanalysis_dir, target_specs)
+    if not capture_plan.part_records:
+        details = "; ".join(capture_plan.warnings[:5])
+        if details:
+            raise ValueError(f"No matching draw records found for current target list: {details}")
         raise ValueError("No matching draw records found for current target list")
 
-    part_records = build_part_records(draw_records)
+    part_records = list(capture_plan.part_records)
+    shadow_host = capture_plan.shadow_host
     bone_aliases = []
     object_remaps = _build_object_remaps(part_records)
     selected_vs_hashes = sorted({part.vs_hash.lower() for part in part_records})
     total_global_bones = sum(part.bone_count for part in part_records)
 
-    warning_list = list(warnings)
+    warning_list = list(capture_plan.warnings)
     oversized_parts = [part for part in part_records if part.bone_count > BI4_MAX_BONE_COUNT]
     if oversized_parts:
         oversize_summary = ", ".join(
@@ -54,6 +59,10 @@ def scan_targets_and_generate_outputs(
         "hlsl_dir": hlsl_output_dir,
         "bonestore_namespace": build_bonestore_namespace(normalized_output_dir),
         "selected_vs_hashes": selected_vs_hashes,
+        "shadow_host_hash": shadow_host.ib_hash if shadow_host else "",
+        "shadow_host_match_index_count": int(shadow_host.match_index_count) if shadow_host else -1,
+        "shadow_host_vs_hash": shadow_host.vs_hash if shadow_host else "",
+        "shadow_host_draw_index": int(shadow_host.draw_index) if shadow_host else -1,
         "local_palette_protocol": {
             "palette_format": "R32_UINT",
             "palette_stride_bytes": 4,
@@ -134,7 +143,8 @@ def scan_targets_and_generate_outputs(
     }
 
     manifest_path = write_json(os.path.join(normalized_output_dir, CAPTURE_MANIFEST_FILE_NAME), manifest_payload)
-    ini_path = write_bonestore_ini(normalized_output_dir, part_records, [])
+    lod_runtime = materialize_lod_runtime_assets(normalized_output_dir, part_records, [], mapping_payload or {})
+    ini_path = write_bonestore_ini(normalized_output_dir, part_records, [], lod_runtime=lod_runtime)
 
     return ScanGenerateResult(
         frameanalysis_dir=normalized_frameanalysis_dir,
@@ -142,6 +152,10 @@ def scan_targets_and_generate_outputs(
         ini_path=ini_path,
         scanned_parts=len(part_records),
         total_global_bones=total_global_bones,
+        shadow_host_hash=shadow_host.ib_hash if shadow_host else "",
+        shadow_host_match_index_count=int(shadow_host.match_index_count) if shadow_host else -1,
+        shadow_host_vs_hash=shadow_host.vs_hash if shadow_host else "",
+        shadow_host_draw_index=int(shadow_host.draw_index) if shadow_host else -1,
         warnings=tuple(warning_list),
     )
 

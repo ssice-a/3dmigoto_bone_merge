@@ -2,6 +2,7 @@
 
 BONESTORE_INI_FILE_NAME = "BoneStore.ini"
 CAPTURE_MANIFEST_FILE_NAME = "capture_manifest.json"
+LOD_CAPTURE_MANIFEST_FILE_NAME = "lod_capture_manifest.json"
 EXPORT_MANIFEST_FILE_NAME = "export_manifest.json"
 HLSL_EXPORT_DIR_NAME = "hlsl"
 BUFFER_EXPORT_DIR_NAME = "Buffer"

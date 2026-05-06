@@ -33,6 +33,17 @@ class BMC_TargetItem(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(name="Enabled", default=True)
 
 
+class BMC_CandidateItem(bpy.types.PropertyGroup):
+    enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+    display_name: bpy.props.StringProperty(name="Candidate", default="")
+    ib_hash: bpy.props.StringProperty(name="IB Hash", default="")
+    match_first_index: bpy.props.IntProperty(name="First Index", default=0, min=0)
+    match_index_count: bpy.props.IntProperty(name="Index Count", default=0, min=0)
+    local_bone_count: bpy.props.IntProperty(name="Local Bones", default=0, min=0)
+    draw_count: bpy.props.IntProperty(name="Draws", default=0, min=0)
+    shadow_draw_count: bpy.props.IntProperty(name="Shadow Draws", default=0, min=0)
+
+
 class BMC_AliasItem(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(name="Enabled", default=True)
     src_draw_index: bpy.props.IntProperty(name="Src Draw", default=0, min=0)
@@ -66,13 +77,34 @@ class BMC_SeamAliasItem(bpy.types.PropertyGroup):
     average_weight_difference: bpy.props.FloatProperty(name="Avg Weight Diff", default=0.0, min=0.0)
 
 
+class BMC_LodTargetItem(bpy.types.PropertyGroup):
+    enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+    object_name: bpy.props.StringProperty(name="Object", default="")
+    object_ref: bpy.props.PointerProperty(name="Object Ref", type=bpy.types.Object)
+    ib_hash: bpy.props.StringProperty(name="IB Hash", default="")
+    match_index_count: bpy.props.IntProperty(name="Match Index Count", default=0, min=0)
+    local_bone_count: bpy.props.IntProperty(name="Local Bone Count", default=0, min=0)
+
+
+class BMC_LodMappingItem(bpy.types.PropertyGroup):
+    enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+    canonical_global_bone: bpy.props.IntProperty(name="Canonical Global", default=0, min=0)
+    mapped_lod_global_bone: bpy.props.IntProperty(name="LOD Global", default=-1, min=-1)
+    status: bpy.props.StringProperty(name="Status", default="")
+    score: bpy.props.FloatProperty(name="Score", default=0.0)
+    note: bpy.props.StringProperty(name="Note", default="")
+
+
 REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Object, "merge_ib_hash"),
     (bpy.types.Object, "merge_match_index_count"),
     (bpy.types.Object, "merge_ib_autodetected"),
     (bpy.types.Scene, "bmc_frameanalysis_dir"),
+    (bpy.types.Scene, "bmc_target_ib_hash"),
+    (bpy.types.Scene, "bmc_lod_frameanalysis_dir"),
     (bpy.types.Scene, "bmc_output_dir"),
     (bpy.types.Scene, "bmc_manifest_path"),
+    (bpy.types.Scene, "bmc_lod_manifest_path"),
     (bpy.types.Scene, "bmc_ini_path"),
     (bpy.types.Scene, "bmc_target_collection"),
     (bpy.types.Scene, "bmc_export_collection"),
@@ -82,12 +114,21 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_shadow_host_hash"),
     (bpy.types.Scene, "bmc_shadow_host_match_index_count"),
     (bpy.types.Scene, "bmc_shadow_host_vs_hash"),
+    (bpy.types.Scene, "bmc_lod_shadow_host_hash"),
+    (bpy.types.Scene, "bmc_lod_shadow_host_match_index_count"),
+    (bpy.types.Scene, "bmc_lod_shadow_host_vs_hash"),
     (bpy.types.Scene, "bmc_scan_auto_apply_mapping"),
     (bpy.types.Scene, "bmc_mapping_payload_json"),
     (bpy.types.Scene, "bmc_target_items"),
     (bpy.types.Scene, "bmc_target_index"),
+    (bpy.types.Scene, "bmc_candidate_items"),
+    (bpy.types.Scene, "bmc_candidate_index"),
+    (bpy.types.Scene, "bmc_lod_target_items"),
+    (bpy.types.Scene, "bmc_lod_target_index"),
     (bpy.types.Scene, "bmc_alias_items"),
     (bpy.types.Scene, "bmc_alias_index"),
+    (bpy.types.Scene, "bmc_lod_mapping_items"),
+    (bpy.types.Scene, "bmc_lod_mapping_index"),
     (bpy.types.Scene, "bmc_seam_match_items"),
     (bpy.types.Scene, "bmc_seam_match_index"),
     (bpy.types.Scene, "bmc_seam_alias_items"),
@@ -108,12 +149,12 @@ def register_addon_properties():
         name="Match Index Count",
         default=-1,
         min=-1,
-        description="Manual override for the mesh match_index_count used by Bone Merge Capture.",
+        description="Legacy cached match_index_count from older Bone Merge Capture presets.",
     )
     bpy.types.Object.merge_ib_autodetected = bpy.props.BoolProperty(
         name="IB Auto",
         default=True,
-        description="Whether IB hash and match_index_count are currently inferred from the object name.",
+        description="Whether IB hash is currently inferred from the object name.",
     )
 
     bpy.types.Scene.bmc_frameanalysis_dir = bpy.props.StringProperty(
@@ -121,6 +162,17 @@ def register_addon_properties():
         default="",
         subtype="DIR_PATH",
         description="FrameAnalysis directory that contains log.txt and dumped buffers.",
+    )
+    bpy.types.Scene.bmc_target_ib_hash = bpy.props.StringProperty(
+        name="Target IB Hash",
+        default="",
+        description="Starting IB hash for the redesigned Main Analyze flow. If empty, enabled Target Objects are used.",
+    )
+    bpy.types.Scene.bmc_lod_frameanalysis_dir = bpy.props.StringProperty(
+        name="LOD FrameAnalysis Dir",
+        default="",
+        subtype="DIR_PATH",
+        description="LOD FrameAnalysis directory used for source capture variant scanning.",
     )
     bpy.types.Scene.bmc_output_dir = bpy.props.StringProperty(
         name="Output Dir",
@@ -133,6 +185,12 @@ def register_addon_properties():
         default="",
         subtype="FILE_PATH",
         description="Generated capture manifest path from the latest Scan.",
+    )
+    bpy.types.Scene.bmc_lod_manifest_path = bpy.props.StringProperty(
+        name="LOD Manifest Path",
+        default="",
+        subtype="FILE_PATH",
+        description="Generated LOD capture manifest path from the latest LOD Scan.",
     )
     bpy.types.Scene.bmc_ini_path = bpy.props.StringProperty(
         name="BoneStore INI",
@@ -183,6 +241,22 @@ def register_addon_properties():
         default="",
         description="VS hash of the detected final vs==200 shadow host draw. Filled by Scan / Load Mapping Preset for reference.",
     )
+    bpy.types.Scene.bmc_lod_shadow_host_hash = bpy.props.StringProperty(
+        name="LOD Shadow Host Hash",
+        default="",
+        description="Detected final vs==200 LOD shadow host IB hash.",
+    )
+    bpy.types.Scene.bmc_lod_shadow_host_match_index_count = bpy.props.IntProperty(
+        name="LOD Shadow Host Count",
+        default=-1,
+        min=-1,
+        description="Detected final vs==200 LOD shadow host match_index_count.",
+    )
+    bpy.types.Scene.bmc_lod_shadow_host_vs_hash = bpy.props.StringProperty(
+        name="LOD Last Shadow VS",
+        default="",
+        description="VS hash of the detected final vs==200 LOD shadow host draw.",
+    )
     bpy.types.Scene.bmc_scan_auto_apply_mapping = bpy.props.BoolProperty(
         name="Auto remap after Scan",
         default=False,
@@ -196,8 +270,14 @@ def register_addon_properties():
     )
     bpy.types.Scene.bmc_target_items = bpy.props.CollectionProperty(type=BMC_TargetItem)
     bpy.types.Scene.bmc_target_index = bpy.props.IntProperty(name="Target Index", default=0, min=0)
+    bpy.types.Scene.bmc_candidate_items = bpy.props.CollectionProperty(type=BMC_CandidateItem)
+    bpy.types.Scene.bmc_candidate_index = bpy.props.IntProperty(name="Candidate Index", default=0, min=0)
+    bpy.types.Scene.bmc_lod_target_items = bpy.props.CollectionProperty(type=BMC_LodTargetItem)
+    bpy.types.Scene.bmc_lod_target_index = bpy.props.IntProperty(name="LOD Target Index", default=0, min=0)
     bpy.types.Scene.bmc_alias_items = bpy.props.CollectionProperty(type=BMC_AliasItem)
     bpy.types.Scene.bmc_alias_index = bpy.props.IntProperty(name="Alias Index", default=0, min=0)
+    bpy.types.Scene.bmc_lod_mapping_items = bpy.props.CollectionProperty(type=BMC_LodMappingItem)
+    bpy.types.Scene.bmc_lod_mapping_index = bpy.props.IntProperty(name="LOD Mapping Index", default=0, min=0)
     bpy.types.Scene.bmc_seam_match_items = bpy.props.CollectionProperty(type=BMC_SeamMatchItem)
     bpy.types.Scene.bmc_seam_match_index = bpy.props.IntProperty(name="Seam Object Index", default=0, min=0)
     bpy.types.Scene.bmc_seam_alias_items = bpy.props.CollectionProperty(type=BMC_SeamAliasItem)

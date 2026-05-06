@@ -10,10 +10,23 @@ class BMC_UL_target_items(bpy.types.UIList):
             row = layout.row(align=True)
             row.prop(item, "enabled", text="")
             row.label(text=object_label or "(unnamed)")
-            row.label(text=f"{item.ib_hash}-{item.match_index_count}")
+            row.label(text=item.ib_hash)
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text=object_label or "?")
+
+
+class BMC_UL_candidate_items(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            row.label(text=item.display_name or item.ib_hash or "(candidate)")
+            row.label(text=f"bones {int(item.local_bone_count)}")
+            row.label(text=f"draws {int(item.draw_count)}")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=item.ib_hash or "?")
 
 
 class BMC_UL_alias_items(bpy.types.UIList):
@@ -51,6 +64,31 @@ class BMC_UL_seam_alias_items(bpy.types.UIList):
             layout.label(text=str(item.src_group))
 
 
+class BMC_UL_lod_target_items(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
+        object_label = item.object_ref.name if getattr(item, "object_ref", None) else item.object_name
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            row.label(text=object_label or "(unnamed)")
+            row.label(text=item.ib_hash)
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=object_label or "?")
+
+
+class BMC_UL_lod_mapping_items(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            row.label(text=f"{item.canonical_global_bone} -> {item.mapped_lod_global_bone}")
+            row.label(text=item.status or "unmatched")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=str(item.canonical_global_bone))
+
+
 class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -86,7 +124,6 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
             target = scene.bmc_target_items[scene.bmc_target_index]
             target_box.prop(target, "object_ref")
             target_box.prop(target, "ib_hash")
-            target_box.prop(target, "match_index_count")
             target_box.prop(target, "local_bone_count")
             target_box.prop(target, "autodetected")
             target_box.operator("object.bmc_refresh_target_identity", icon="FILE_REFRESH")
@@ -126,15 +163,79 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         )
 
         scan_box = layout.box()
-        scan_box.label(text="Scan / Freeze Mapping", icon="FILE_FOLDER")
+        scan_box.label(text="Main Analyze", icon="VIEWZOOM")
         scan_box.prop(scene, "bmc_frameanalysis_dir")
+        scan_box.prop(scene, "bmc_target_ib_hash")
         scan_box.prop(scene, "bmc_output_dir")
-        scan_box.prop(scene, "bmc_scan_auto_apply_mapping")
-        scan_box.operator("object.bmc_scan_targets", icon="VIEWZOOM")
+        scan_box.operator("object.bmc_analyze_main_frameanalysis", icon="VIEWZOOM")
+        row = scan_box.row()
+        row.template_list(
+            "BMC_UL_candidate_items",
+            "",
+            scene,
+            "bmc_candidate_items",
+            scene,
+            "bmc_candidate_index",
+            rows=6,
+        )
+        if scene.bmc_candidate_items and 0 <= scene.bmc_candidate_index < len(scene.bmc_candidate_items):
+            candidate = scene.bmc_candidate_items[scene.bmc_candidate_index]
+            scan_box.prop(candidate, "ib_hash")
+            scan_box.prop(candidate, "match_first_index")
+            scan_box.prop(candidate, "match_index_count")
+            scan_box.prop(candidate, "local_bone_count")
+
+        legacy_scan_box = layout.box()
+        legacy_scan_box.label(text="Legacy Scan / Freeze Mapping", icon="FILE_FOLDER")
+        legacy_scan_box.prop(scene, "bmc_frameanalysis_dir")
+        legacy_scan_box.prop(scene, "bmc_output_dir")
+        legacy_scan_box.prop(scene, "bmc_scan_auto_apply_mapping")
+        legacy_scan_box.operator("object.bmc_scan_targets", icon="VIEWZOOM")
 
         mapping_box = layout.box()
         mapping_box.label(text="Legacy Target Remap", icon="MODIFIER")
         mapping_box.operator("object.bmc_apply_vertex_group_remap", icon="DRIVER")
+
+        lod_box = layout.box()
+        lod_box.label(text="LOD", icon="MESH_GRID")
+        lod_box.prop(scene, "bmc_lod_frameanalysis_dir")
+        row = lod_box.row()
+        row.template_list(
+            "BMC_UL_lod_target_items",
+            "",
+            scene,
+            "bmc_lod_target_items",
+            scene,
+            "bmc_lod_target_index",
+            rows=5,
+        )
+        col = row.column(align=True)
+        col.operator("object.bmc_add_selected_lod_targets", icon="ADD", text="")
+        col.operator("object.bmc_remove_lod_target", icon="REMOVE", text="")
+        col.operator("object.bmc_clear_lod_targets", icon="TRASH", text="")
+        lod_actions = lod_box.row(align=True)
+        lod_actions.operator("object.bmc_scan_lod_targets", icon="VIEWZOOM")
+        lod_actions.operator("object.bmc_apply_lod_vertex_group_remap", icon="DRIVER")
+        lod_actions = lod_box.row(align=True)
+        lod_actions.operator("object.bmc_build_lod_mapping", icon="TRACKING")
+        lod_actions.operator("object.bmc_generate_lod_runtime_map", icon="MOD_ARRAY")
+        row = lod_box.row()
+        row.template_list(
+            "BMC_UL_lod_mapping_items",
+            "",
+            scene,
+            "bmc_lod_mapping_items",
+            scene,
+            "bmc_lod_mapping_index",
+            rows=6,
+        )
+        if scene.bmc_lod_mapping_items and 0 <= scene.bmc_lod_mapping_index < len(scene.bmc_lod_mapping_items):
+            lod_mapping = scene.bmc_lod_mapping_items[scene.bmc_lod_mapping_index]
+            lod_box.prop(lod_mapping, "canonical_global_bone")
+            lod_box.prop(lod_mapping, "mapped_lod_global_bone")
+            lod_box.prop(lod_mapping, "status")
+            lod_box.prop(lod_mapping, "score")
+            lod_box.prop(lod_mapping, "note")
 
         preset_box = layout.box()
         preset_box.label(text="Mapping Preset", icon="BOOKMARKS")

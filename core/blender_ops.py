@@ -33,19 +33,18 @@ _MAPPING_WEIGHT_FLOOR = 1.0e-4
 def resolve_mesh_identity(mesh_obj) -> tuple[str, int] | None:
     autodetected = bool(getattr(mesh_obj, "merge_ib_autodetected", True))
     manual_hash = str(getattr(mesh_obj, "merge_ib_hash", "")).strip().lower()
-    manual_count = int(getattr(mesh_obj, "merge_match_index_count", -1))
-    if not autodetected and manual_hash and manual_count >= 0:
+    if not autodetected and manual_hash:
         mesh_obj.merge_ib_autodetected = False
-        return manual_hash, manual_count
+        return manual_hash, 0
 
     inferred = infer_mesh_identity_from_name(mesh_obj.name)
     if inferred is None:
         mesh_obj.merge_ib_hash = ""
-        mesh_obj.merge_match_index_count = -1
+        mesh_obj.merge_match_index_count = 0
         mesh_obj.merge_ib_autodetected = True
         return None
     mesh_obj.merge_ib_hash = inferred[0]
-    mesh_obj.merge_match_index_count = inferred[1]
+    mesh_obj.merge_match_index_count = 0
     mesh_obj.merge_ib_autodetected = True
     return inferred
 
@@ -291,7 +290,7 @@ def build_seam_filtered_aliases_from_manifest(context, manifest: dict, target_ob
 
 def _build_object_metadata_index(manifest: dict, mesh_by_name: dict[str, object], identity_by_name: dict[str, tuple[str, int] | None]) -> dict[str, dict]:
     metadata_by_exact_name: dict[str, dict] = {}
-    metadata_by_identity: dict[tuple[str, int], dict] = {}
+    metadata_by_identity: dict[str, dict] = {}
     for part in manifest.get("part_records", []):
         object_name = str(part.get("object_name", "")).strip()
         ib_hash = str(part.get("ib_hash", "")).strip().lower()
@@ -307,8 +306,8 @@ def _build_object_metadata_index(manifest: dict, mesh_by_name: dict[str, object]
         }
         if object_name:
             metadata_by_exact_name[object_name] = metadata
-        if ib_hash and match_index_count >= 0:
-            metadata_by_identity[(ib_hash, match_index_count)] = metadata
+        if ib_hash:
+            metadata_by_identity.setdefault(ib_hash, metadata)
 
     metadata_by_object: dict[str, dict] = {}
     for object_name in mesh_by_name:
@@ -319,7 +318,7 @@ def _build_object_metadata_index(manifest: dict, mesh_by_name: dict[str, object]
         identity = identity_by_name.get(object_name)
         if identity is None:
             continue
-        by_identity = metadata_by_identity.get((identity[0].lower(), int(identity[1])))
+        by_identity = metadata_by_identity.get(identity[0].lower())
         if by_identity is not None:
             metadata_by_object[object_name] = {
                 **by_identity,
@@ -445,8 +444,9 @@ def _format_fast_seam_confidence(edges: list[dict]) -> str:
 def apply_group_remaps_to_meshes(mesh_objects, manifest: dict, identity_resolver=None) -> RemapApplyResult:
     remap_index = {}
     for entry in manifest.get("object_remaps", []):
-        remap_index[(entry.get("object_name", ""), entry["ib_hash"].lower(), int(entry["match_index_count"]))] = entry
-        remap_index[("", entry["ib_hash"].lower(), int(entry["match_index_count"]))] = entry
+        ib_hash = entry["ib_hash"].lower()
+        remap_index[(entry.get("object_name", ""), ib_hash)] = entry
+        remap_index[("", ib_hash)] = entry
 
     resolver = identity_resolver or resolve_mesh_identity
     updated_objects = 0
@@ -456,14 +456,14 @@ def apply_group_remaps_to_meshes(mesh_objects, manifest: dict, identity_resolver
     for mesh_obj in mesh_objects:
         mesh_identity = resolver(mesh_obj)
         if mesh_identity is None:
-            skipped_objects.append(f"{mesh_obj.name}: cannot infer ib_hash/index_count")
+            skipped_objects.append(f"{mesh_obj.name}: cannot infer ib_hash")
             continue
 
-        remap_entry = remap_index.get((mesh_obj.name, mesh_identity[0], mesh_identity[1]))
+        remap_entry = remap_index.get((mesh_obj.name, mesh_identity[0]))
         if remap_entry is None:
-            remap_entry = remap_index.get(("", mesh_identity[0], mesh_identity[1]))
+            remap_entry = remap_index.get(("", mesh_identity[0]))
         if remap_entry is None:
-            skipped_objects.append(f"{mesh_obj.name}: no remap entry for {mesh_identity[0]}-{mesh_identity[1]}")
+            skipped_objects.append(f"{mesh_obj.name}: no remap entry for {mesh_identity[0]}")
             continue
 
         local_to_global = _normalize_local_to_global(remap_entry.get("local_group_to_global_group", {}))

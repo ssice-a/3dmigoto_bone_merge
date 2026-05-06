@@ -113,11 +113,81 @@ def generate_shadow_split(
     if not payloads:
         raise ValueError("No matching source TextureOverride sections were found for the prepared export chunks")
 
-    generated_host_lines = _build_generated_host_block(
+    host_blocks: list[str] = _build_generated_host_block(
         host_record=host_record,
         bonestore_namespace=bonestore_namespace,
         payloads=payloads,
+        name_suffix="main",
     )
+    lod_shadow_variants = []
+    for lod_variant in export_manifest.get("lod_variants", []) or []:
+        lod_shadow_hash = str(lod_variant.get("shadow_host_hash", "") or "").strip().lower()
+        lod_shadow_count = int(lod_variant.get("shadow_host_match_index_count", -1))
+        if not lod_shadow_hash or lod_shadow_count <= 0:
+            continue
+        palette_override_records = [
+            record
+            for record in lod_variant.get("palette_overrides", []) or []
+            if str(record.get("base_resource_suffix", "") or "").strip()
+            and str(record.get("resource_suffix", "") or "").strip()
+        ]
+        resource_suffix_by_base = {
+            str(record.get("base_resource_suffix", "")).strip(): str(record.get("resource_suffix", "")).strip()
+            for record in palette_override_records
+        }
+        if not resource_suffix_by_base:
+            continue
+        variant_payloads: list[ChunkSectionPayload] = []
+        for payload in payloads:
+            mapped_resource_suffix = resource_suffix_by_base.get(str(payload.resource_suffix))
+            if not mapped_resource_suffix:
+                continue
+            variant_payloads.append(
+                ChunkSectionPayload(
+                    ib_hash=str(payload.ib_hash),
+                    match_index_count=int(payload.match_index_count),
+                    chunk_index=int(payload.chunk_index),
+                    resource_suffix=mapped_resource_suffix,
+                    source_section_name=str(payload.source_section_name),
+                    payload_kind=str(payload.payload_kind),
+                    payload_lines=tuple(payload.payload_lines),
+                )
+            )
+        if not variant_payloads:
+            continue
+        lod_host_record = ShadowHostRecord(
+            draw_index=-1,
+            ib_hash=lod_shadow_hash,
+            match_index_count=lod_shadow_count,
+            vs_hash=str(lod_variant.get("shadow_host_vs_hash", "") or ""),
+        )
+        host_blocks.extend(
+            [
+                "",
+                *_build_generated_host_block(
+                    host_record=lod_host_record,
+                    bonestore_namespace=bonestore_namespace,
+                    payloads=variant_payloads,
+                    name_suffix=str(lod_variant.get("variant_id", "lod") or "lod"),
+                ),
+            ]
+        )
+        lod_shadow_variants.append(
+            {
+                "variant_id": str(lod_variant.get("variant_id", "lod") or "lod"),
+                "shadow_host_hash": lod_shadow_hash,
+                "shadow_host_match_index_count": lod_shadow_count,
+                "shadow_host_vs_hash": str(lod_variant.get("shadow_host_vs_hash", "") or ""),
+                "migrated_chunks": [
+                    {
+                        "base_resource_suffix": str(record.get("base_resource_suffix", "") or ""),
+                        "resource_suffix": str(record.get("resource_suffix", "") or ""),
+                    }
+                    for record in palette_override_records
+                ],
+            }
+        )
+    generated_host_lines = [_HOST_BEGIN_MARKER, *host_blocks, _HOST_END_MARKER]
 
     final_lines: list[str] = list(preamble_lines)
     for section in sections:
@@ -157,6 +227,7 @@ def generate_shadow_split(
             for payload in payloads
         ],
         "rewritten_source_sections": sorted(set(rewritten_section_names)),
+        "lod_shadow_variants": lod_shadow_variants,
     }
     write_json(normalized_export_manifest_path, export_manifest)
 
@@ -535,18 +606,23 @@ def _build_generated_host_block(
     host_record: ShadowHostRecord,
     bonestore_namespace: str,
     payloads: list[ChunkSectionPayload],
+    name_suffix: str = "",
 ) -> list[str]:
     section_name = (
         f"TextureOverride_BMC_ShadowHost_{host_record.ib_hash.lower()}_{int(host_record.match_index_count)}"
+        f"_{re.sub(r'[^0-9A-Za-z_]+', '_', str(name_suffix or 'host')).strip('_') or 'host'}"
     )
     lines = [
-        _HOST_BEGIN_MARKER,
         f"[{section_name}]",
         f"hash = {host_record.ib_hash.lower()}",
         f"match_index_count = {int(host_record.match_index_count)}",
         "match_priority = -300",
         "if vs == 200",
         f"  ps-t0 = {_WHITE_RESOURCE_NAME}",
+        f"  run = CustomShader\\{bonestore_namespace}\\_ExtractCB1",
+        f"  vs-t0 = Resource\\{bonestore_namespace}\\LocalFakeT0_SRV",
+        f"  run = CustomShader\\{bonestore_namespace}\\_RedirectCB1",
+        f"  vs-cb1 = Resource\\{bonestore_namespace}\\FakeCB1",
     ]
 
     for payload in payloads:
@@ -562,7 +638,6 @@ def _build_generated_host_block(
     lines.extend(
         [
             "endif",
-            _HOST_END_MARKER,
         ]
     )
     return lines

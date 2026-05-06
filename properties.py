@@ -45,6 +45,8 @@ class BMC_CandidateItem(bpy.types.PropertyGroup):
     draw_count: bpy.props.IntProperty(name="Draws", default=0, min=0)
     shadow_draw_count: bpy.props.IntProperty(name="Shadow Draws", default=0, min=0)
     shadow_capture_ready: bpy.props.BoolProperty(name="Shadow Capture", default=False)
+    lod_match_excluded: bpy.props.BoolProperty(name="Skip LOD Match", default=False)
+    lod_match_excluded_reason: bpy.props.StringProperty(name="LOD Skip Reason", default="")
     status: bpy.props.StringProperty(name="Status", default="")
     manual: bpy.props.BoolProperty(name="Manual", default=False)
 
@@ -95,6 +97,10 @@ class BMC_LodMappingItem(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(name="Enabled", default=True)
     canonical_global_bone: bpy.props.IntProperty(name="Canonical Global", default=0, min=0)
     mapped_lod_global_bone: bpy.props.IntProperty(name="LOD Global", default=-1, min=-1)
+    lod_record_key: bpy.props.StringProperty(name="LOD Source", default="")
+    lod_local_bone: bpy.props.IntProperty(name="LOD Local", default=-1, min=-1)
+    votes: bpy.props.IntProperty(name="Votes", default=0, min=0)
+    average_distance: bpy.props.FloatProperty(name="Avg Distance", default=0.0, min=0.0)
     status: bpy.props.StringProperty(name="Status", default="")
     score: bpy.props.FloatProperty(name="Score", default=0.0)
     note: bpy.props.StringProperty(name="Note", default="")
@@ -124,6 +130,8 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_lod_shadow_host_hash"),
     (bpy.types.Scene, "bmc_lod_shadow_host_match_index_count"),
     (bpy.types.Scene, "bmc_lod_shadow_host_vs_hash"),
+    (bpy.types.Scene, "bmc_lod_match_summary"),
+    (bpy.types.Scene, "bmc_lod_match_warning"),
     (bpy.types.Scene, "bmc_scan_auto_apply_mapping"),
     (bpy.types.Scene, "bmc_mapping_payload_json"),
     (bpy.types.Scene, "bmc_target_items"),
@@ -283,6 +291,16 @@ def register_addon_properties():
         name="LOD Last Shadow VS",
         default="",
         description="VS hash of the detected final vs==200 LOD shadow host draw.",
+    )
+    bpy.types.Scene.bmc_lod_match_summary = bpy.props.StringProperty(
+        name="LOD Match Summary",
+        default="",
+        description="Compact summary of the latest Analyze LOD result.",
+    )
+    bpy.types.Scene.bmc_lod_match_warning = bpy.props.StringProperty(
+        name="LOD Match Warning",
+        default="",
+        description="Most important warning from the latest Analyze LOD result.",
     )
     bpy.types.Scene.bmc_scan_auto_apply_mapping = bpy.props.BoolProperty(
         name="Auto remap after Scan",

@@ -66,6 +66,30 @@ class SyntheticCandidateImportTests(unittest.TestCase):
         self.assertEqual(order[1]["local_bone_count"], 2)
         self.assertFalse(order[1]["bone_capture_available"])
 
+    def test_bone_pool_order_keeps_dynamic_vb0_capture_available_but_excludes_lod(self):
+        candidates = [
+            {
+                "ib_hash": "aaaaaaaa",
+                "match_first_index": 0,
+                "match_index_count": 100,
+                "local_bone_count": 4,
+                "used_local_bone_indices": [0, 1],
+                "enabled": True,
+                "shadow_capture_ready": True,
+                "lod_match_excluded": True,
+                "lod_match_excluded_reason": "dynamic_vb0_backing_hash_mismatch",
+                "dynamic_vb0": True,
+            }
+        ]
+
+        order = main_analyze.build_bone_pool_order(candidates)
+
+        self.assertEqual(len(order), 1)
+        self.assertTrue(order[0]["bone_capture_available"])
+        self.assertTrue(order[0]["lod_match_excluded"])
+        self.assertEqual(order[0]["lod_match_excluded_reason"], "dynamic_vb0_backing_hash_mismatch")
+        self.assertEqual(order[0]["status"], "capture_ready_dynamic_vb0_lod_excluded")
+
     def test_analyzer_reads_r32_uint_blend_indices(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             buf_path = Path(temp_dir) / "blend.buf"
@@ -407,12 +431,28 @@ class MainFrameAnalysisAnalyzeTests(unittest.TestCase):
         self.assertLessEqual(candidate["local_bone_count"], candidate["source_local_bone_count"])
         self.assertEqual(candidate["skin_format"]["blend_weights_format"], "R32G32B32A32_FLOAT")
         self.assertEqual(candidate["skin_format"]["blend_indices_format"], "R32G32B32A32_UINT")
+        self.assertTrue(candidate["lod_match_excluded"])
+        self.assertEqual(candidate["position_stream"]["ib_backing_hash"], "9a09f1f0")
+        self.assertEqual(candidate["position_stream"]["vb0_backing_hash"], "1d6a6186")
         self.assertIn(12, candidate["shadow_draw_indices"])
         pool_names = {
             f"{entry['ib_hash']}-{entry['match_index_count']}-{entry['match_first_index']}"
             for entry in self.manifest["bone_pool_order"]
         }
         self.assertIn("2009f0d6-1356-0", pool_names)
+        pool_entry = next(
+            entry
+            for entry in self.manifest["bone_pool_order"]
+            if f"{entry['ib_hash']}-{entry['match_index_count']}-{entry['match_first_index']}" == "2009f0d6-1356-0"
+        )
+        self.assertTrue(pool_entry["bone_capture_available"])
+        self.assertTrue(pool_entry["lod_match_excluded"])
+
+    def test_main_static_vb0_ib_is_not_lod_excluded(self):
+        candidate = self._candidate("58870754-96-0")
+        self.assertFalse(candidate["lod_match_excluded"])
+        self.assertEqual(candidate["position_stream"]["ib_backing_hash"], "9a09f1f0")
+        self.assertEqual(candidate["position_stream"]["vb0_backing_hash"], "9a09f1f0")
 
     def _candidate(self, display_name: str) -> dict:
         for candidate in self.manifest["candidate_ibs"]:

@@ -529,6 +529,11 @@ def _build_candidate_entries(
             if _state_vs_hash(draw_states, dump_file) in shadow_vs_hashes
         ]
         import_state = draw_states.get(import_hit.draw_index)
+        position_stream = _build_position_stream_payload(files_by_draw, import_hit)
+        lod_match_excluded = _is_dynamic_vb0_position_stream(position_stream)
+        lod_match_excluded_reason = (
+            "dynamic_vb0_backing_hash_mismatch" if lod_match_excluded else ""
+        )
         manifest_hits = [import_hit] + [
             dump_file
             for dump_file in key_shadow_hits
@@ -550,9 +555,13 @@ def _build_candidate_entries(
             "source_local_bone_count": int(source_local_bone_count),
             "local_bone_count": int(source_local_bone_count),
             "texture_region_key": f"{ib_hash}-{index_count}-{first_index}",
-            "status": "capture_ready" if key_shadow_hits else "import_only_no_early_shadow",
+            "status": _candidate_runtime_status(bool(key_shadow_hits), lod_match_excluded),
             "import_paths": _build_import_paths_payload(files_by_draw, ordered_hits),
             "skin_format": _build_skin_format_payload(files_by_draw, import_hit),
+            "position_stream": position_stream,
+            "dynamic_vb0": lod_match_excluded,
+            "lod_match_excluded": lod_match_excluded,
+            "lod_match_excluded_reason": lod_match_excluded_reason,
             "manifest_hits": manifest_hits,
         }
         used_local_bone_indices = _infer_candidate_used_local_bone_indices(
@@ -591,6 +600,29 @@ def _build_candidate_entries(
             }
         )
     return candidates
+
+
+def _build_position_stream_payload(files_by_draw: dict[int, list[DumpFile]], import_hit: DumpFile) -> dict:
+    draw_files = files_by_draw.get(import_hit.draw_index, [])
+    vb0_file = _first_slot_file(draw_files, "vb0", "txt")
+    return {
+        "ib_hash": import_hit.resource_hash,
+        "ib_backing_hash": import_hit.backing_hash,
+        "vb0_hash": vb0_file.resource_hash if vb0_file else "",
+        "vb0_backing_hash": vb0_file.backing_hash if vb0_file else "",
+    }
+
+
+def _is_dynamic_vb0_position_stream(position_stream: dict) -> bool:
+    ib_backing_hash = str(position_stream.get("ib_backing_hash", "") or "").lower()
+    vb0_backing_hash = str(position_stream.get("vb0_backing_hash", "") or "").lower()
+    return bool(ib_backing_hash and vb0_backing_hash and ib_backing_hash != vb0_backing_hash)
+
+
+def _candidate_runtime_status(shadow_capture_ready: bool, lod_match_excluded: bool) -> str:
+    if lod_match_excluded:
+        return "capture_ready_dynamic_vb0_lod_excluded" if shadow_capture_ready else "import_only_dynamic_vb0_lod_excluded"
+    return "capture_ready" if shadow_capture_ready else "import_only_no_early_shadow"
 
 
 def _select_import_hit(
@@ -1009,7 +1041,7 @@ def _candidate_key_from_ib_dump(dump_file: DumpFile) -> tuple[str, int, int]:
     return dump_file.resource_hash.lower(), int(first_index), int(index_count)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=8192)
 def _parse_buffer_header(path: str) -> BufferHeader:
     header = BufferHeader()
     current_element: HeaderElement | None = None
@@ -1180,8 +1212,26 @@ def _build_import_paths_payload(files_by_draw: dict[int, list[DumpFile]], all_hi
     return {
         "ib": first_hit.path,
         "ib_buf": _binary_data_path_for_slot(first_draw_files, "ib"),
+        "ib_hash": first_hit.resource_hash,
+        "ib_backing_hash": first_hit.backing_hash,
         "vb": {
             slot: {
+                "hash": next(
+                    (
+                        dump_file.resource_hash
+                        for dump_file in first_draw_files
+                        if dump_file.slot == slot and dump_file.extension == "txt"
+                    ),
+                    "",
+                ),
+                "backing_hash": next(
+                    (
+                        dump_file.backing_hash
+                        for dump_file in first_draw_files
+                        if dump_file.slot == slot and dump_file.extension == "txt"
+                    ),
+                    "",
+                ),
                 "txt": [
                     dump_file.path
                     for dump_file in first_draw_files
@@ -1595,6 +1645,7 @@ def _binary_data_path_for_slot(draw_files: list[DumpFile], slot: str) -> str:
     return ""
 
 
+@lru_cache(maxsize=2048)
 def _read_max_blend_index(
     data_path: str,
     byte_offset: int,
@@ -1695,6 +1746,8 @@ def build_bone_pool_order(candidates: list[dict]) -> list[dict]:
             max(used_local_bone_indices) + 1,
         )
         capture_available = bool(candidate.get("shadow_capture_ready", False))
+        lod_match_excluded = bool(candidate.get("lod_match_excluded", False))
+        lod_match_excluded_reason = str(candidate.get("lod_match_excluded_reason", "") or "")
         payload.append(
             {
                 "ib_hash": str(candidate.get("ib_hash", "")),
@@ -1708,11 +1761,21 @@ def build_bone_pool_order(candidates: list[dict]) -> list[dict]:
                 "capture_store_base": int(next_base),
                 "shadow_capture_ready": capture_available,
                 "bone_capture_available": capture_available,
-                "status": "capture_ready" if capture_available else "bone_mapping_only_no_shadow_capture",
+                "lod_match_excluded": lod_match_excluded,
+                "lod_match_excluded_reason": lod_match_excluded_reason,
+                "dynamic_vb0": bool(candidate.get("dynamic_vb0", lod_match_excluded)),
+                "position_stream": dict(candidate.get("position_stream", {}) or {}),
+                "status": _pool_record_status(capture_available, lod_match_excluded),
             }
         )
         next_base += max(0, local_bone_count)
     return payload
+
+
+def _pool_record_status(capture_available: bool, lod_match_excluded: bool) -> str:
+    if lod_match_excluded:
+        return "capture_ready_dynamic_vb0_lod_excluded" if capture_available else "bone_mapping_only_dynamic_vb0_lod_excluded"
+    return "capture_ready" if capture_available else "bone_mapping_only_no_shadow_capture"
 
 
 def _candidate_used_local_bone_indices(candidate: dict) -> list[int]:

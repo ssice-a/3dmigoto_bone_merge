@@ -24,7 +24,10 @@ class BMC_UL_candidate_items(bpy.types.UIList):
             row.label(text=item.display_name or item.ib_hash or "(candidate)")
             row.label(text=f"idx {int(item.match_index_count)}")
             row.label(text=f"bones {int(item.local_bone_count)}")
-            row.label(text="capture" if item.shadow_capture_ready else "map")
+            if item.lod_match_excluded:
+                row.label(text="noLOD")
+            else:
+                row.label(text="capture" if item.shadow_capture_ready else "map")
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text=item.ib_hash or "?")
@@ -83,8 +86,12 @@ class BMC_UL_lod_mapping_items(bpy.types.UIList):
         if self.layout_type in {"DEFAULT", "COMPACT"}:
             row = layout.row(align=True)
             row.prop(item, "enabled", text="")
-            row.label(text=f"{item.canonical_global_bone} -> {item.mapped_lod_global_bone}")
+            if item.lod_record_key:
+                row.label(text=f"G{item.canonical_global_bone} -> {item.lod_record_key}:{item.lod_local_bone}")
+            else:
+                row.label(text=f"G{item.canonical_global_bone} -> unmatched")
             row.label(text=item.status or "unmatched")
+            row.label(text=f"v{int(item.votes)}")
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text=str(item.canonical_global_bone))
@@ -114,6 +121,22 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         lod_row = scan_box.row(align=True)
         lod_row.prop(scene, "bmc_lod_frameanalysis_dir", text="LOD")
         lod_row.operator("object.bmc_analyze_lod_frameanalysis", icon="MESH_GRID", text="Analyze LOD")
+        if scene.bmc_lod_match_summary:
+            icon = "CHECKMARK" if not scene.bmc_lod_match_warning else "ERROR"
+            scan_box.label(text=scene.bmc_lod_match_summary, icon=icon)
+        if scene.bmc_lod_match_warning:
+            scan_box.label(text=scene.bmc_lod_match_warning, icon="ERROR")
+        if scene.bmc_lod_mapping_items:
+            row = scan_box.row()
+            row.template_list(
+                "BMC_UL_lod_mapping_items",
+                "",
+                scene,
+                "bmc_lod_mapping_items",
+                scene,
+                "bmc_lod_mapping_index",
+                rows=4,
+            )
         add_row = scan_box.row(align=True)
         add_row.prop(scene, "bmc_candidate_add_hash", text="")
         row = scan_box.row()
@@ -138,6 +161,7 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
             scan_box.prop(candidate, "import_draw_index")
             scan_box.prop(candidate, "local_bone_count")
             scan_box.prop(candidate, "shadow_capture_ready")
+            scan_box.prop(candidate, "lod_match_excluded")
             scan_box.prop(candidate, "status")
 
         export_box = layout.box()

@@ -638,9 +638,12 @@ After Build Global Bone Pool, the addon creates empty child collections for ever
 <root export collection>
   <ib_hash>-<match_index_count>-0
   <ib_hash>-<match_index_count>-0-NO_CAPTURE_BONES
+  <ib_hash>-<match_index_count>-0-NO_LOD_DYNAMIC_VB0
 ```
 
 These child collections are the export contract. Final INI identity, `match_index_count`, palette generation, and delayed shadow replay all derive from the child collection name. Mesh object names are not final export identity. The `NO_CAPTURE_BONES` suffix marks mapping-only candidates: their own native matrices were not captured in the early shadow stage, but the collection can still host meshes that use other captured global bones.
+
+`NO_LOD_DYNAMIC_VB0` marks candidates whose imported `vb0` position stream is not from the same backing buffer as the IB/static VB family. In the observed eyelash case `2009f0d6-1356-0`, `ib` is backed by `9a09f1f0` while `vb0` is backed by CPU-uploaded `1d6a6186`; this means the geometry is already preprocessed/pre-skinned for the pass and is not a stable spatial source for LOD matching. These entries may still be capture-ready in the main pool, but LOD matching and LOD coverage review must ignore their global slots explicitly.
 
 Users manually move/edit/copy objects into the desired child collections for export.
 
@@ -1020,11 +1023,15 @@ This preserves the runtime bone-store semantics and avoids event-order drift whe
   "source_local_bone_count": 83,
   "used_local_bone_indices": [0, 1, 4, 9],
   "capture_store_base": 378,
-  "bone_capture_available": true
+  "bone_capture_available": true,
+  "lod_match_excluded": false,
+  "lod_match_excluded_reason": ""
 }
 ```
 
 `bone_pool_order` is compact. It allocates one global slot per entry in `used_local_bone_indices`, not one slot per number in `0..max_local`. Capture-ready candidates are sorted first; mapping-only/no-shadow candidates are sorted after them and are marked `bone_capture_available=false`.
+
+`bone_capture_available` and `lod_match_excluded` are separate concepts. A dynamic/pre-skinned `vb0` candidate can still be `bone_capture_available=true` for main runtime capture while `lod_match_excluded=true` prevents the LOD matcher from using its positions or requiring the LOD scatter pass to fill its global slots.
 
 The global bone index and capture-store index have the same meaning in HLSL. Exported chunk palettes must reference these indices exactly. Runtime capture for sparse native palettes must use the same `used_local_bone_indices` table so local source bone `248` can be written to compact global slot `base + compact_index`, not blindly to `base + 248`.
 
@@ -1107,6 +1114,8 @@ The inline `pairs` array is for diagnostics and project portability. The generat
 ```
 
 The first implementation writes these LOD fields into the main capture manifest only. INI/HLSL generation should consume the same fields later, but Analyze LOD itself must not emit runtime files yet.
+
+For performance, Analyze LOD must use a lightweight point-cloud reader that loads only IB, POSITION, BLENDWEIGHTS, and BLENDINDICES. It must not run the full Blender import decode path for UVs, normals, or custom attributes. Before nearest-neighbor voting, weighted point clouds are compressed with semantic-preserving spatial buckets so runtime-scale meshes do not require every source vertex to participate in matching.
 
 #### validation
 
@@ -1354,7 +1363,7 @@ The intended user flow is:
 1. Analyze Main.
 2. Import selected main candidates.
 3. User deletes unwanted candidates from the Candidate IB list or refreshes the list from collection objects.
-4. Build Global Bone Pool from enabled candidates; capture-ready entries are first, mapping-only entries are marked unavailable.
+4. Build Global Bone Pool from enabled candidates; capture-ready entries are first, mapping-only entries are marked unavailable, and dynamic/pre-skinned `vb0` entries are marked as no-LOD sources.
 5. Analyze LOD.
 6. Generate runtime buffers and INI.
 ```
@@ -1368,7 +1377,7 @@ Candidate IB List:
   enabled + local_bone_count > 0 entries control Build Global Bone Pool
 ```
 
-The LOD analyzer must consume the built global pool, not the full Candidate IB list. Imported candidates that the user deleted or disabled must not pollute LOD matching. Mapping-only/no-shadow candidates can appear in the pool, but they must not be treated as native capture sources unless an LOD mapping explicitly provides a valid capture path.
+The LOD analyzer must consume the built global pool, not the full Candidate IB list. Imported candidates that the user deleted or disabled must not pollute LOD matching. Mapping-only/no-shadow candidates can appear in the pool, but they must not be treated as native capture sources unless an LOD mapping explicitly provides a valid capture path. Dynamic/pre-skinned `vb0` candidates are a special ignored class: their collection and pool record are marked, their geometry is skipped when building the canonical/LOD point clouds, and their global slots are not counted as required missing bones during LOD review.
 
 ### Main To LOD Draw Linking
 

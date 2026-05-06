@@ -95,10 +95,13 @@ def _export_chunk_collection_name(
     chunk_index: int = 0,
     *,
     bone_capture_available: bool = True,
+    lod_match_excluded: bool = False,
 ) -> str:
     chunk_name = f"{ib_hash.lower()}-{int(match_index_count)}-{int(chunk_index)}"
     if not bone_capture_available:
         chunk_name += "-NO_CAPTURE_BONES"
+    if lod_match_excluded:
+        chunk_name += "-NO_LOD_DYNAMIC_VB0"
     return chunk_name
 
 
@@ -109,24 +112,30 @@ def _ensure_export_chunk_collection(
     chunk_index: int = 0,
     *,
     bone_capture_available: bool = True,
+    lod_match_excluded: bool = False,
 ):
     chunk_name = _export_chunk_collection_name(
         ib_hash,
         match_index_count,
         chunk_index,
         bone_capture_available=bone_capture_available,
+        lod_match_excluded=lod_match_excluded,
     )
     for child in parent_collection.children:
         identity = _resolve_export_chunk_collection_identity(child)
         if identity == (str(ib_hash or "").lower(), int(match_index_count), int(chunk_index)):
             if child.name != chunk_name and bpy.data.collections.get(chunk_name) is None:
                 child.name = chunk_name
+            child["bmc_bone_capture_available"] = bool(bone_capture_available)
+            child["bmc_lod_match_excluded"] = bool(lod_match_excluded)
             return child
     collection = bpy.data.collections.get(chunk_name)
     if collection is None:
         collection = bpy.data.collections.new(chunk_name)
     if all(child.name != collection.name for child in parent_collection.children):
         parent_collection.children.link(collection)
+    collection["bmc_bone_capture_available"] = bool(bone_capture_available)
+    collection["bmc_lod_match_excluded"] = bool(lod_match_excluded)
     return collection
 
 
@@ -177,6 +186,7 @@ def _ensure_export_chunk_collection_if_missing(
     chunk_index: int = 0,
     *,
     bone_capture_available: bool = True,
+    lod_match_excluded: bool = False,
 ) -> bool:
     identity = (str(ib_hash or "").lower(), int(match_index_count), int(chunk_index))
     existed_under_parent = any(_resolve_export_chunk_collection_identity(child) == identity for child in parent_collection.children)
@@ -186,6 +196,7 @@ def _ensure_export_chunk_collection_if_missing(
         match_index_count,
         chunk_index,
         bone_capture_available=bone_capture_available,
+        lod_match_excluded=lod_match_excluded,
     )
     return not existed_under_parent
 
@@ -603,11 +614,27 @@ def _replace_lod_mapping_items(scene, mapping_entries: list[dict]) -> None:
         item = scene.bmc_lod_mapping_items.add()
         item.enabled = bool(mapping_entry.get("enabled", True))
         item.canonical_global_bone = int(mapping_entry.get("canonical_global_bone", 0))
-        item.mapped_lod_global_bone = int(mapping_entry.get("mapped_lod_global_bone", -1))
+        item.mapped_lod_global_bone = int(mapping_entry.get("mapped_lod_global_bone", mapping_entry.get("lod_local_bone", -1)))
+        item.lod_record_key = str(mapping_entry.get("lod_record_key", "") or "")
+        item.lod_local_bone = int(mapping_entry.get("lod_local_bone", -1))
+        item.votes = int(mapping_entry.get("votes", 0) or 0)
+        item.average_distance = float(mapping_entry.get("average_distance", 0.0) or 0.0)
         item.status = str(mapping_entry.get("status", ""))
         item.score = float(mapping_entry.get("score", 0.0))
-        item.note = str(mapping_entry.get("note", ""))
+        item.note = str(mapping_entry.get("note", "") or _lod_mapping_note(mapping_entry))
     scene.bmc_lod_mapping_index = min(scene.bmc_lod_mapping_index, max(0, len(scene.bmc_lod_mapping_items) - 1))
+
+
+def _lod_mapping_note(mapping_entry: dict) -> str:
+    status = str(mapping_entry.get("status", ""))
+    if status == "matched":
+        return (
+            f"{mapping_entry.get('lod_record_key', '')}: local {int(mapping_entry.get('lod_local_bone', -1))}, "
+            f"votes {int(mapping_entry.get('votes', 0) or 0)}, score {float(mapping_entry.get('score', 0.0) or 0.0):.3f}"
+        )
+    if status == "ignored_lod_match_excluded":
+        return "ignored: dynamic/pre-skinned vb0 source"
+    return "unmatched"
 
 
 def _canonical_mesh_entries_for_lod_build(scene, payload: dict) -> list[tuple[object, dict]]:
@@ -831,6 +858,8 @@ def _replace_candidate_items_from_manifest(scene, manifest: dict) -> None:
         item.draw_count = len(candidate.get("draw_indices", []) or [])
         item.shadow_draw_count = len(candidate.get("shadow_draw_indices", []) or [])
         item.shadow_capture_ready = bool(candidate.get("shadow_capture_ready", bool(candidate.get("shadow_draw_indices"))))
+        item.lod_match_excluded = bool(candidate.get("lod_match_excluded", False))
+        item.lod_match_excluded_reason = str(candidate.get("lod_match_excluded_reason", "") or "")
         item.status = str(candidate.get("status", "") or ("capture_ready" if item.shadow_capture_ready else "import_only_no_early_shadow"))
         item.manual = False
     scene.bmc_candidate_index = min(scene.bmc_candidate_index, max(0, len(scene.bmc_candidate_items) - 1))
@@ -879,6 +908,8 @@ def _apply_candidate_payload_to_item(item, candidate: dict, *, manual: bool = Fa
     item.draw_count = len(candidate.get("draw_indices", []) or [])
     item.shadow_draw_count = len(candidate.get("shadow_draw_indices", []) or [])
     item.shadow_capture_ready = bool(candidate.get("shadow_capture_ready", bool(candidate.get("shadow_draw_indices"))))
+    item.lod_match_excluded = bool(candidate.get("lod_match_excluded", False))
+    item.lod_match_excluded_reason = str(candidate.get("lod_match_excluded_reason", "") or "")
     item.status = str(candidate.get("status", "") or ("capture_ready" if item.shadow_capture_ready else "manual_or_import_only"))
     item.manual = bool(manual)
 
@@ -919,6 +950,12 @@ def _candidate_payload_from_item(item, manifest: dict | None = None) -> dict:
         }
     candidate["enabled"] = bool(getattr(item, "enabled", True))
     candidate["shadow_capture_ready"] = bool(getattr(item, "shadow_capture_ready", False))
+    candidate["lod_match_excluded"] = bool(getattr(item, "lod_match_excluded", candidate.get("lod_match_excluded", False)))
+    candidate["lod_match_excluded_reason"] = str(
+        getattr(item, "lod_match_excluded_reason", candidate.get("lod_match_excluded_reason", "")) or ""
+    )
+    if candidate["lod_match_excluded"] and not candidate["lod_match_excluded_reason"]:
+        candidate["lod_match_excluded_reason"] = "manual_lod_match_excluded"
     candidate["status"] = str(getattr(item, "status", "") or candidate.get("status", ""))
     return candidate
 
@@ -1036,6 +1073,7 @@ def _global_pool_generation_id(manifest: dict, bone_pool_order: list[dict] | Non
             str(int(item.get("local_bone_count", 0) or 0)),
             ",".join(str(int(value)) for value in item.get("used_local_bone_indices", []) or []),
             "capture" if bool(item.get("bone_capture_available", item.get("shadow_capture_ready", False))) else "mapping",
+            "no_lod" if bool(item.get("lod_match_excluded", False)) else "lod",
         )
         for item in order
     ]
@@ -2766,16 +2804,21 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
             export_collection = _ensure_export_collection(context)
             created_count = 0
             unavailable_count = 0
+            lod_excluded_count = 0
             for record in bone_pool_order:
                 capture_available = bool(record.get("bone_capture_available", record.get("shadow_capture_ready", False)))
+                lod_match_excluded = bool(record.get("lod_match_excluded", False))
                 if not capture_available:
                     unavailable_count += 1
+                if lod_match_excluded:
+                    lod_excluded_count += 1
                 if _ensure_export_chunk_collection_if_missing(
                     export_collection,
                     str(record.get("ib_hash", "") or ""),
                     int(record.get("match_index_count", 0) or 0),
                     0,
                     bone_capture_available=capture_available,
+                    lod_match_excluded=lod_match_excluded,
                 ):
                     created_count += 1
             _update_scene_mapping_payload(scene, manifest_path)
@@ -2789,6 +2832,8 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
         message += f"; compact bones {sum(int(item.get('local_bone_count', 0)) for item in bone_pool_order)}"
         if unavailable_count > 0:
             message += f"; {unavailable_count} mapping-only IB(s)"
+        if lod_excluded_count > 0:
+            message += f"; {lod_excluded_count} no-LOD IB(s)"
         if skipped_count > 0:
             message += f"; skipped {skipped_count} invalid IB(s)"
         self.report({"INFO"}, message)
@@ -2876,6 +2921,7 @@ class BMC_OT_analyze_lod_frameanalysis(bpy.types.Operator):
             manifest["lod_links"] = list(lod_result.get("lod_links", []) or [])
             manifest["lod_capture_records"] = list(lod_result.get("lod_capture_records", []) or [])
             manifest["lod_mapping"] = list(lod_result.get("lod_mapping", []) or [])
+            manifest["lod_review"] = dict(lod_result.get("lod_review", {}) or {})
             manifest["lod_validation"] = list(lod_result.get("validation", []) or [])
             manifest["lod_manifest_snapshot"] = dict(lod_result.get("lod_manifest_snapshot", {}) or {})
             manifest.setdefault("validation", []).append(
@@ -2888,6 +2934,7 @@ class BMC_OT_analyze_lod_frameanalysis(bpy.types.Operator):
             )
             write_json(manifest_path, manifest)
             _update_scene_mapping_payload(scene, manifest_path)
+            _replace_lod_mapping_items(scene, manifest["lod_mapping"])
         except Exception as exc:
             self.report({"ERROR"}, f"Analyze LOD failed: {exc}")
             return {"CANCELLED"}
@@ -2901,10 +2948,21 @@ class BMC_OT_analyze_lod_frameanalysis(bpy.types.Operator):
         scene.bmc_lod_shadow_host_vs_hash = str(shadow_stage.get("transparent_vs_hash", "") or shadow_stage.get("normal_vs_hash", "") or "")
         matched_count = int(frame_record.get("matched_global_bone_count", 0) or 0)
         total_count = int(frame_record.get("total_global_bone_count", 0) or 0)
+        required_count = int(frame_record.get("required_global_bone_count", total_count) or 0)
+        ignored_count = int(frame_record.get("ignored_lod_global_bone_count", 0) or 0)
         capture_count = len(manifest.get("lod_capture_records", []) or [])
+        review = dict(manifest.get("lod_review", {}) or {})
+        runtime_safe = bool(review.get("runtime_safe", False))
+        missing_count = int(review.get("missing_global_bone_count", 0) or 0)
+        coverage = (matched_count / required_count * 100.0) if required_count > 0 else 0.0
+        scene.bmc_lod_match_summary = (
+            f"LOD {'OK' if runtime_safe else 'BLOCKED'}: matched {matched_count}/{required_count} "
+            f"required bones ({coverage:.1f}%), ignored {ignored_count}, missing {missing_count}, "
+            f"{capture_count} capture records"
+        )
         self.report(
             {"INFO"},
-            f"Analyzed LOD: matched {matched_count}/{total_count} global bone(s); capture records {capture_count}",
+            f"Analyzed LOD: matched {matched_count}/{required_count} required global bone(s); ignored {ignored_count}; capture records {capture_count}",
         )
         lod_warnings = list(manifest.get("lod_validation", []) or [])
         warning_messages = [
@@ -2912,6 +2970,7 @@ class BMC_OT_analyze_lod_frameanalysis(bpy.types.Operator):
             for item in lod_warnings
             if str(item.get("severity", "")).lower() in {"warning", "error"} and str(item.get("message", ""))
         ]
+        scene.bmc_lod_match_warning = warning_messages[0] if warning_messages else ""
         if warning_messages:
             self.report({"WARNING"}, " | ".join(warning_messages[:3]))
         return {"FINISHED"}

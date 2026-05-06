@@ -60,6 +60,107 @@ class LodAnalyzeTests(unittest.TestCase):
             [(4, 10), (4, 11)],
         )
 
+    def test_review_blocks_when_global_pool_is_not_filled(self):
+        manifest = {
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_index_count": 10,
+                    "match_first_index": 0,
+                    "global_bone_base": 0,
+                    "local_bone_count": 3,
+                    "bone_capture_available": True,
+                }
+            ]
+        }
+        capture_records = [
+            {
+                "lod_record_key": "lod_a-3-0",
+                "scatter_pairs": [
+                    {"lod_local_bone": 0, "canonical_global_bone": 0},
+                    {"lod_local_bone": 1, "canonical_global_bone": 2},
+                ],
+            }
+        ]
+
+        review = lod_analyze.review_lod_global_pool_coverage(manifest, capture_records)
+
+        self.assertFalse(review["runtime_safe"])
+        self.assertEqual(review["filled_global_bone_count"], 2)
+        self.assertEqual(review["missing_global_bone_count"], 1)
+        self.assertEqual(review["missing_capture_ready_count"], 1)
+        self.assertEqual(review["missing_by_record"][0]["missing_global_bones"], [1])
+        self.assertEqual(review["validation"][0]["severity"], "error")
+
+    def test_review_accepts_fully_filled_global_pool(self):
+        manifest = {
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_index_count": 10,
+                    "match_first_index": 0,
+                    "global_bone_base": 4,
+                    "local_bone_count": 2,
+                    "bone_capture_available": True,
+                }
+            ]
+        }
+        capture_records = [
+            {
+                "lod_record_key": "lod_a-3-0",
+                "scatter_pairs": [
+                    {"lod_local_bone": 0, "canonical_global_bone": 4},
+                    {"lod_local_bone": 0, "canonical_global_bone": 5},
+                ],
+            }
+        ]
+
+        review = lod_analyze.review_lod_global_pool_coverage(manifest, capture_records)
+
+        self.assertTrue(review["runtime_safe"])
+        self.assertEqual(review["missing_global_bone_count"], 0)
+        self.assertEqual(review["validation"], [])
+
+    def test_review_ignores_lod_excluded_dynamic_vb0_records(self):
+        manifest = {
+            "bone_pool_order": [
+                {
+                    "ib_hash": "dynamic1",
+                    "match_index_count": 10,
+                    "match_first_index": 0,
+                    "global_bone_base": 0,
+                    "local_bone_count": 3,
+                    "bone_capture_available": True,
+                    "lod_match_excluded": True,
+                    "lod_match_excluded_reason": "dynamic_vb0_backing_hash_mismatch",
+                },
+                {
+                    "ib_hash": "static01",
+                    "match_index_count": 20,
+                    "match_first_index": 0,
+                    "global_bone_base": 3,
+                    "local_bone_count": 1,
+                    "bone_capture_available": True,
+                },
+            ]
+        }
+        capture_records = [
+            {
+                "lod_record_key": "lod_a-3-0",
+                "scatter_pairs": [
+                    {"lod_local_bone": 0, "canonical_global_bone": 3},
+                ],
+            }
+        ]
+
+        review = lod_analyze.review_lod_global_pool_coverage(manifest, capture_records)
+
+        self.assertTrue(review["runtime_safe"])
+        self.assertEqual(review["required_global_bone_count"], 1)
+        self.assertEqual(review["ignored_lod_global_bone_count"], 3)
+        self.assertEqual(review["missing_global_bone_count"], 0)
+        self.assertEqual(review["ignored_by_record"][0]["source_key"], "dynamic1-10-0")
+
 
 if __name__ == "__main__":
     unittest.main()

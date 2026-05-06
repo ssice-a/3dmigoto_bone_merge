@@ -50,7 +50,6 @@ def resolve_preset_workspace_paths(preset_name: str) -> dict[str, str | int]:
         "manifest_path": "",
         "ini_path": "",
         "export_manifest_path": "",
-        "source_ini_path": str(workspace.get("source_ini_path", "") or ""),
         "shadow_host_hash": "",
         "shadow_host_match_index_count": -1,
         "shadow_host_vs_hash": "",

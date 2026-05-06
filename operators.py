@@ -42,7 +42,6 @@ from .core.lod_analyze import analyze_lod_for_manifest, review_lod_global_pool_c
 from .core.lod_fallback import apply_lod_fallbacks_to_manifest, preview_lod_fallbacks_for_export
 from .core.lod_runtime import build_lod_mapping, scan_lod_targets_and_generate_manifest
 from .core.main_analyze import build_bone_pool_order, write_main_analysis_manifest
-from .core.shadow_split import generate_shadow_split
 from .core.seam_matcher import apply_seam_mapping, build_and_apply_seam_mapping, build_seam_mapping
 from .core.workflow import scan_targets_and_generate_outputs
 from .core.models import TargetObjectSpec
@@ -2199,54 +2198,6 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         self.report(
             {"INFO"},
             f"Prepared {result['objects']} object(s), {result['palettes']} palette(s); wrote 3Dmigoto files to {result['output_dir']}",
-        )
-        return {"FINISHED"}
-
-
-class BMC_OT_generate_shadow_split(bpy.types.Operator):
-    bl_idname = "object.bmc_generate_shadow_split"
-    bl_label = "Modify Main INI"
-    bl_description = "Rewrite the source mod INI so vs==200 shadow draws move to the last shadow host and consume the latest exported BoneStore local palettes"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        scene = context.scene
-        has_manual_shadow_host = bool(
-            scene
-            and scene.bmc_shadow_host_hash
-            and int(scene.bmc_shadow_host_match_index_count) > 0
-        )
-        return bool(
-            scene
-            and (scene.bmc_frameanalysis_dir or has_manual_shadow_host)
-            and scene.bmc_export_manifest_path
-            and scene.bmc_ini_path
-            and scene.bmc_source_ini_path
-        )
-
-    def execute(self, context):
-        scene = context.scene
-        try:
-            result = generate_shadow_split(
-                frameanalysis_dir=bpy.path.abspath(scene.bmc_frameanalysis_dir),
-                export_manifest_path=bpy.path.abspath(scene.bmc_export_manifest_path),
-                bonestore_ini_path=bpy.path.abspath(scene.bmc_ini_path),
-                source_ini_path=bpy.path.abspath(scene.bmc_source_ini_path),
-                shadow_host_hash=scene.bmc_shadow_host_hash,
-                shadow_host_match_index_count=int(scene.bmc_shadow_host_match_index_count),
-            )
-        except Exception as exc:
-            self.report({"ERROR"}, f"Shadow split failed: {exc}")
-            return {"CANCELLED"}
-
-        scene.bmc_source_ini_path = result.source_ini_path
-        scene.bmc_shadow_host_hash = result.shadow_host_hash
-        scene.bmc_shadow_host_match_index_count = int(result.shadow_host_match_index_count)
-        scene.bmc_shadow_host_vs_hash = result.shadow_host_vs_hash
-        self.report(
-            {"INFO"},
-            f"Shadow split updated {result.rewritten_sections} section(s); migrated {result.migrated_chunks} chunk(s) via host {result.shadow_host_hash}-{result.shadow_host_match_index_count}",
         )
         return {"FINISHED"}
 

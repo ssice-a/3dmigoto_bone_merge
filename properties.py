@@ -135,7 +135,6 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_export_collection"),
     (bpy.types.Scene, "bmc_export_build_collection"),
     (bpy.types.Scene, "bmc_export_manifest_path"),
-    (bpy.types.Scene, "bmc_source_ini_path"),
     (bpy.types.Scene, "bmc_shadow_host_hash"),
     (bpy.types.Scene, "bmc_shadow_host_match_index_count"),
     (bpy.types.Scene, "bmc_shadow_host_vs_hash"),
@@ -269,12 +268,6 @@ def register_addon_properties():
         default="",
         subtype="FILE_PATH",
         description="Authoritative export manifest path produced by the latest Prepare Export run.",
-    )
-    bpy.types.Scene.bmc_source_ini_path = bpy.props.StringProperty(
-        name="Main INI",
-        default="",
-        subtype="FILE_PATH",
-        description="Source mod INI that should receive the generated last-shadow-host split logic.",
     )
     bpy.types.Scene.bmc_shadow_host_hash = bpy.props.StringProperty(
         name="Shadow Host Hash",

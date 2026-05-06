@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..constants import CAPTURE_MANIFEST_FILE_NAME
+from .data_types import annotate_vertex_layout
 from .io import write_json
 
 
@@ -212,6 +213,8 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
             ),
         )
     ]
+    for candidate in candidates:
+        candidate["vertex_layout_key"] = _candidate_source_key(candidate)
 
     included_key_index = {
         (str(candidate["ib_hash"]), int(candidate["match_first_index"]), int(candidate["match_index_count"])): key_index[
@@ -221,6 +224,7 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
         if (str(candidate["ib_hash"]), int(candidate["match_first_index"]), int(candidate["match_index_count"])) in key_index
     }
     texture_candidates = _build_texture_candidates(files_by_draw, included_key_index)
+    vertex_layout_table = _build_vertex_layout_table(normalized_frameanalysis_dir, candidates)
     bone_pool_order = build_bone_pool_order(candidates)
     payload = {
         "schema_version": 1,
@@ -243,6 +247,7 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
             "host_match_index_count": int(host_key[2]),
         },
         "candidate_ibs": candidates,
+        "vertex_layout_table": vertex_layout_table,
         "draw_hits": draw_hits,
         "texture_candidates": texture_candidates,
         "producer_dispatches": [],
@@ -1258,6 +1263,124 @@ def _build_import_paths_payload(files_by_draw: dict[int, list[DumpFile]], all_hi
         },
         "layout": "",
     }
+
+
+def _candidate_source_key(candidate: dict) -> str:
+    return (
+        f"{str(candidate.get('ib_hash', '') or '').lower()}-"
+        f"{int(candidate.get('match_index_count', 0) or 0)}-"
+        f"{int(candidate.get('match_first_index', 0) or 0)}"
+    )
+
+
+def _build_vertex_layout_table(frameanalysis_dir: str, candidates: list[dict]) -> dict:
+    table: dict[str, dict] = {}
+    for candidate in candidates:
+        key = str(candidate.get("vertex_layout_key", "") or _candidate_source_key(candidate))
+        table[key] = _build_candidate_vertex_layout(frameanalysis_dir, candidate)
+    return table
+
+
+def _build_candidate_vertex_layout(frameanalysis_dir: str, candidate: dict) -> dict:
+    import_paths = dict(candidate.get("import_paths", {}) or {})
+    layout = {
+        "source_key": str(candidate.get("vertex_layout_key", "") or _candidate_source_key(candidate)),
+        "ib_hash": str(candidate.get("ib_hash", "") or "").lower(),
+        "import_vs_hash": str(candidate.get("import_vs_hash", "") or "").lower(),
+        "match_first_index": int(candidate.get("match_first_index", 0) or 0),
+        "match_index_count": int(candidate.get("match_index_count", 0) or 0),
+        "ib": _build_index_layout(frameanalysis_dir, import_paths),
+        "vertex_buffers": {},
+    }
+    vb_payload = dict(import_paths.get("vb", {}) or {})
+    for slot_name, slot_payload in sorted(vb_payload.items(), key=lambda item: _slot_index(str(item[0]))):
+        slot_index = _slot_index(str(slot_name))
+        if slot_index < 0:
+            continue
+        slot_layout = _build_vertex_slot_layout(frameanalysis_dir, str(slot_name), slot_index, dict(slot_payload or {}))
+        if slot_layout:
+            layout["vertex_buffers"][str(slot_name)] = slot_layout
+    return annotate_vertex_layout(layout, str(candidate.get("import_vs_hash", "") or ""))
+
+
+def _build_index_layout(frameanalysis_dir: str, import_paths: dict) -> dict:
+    ib_path = _resolve_manifest_path(str(import_paths.get("ib", "") or ""), frameanalysis_dir)
+    if not ib_path or not os.path.exists(ib_path):
+        return {}
+    header = _parse_buffer_header(ib_path)
+    return {
+        "format": str(header.fmt or ""),
+        "byte_offset": int(header.byte_offset),
+        "first_index": int(header.first_index),
+        "index_count": int(header.index_count),
+        "topology": str(header.topology or ""),
+        "source_txt": _relpath(ib_path, frameanalysis_dir),
+        "source_buf": _relpath(str(import_paths.get("ib_buf", "") or ""), frameanalysis_dir),
+    }
+
+
+def _build_vertex_slot_layout(frameanalysis_dir: str, slot_name: str, slot_index: int, slot_payload: dict) -> dict:
+    header_paths = _layout_header_paths(frameanalysis_dir, slot_payload)
+    if not header_paths:
+        return {}
+    header = _first_valid_layout_header(header_paths)
+    if int(header.stride) <= 0 or int(header.vertex_count) <= 0:
+        return {}
+    fields = [
+        element.to_dict()
+        for element in header.elements
+        if int(element.input_slot) == int(slot_index)
+    ]
+    return {
+        "slot": slot_name,
+        "slot_index": int(slot_index),
+        "resource_hash": str(slot_payload.get("hash", "") or "").lower(),
+        "backing_hash": str(slot_payload.get("backing_hash", "") or "").lower(),
+        "stride": int(header.stride),
+        "vertex_count": int(header.vertex_count),
+        "byte_offset": int(header.byte_offset),
+        "source_txt": [_relpath(path, frameanalysis_dir) for path in _resolve_manifest_paths(slot_payload.get("txt", []), frameanalysis_dir)],
+        "source_layout_txt": [_relpath(path, frameanalysis_dir) for path in header_paths],
+        "source_buf": _relpath(str(slot_payload.get("buf", "") or ""), frameanalysis_dir),
+        "fields": fields,
+    }
+
+
+def _layout_header_paths(frameanalysis_dir: str, slot_payload: dict) -> list[str]:
+    return [
+        path
+        for path in _resolve_manifest_paths(
+            list(slot_payload.get("layout_txt", []) or []) + list(slot_payload.get("txt", []) or []),
+            frameanalysis_dir,
+        )
+        if os.path.exists(path)
+    ]
+
+
+def _resolve_manifest_paths(paths, frameanalysis_dir: str) -> list[str]:
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths or []:
+        path = _resolve_manifest_path(str(raw_path or ""), frameanalysis_dir)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        resolved.append(path)
+    return resolved
+
+
+def _resolve_manifest_path(path: str, frameanalysis_dir: str) -> str:
+    if not path:
+        return ""
+    return os.path.abspath(path) if os.path.isabs(path) else os.path.abspath(os.path.join(frameanalysis_dir, path))
+
+
+def _first_valid_layout_header(paths: list[str]) -> BufferHeader:
+    for path in paths:
+        header = _parse_buffer_header(path)
+        if int(header.stride) > 0 and int(header.vertex_count) > 0:
+            return header
+    return _parse_buffer_header(paths[0])
 
 
 def _build_skin_format_payload(files_by_draw: dict[int, list[DumpFile]], import_hit: DumpFile) -> dict:

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "source": "manual_from_disassembled_vs_replace",
+  "contracts": {
+    "9bac7486f7930a24": {
+      "label": "static_skinned_tangent_material",
+      "inputs": [
+        {"register": "v0", "semantic": "POSITION0", "components": "xyz", "role": "position"},
+        {"register": "v1", "semantic": "TEXCOORD0", "components": "xy", "role": "uv0"},
+        {"register": "v2", "semantic": "NORMAL0", "components": "xyz", "role": "packed_octahedral_normal"},
+        {"register": "v3", "semantic": "TANGENT0", "components": "xyzw", "role": "tangent_frame"},
+        {"register": "v4", "semantic": "TEXCOORD4", "components": "xyz", "role": "packed_aux_vector"},
+        {"register": "v5", "semantic": "BLENDWEIGHTS0", "components": "xyzw", "role": "local_blend_weights"},
+        {"register": "v6", "semantic": "BLENDINDICES0", "components": "xyzw", "role": "local_blend_indices"},
+        {"register": "v7", "semantic": "SV_InstanceID0", "components": "x", "role": "instance_id"}
+      ],
+      "notes": [
+        "No TEXCOORD2 input in the disassembled VS.",
+        "TEXCOORD4 is a packed auxiliary vector, not a UV layer."
+      ]
+    },
+    "2ff51b35a650fab2": {
+      "label": "static_skinned_no_tangent",
+      "inputs": [
+        {"register": "v0", "semantic": "POSITION0", "components": "xyz", "role": "position"},
+        {"register": "v1", "semantic": "TEXCOORD0", "components": "xy", "role": "uv0"},
+        {"register": "v2", "semantic": "NORMAL0", "components": "xyz", "role": "packed_octahedral_normal"},
+        {"register": "v3", "semantic": "TEXCOORD4", "components": "xyz", "role": "packed_aux_vector"},
+        {"register": "v4", "semantic": "BLENDWEIGHTS0", "components": "xyzw", "role": "local_blend_weights"},
+        {"register": "v5", "semantic": "BLENDINDICES0", "components": "xyzw", "role": "local_blend_indices"},
+        {"register": "v6", "semantic": "SV_InstanceID0", "components": "x", "role": "instance_id"}
+      ],
+      "notes": [
+        "No TEXCOORD2 input in the disassembled VS."
+      ]
+    },
+    "d5d284900d7d0543": {
+      "label": "static_skinned_outline_expand",
+      "inputs": [
+        {"register": "v0", "semantic": "POSITION0", "components": "xyz", "role": "position"},
+        {"register": "v1", "semantic": "TEXCOORD0", "components": "xy", "role": "uv0"},
+        {"register": "v2", "semantic": "NORMAL0", "components": "xyz", "role": "packed_octahedral_normal"},
+        {"register": "v3", "semantic": "TANGENT0", "components": "xyzw", "role": "tangent_frame"},
+        {"register": "v4", "semantic": "TEXCOORD2", "components": "xy", "role": "outline_expansion_tangent_xy"},
+        {"register": "v5", "semantic": "TEXCOORD4", "components": "xyz", "role": "packed_aux_vector_or_fallback_position"},
+        {"register": "v6", "semantic": "BLENDWEIGHTS0", "components": "xyzw", "role": "local_blend_weights"},
+        {"register": "v7", "semantic": "BLENDINDICES0", "components": "xyzw", "role": "local_blend_indices"},
+        {"register": "v8", "semantic": "SV_InstanceID0", "components": "x", "role": "instance_id"}
+      ],
+      "notes": [
+        "TEXCOORD2.xy is read by the VS and contributes to the reconstructed outline expansion direction.",
+        "TEXCOORD2 and TEXCOORD4 may alias the same four bytes in IA layouts."
+      ]
+    },
+    "b30cc5ad521e0700": {
+      "label": "extended_skinned_outline_material",
+      "inputs": [
+        {"register": "v0", "semantic": "POSITION0", "components": "xyz", "role": "position"},
+        {"register": "v1", "semantic": "TEXCOORD0", "components": "xy", "role": "uv0"},
+        {"register": "v2", "semantic": "NORMAL0", "components": "xyz", "role": "packed_octahedral_normal"},
+        {"register": "v3", "semantic": "TANGENT0", "components": "xyzw", "role": "tangent_frame"},
+        {"register": "v4", "semantic": "TEXCOORD4", "components": "xyz", "role": "packed_aux_vector"},
+        {"register": "v5", "semantic": "TEXCOORD5", "components": "xyz", "role": "position_alias_or_aux_vector"},
+        {"register": "v6", "semantic": "TEXCOORD6", "components": "x", "role": "packed_aux_scalar"},
+        {"register": "v7", "semantic": "BLENDWEIGHTS0", "components": "xyzw", "role": "local_blend_weights"},
+        {"register": "v8", "semantic": "BLENDINDICES0", "components": "xyzw", "role": "local_blend_indices"},
+        {"register": "v9", "semantic": "SV_InstanceID0", "components": "x", "role": "instance_id"}
+      ],
+      "notes": [
+        "No TEXCOORD2 input in the disassembled VS.",
+        "TEXCOORD5/6 may alias the position buffer in specific passes."
+      ]
+    },
+    "dc40e5f69e550739": {
+      "label": "position_uv_skinned_minimal",
+      "inputs": [
+        {"register": "v0", "semantic": "POSITION0", "components": "xyz", "role": "position"},
+        {"register": "v1", "semantic": "TEXCOORD0", "components": "xy", "role": "uv0"},
+        {"register": "v2", "semantic": "BLENDWEIGHTS0", "components": "xyzw", "role": "local_blend_weights"},
+        {"register": "v3", "semantic": "BLENDINDICES0", "components": "xyzw", "role": "local_blend_indices"},
+        {"register": "v4", "semantic": "SV_InstanceID0", "components": "x", "role": "instance_id"}
+      ],
+      "notes": [
+        "No normal, tangent, TEXCOORD2, or TEXCOORD4 input in the disassembled VS."
+      ]
+    }
+  }
+}

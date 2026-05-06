@@ -171,14 +171,3 @@ class CapturePlan:
     shadow_host: ShadowHostRecord | None
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
-
-@dataclass(frozen=True)
-class ShadowSplitResult:
-    source_ini_path: str
-    bonestore_ini_path: str
-    export_manifest_path: str
-    shadow_host_hash: str
-    shadow_host_match_index_count: int
-    migrated_chunks: int
-    rewritten_sections: int
-    shadow_host_vs_hash: str = ""

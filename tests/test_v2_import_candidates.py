@@ -357,6 +357,24 @@ class RealFrameAnalysisImportTests(unittest.TestCase):
         candidate = self._candidate("640d1c0e-46845-0")
         self.assertGreater(len(candidate["import_paths"]["vb"]["vb1"].get("layout_txt", [])), 0)
 
+    def test_manifest_has_vertex_layout_table_for_export(self):
+        table = self.manifest.get("vertex_layout_table", {})
+        layout = table.get("640d1c0e-46845-0")
+        self.assertIsInstance(layout, dict)
+        self.assertEqual(layout["vertex_buffers"]["vb1"]["stride"], 20)
+        fields = layout["vertex_buffers"]["vb1"]["fields"]
+        self.assertIn(
+            {
+                "semantic": "TEXCOORD4",
+                "semantic_name": "TEXCOORD",
+                "semantic_index": 4,
+                "format": "R8G8B8A8_SNORM",
+                "input_slot": 1,
+                "aligned_byte_offset": 16,
+            },
+            fields,
+        )
+
     def test_640d1c0e_geometry_matches_known_frameanalysis_values(self):
         candidate = self._candidate("640d1c0e-46845-0")
         geometry = import_candidates.load_candidate_geometry(candidate, self.manifest["frameanalysis_dir"])
@@ -365,8 +383,13 @@ class RealFrameAnalysisImportTests(unittest.TestCase):
         self.assertEqual(candidate["local_bone_count"], 145)
         self.assertEqual(candidate["skin_format"]["blend_weights_format"], "R16G16B16A16_UNORM")
         self.assertEqual(candidate["skin_format"]["blend_indices_format"], "R8G8B8A8_UINT")
-        self.assertAlmostEqual(geometry.uv1[0][0], geometry.uv0[0][0], places=6)
-        self.assertAlmostEqual(geometry.uv1[0][1], geometry.uv0[0][1], places=6)
+        self.assertIsNotNone(geometry.uv0)
+        self.assertIsNone(geometry.uv1)
+        self.assertTrue(any(
+            int(record["semantic_index"]) == 4
+            and str(record["format"]).upper() == "R8G8B8A8_SNORM"
+            for record in geometry.texcoord_semantics
+        ))
         self.assertEqual(geometry.blend_indices[0], (2, 52, 55, 49))
         self.assertAlmostEqual(sum(geometry.blend_weights[0]), 1.0, places=4)
 

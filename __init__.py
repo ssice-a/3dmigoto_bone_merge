@@ -56,7 +56,6 @@ def register():
         operators.BMC_OT_revert_global_names_by_object_hash,
         operators.BMC_OT_merge_selected_seam_groups,
         operators.BMC_OT_prepare_export_collection,
-        operators.BMC_OT_generate_shadow_split,
         operators.BMC_OT_remove_target,
         operators.BMC_OT_clear_targets,
         operators.BMC_OT_remove_lod_target,

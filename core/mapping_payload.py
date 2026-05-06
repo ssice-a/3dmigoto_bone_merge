@@ -175,7 +175,6 @@ def build_mapping_payload(scene, manifest_payload: dict | None = None, base_payl
             "frameanalysis_dir": str(scene.bmc_frameanalysis_dir or base_payload.get("workspace", {}).get("frameanalysis_dir", "") or ""),
             "lod_frameanalysis_dir": str(scene.bmc_lod_frameanalysis_dir or base_payload.get("workspace", {}).get("lod_frameanalysis_dir", "") or ""),
             "output_dir": str(scene.bmc_output_dir or base_payload.get("workspace", {}).get("output_dir", "") or ""),
-            "source_ini_path": str(scene.bmc_source_ini_path or base_payload.get("workspace", {}).get("source_ini_path", "") or ""),
             "target_collection_name": scene.bmc_target_collection.name if scene.bmc_target_collection else str(base_payload.get("workspace", {}).get("target_collection_name", "") or ""),
             "export_collection_name": scene.bmc_export_collection.name if scene.bmc_export_collection else str(base_payload.get("workspace", {}).get("export_collection_name", "") or ""),
             "export_build_collection_name": scene.bmc_export_build_collection.name if scene.bmc_export_build_collection else str(base_payload.get("workspace", {}).get("export_build_collection_name", "") or ""),
@@ -229,8 +228,6 @@ def apply_mapping_payload_to_scene(scene, payload: dict, preset_name: str = "") 
         scene.bmc_frameanalysis_dir = str(workspace.get("frameanalysis_dir", "") or scene.bmc_frameanalysis_dir or "")
         scene.bmc_lod_frameanalysis_dir = str(workspace.get("lod_frameanalysis_dir", "") or scene.bmc_lod_frameanalysis_dir or "")
         scene.bmc_output_dir = str(workspace.get("output_dir", "") or scene.bmc_output_dir or "")
-        scene.bmc_source_ini_path = str(workspace.get("source_ini_path", "") or scene.bmc_source_ini_path or "")
-
         target_collection_name = str(workspace.get("target_collection_name", "") or "").strip()
         if target_collection_name:
             target_collection = bpy.data.collections.get(target_collection_name)

@@ -146,12 +146,12 @@ match_index_count = <count>
 match_priority = -500
 if vs == 200
   run = CustomShader_ExtractCB1
-  cs-t2 = ResourceBoneMeta_<hash>
+  x100 = <capture_record_index>
   run = CustomShader_RecordBones
 endif
 run = CustomShader_ExtractCB1
+x101 = <local_bone_count>
 cs-t2 = ResourceLocalPalette_<chunk>
-cs-t3 = ResourceLocalPaletteMeta_<chunk>
 run = CustomShader_GatherBones
 vs-t0 = ResourceLocalFakeT0_SRV
 run = CustomShader_RedirectCB1

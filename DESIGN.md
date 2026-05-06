@@ -377,8 +377,8 @@ Consume pass:
 
 ```ini
 run = CustomShader_ExtractCB1
+x101 = <local_bone_count>
 cs-t2 = ResourceLocalPalette_<chunk>
-cs-t3 = ResourceLocalPaletteMeta_<chunk>
 run = CustomShader_GatherBones
 vs-t0 = ResourceLocalFakeT0_SRV
 run = CustomShader_RedirectCB1
@@ -1212,6 +1212,20 @@ draw slice metadata
 ```
 
 #### Imported Buffer Semantics
+
+#### Data Type Registry
+
+Known shader input contracts and observed vertex-buffer profiles live under `core/data_types/`.
+This folder is a data fact registry, not a preset system. `vs_input_contracts.json` records only
+semantics confirmed from readable `*-vs_replace.txt` disassembly, while
+`vertex_layout_profiles.json` records recurring physical slot layouts such as UV0 plus packed
+auxiliary `R8G8B8A8_SNORM` bytes. FrameAnalysis remains the source of truth for every import and
+export offset, stride, format, and index count; the registry only annotates manifest records so
+diagnostics can distinguish "declared in IA layout" from "actually consumed by this VS".
+
+When a VS disassembly is missing, the registry must leave the VS role unknown instead of guessing
+from IA declarations. In particular, a layout may expose the same four bytes as both `TEXCOORD2`
+and `TEXCOORD4`, but only the disassembled VS decides which semantic is meaningful for that pass.
 
 `Position` buffer:
 

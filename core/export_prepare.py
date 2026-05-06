@@ -21,11 +21,9 @@ from ..constants import (
     EXPORT_MANIFEST_FILE_NAME,
 )
 from .hlsl_assets import export_required_hlsl
-from .ini_export import build_bonestore_namespace, write_bonestore_ini
+from .ini_export import build_bonestore_namespace, materialize_bonestore_runtime, write_bonestore_ini
 from .io import ensure_directory, read_json, write_json, write_uint32_buffer
-from .lod_runtime import materialize_lod_runtime_assets
-from .mapping_payload import load_mapping_payload_from_scene
-from .models import LocalPaletteRecord, PartRecord
+from .models import LocalPaletteRecord
 
 _NUMERIC_GROUP_RE = re.compile(r"^\d+$")
 _CHUNK_COLLECTION_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)(?:[-_](?P<chunk>\d+))?")
@@ -152,13 +150,11 @@ def prepare_export_collection(
     }
     manifest_dir = ensure_directory(internal_manifest_dir or normalized_output_dir)
     manifest_path = write_json(os.path.join(manifest_dir, EXPORT_MANIFEST_FILE_NAME), manifest)
-    mapping_payload = load_mapping_payload_from_scene(context.scene)
     bonestore_ini_path = regenerate_bonestore_runtime_files(
         output_dir=normalized_output_dir,
         capture_manifest_path=capture_manifest_path,
         export_manifest_path=manifest_path,
         local_palette_records=local_palette_records,
-        mapping_payload=mapping_payload,
     )
     return {
         "manifest_path": manifest_path,
@@ -492,6 +488,7 @@ def regenerate_bonestore_runtime_files(
     local_palette_records: list[LocalPaletteRecord] | None = None,
     mapping_payload: dict | None = None,
 ) -> str:
+    _ = mapping_payload
     manifest_path = os.path.abspath(capture_manifest_path or "") if capture_manifest_path else ""
     if not manifest_path or not os.path.exists(manifest_path):
         manifest_path = os.path.join(output_dir, CAPTURE_MANIFEST_FILE_NAME)
@@ -499,8 +496,7 @@ def regenerate_bonestore_runtime_files(
         return os.path.join(output_dir, BONESTORE_INI_FILE_NAME)
 
     manifest = read_json(manifest_path)
-    part_records = [_part_record_from_manifest_record(record) for record in manifest.get("part_records", [])]
-    if not part_records:
+    if not manifest.get("bone_pool_order"):
         return os.path.join(output_dir, BONESTORE_INI_FILE_NAME)
     palette_records = list(local_palette_records or [])
     normalized_export_manifest_path = os.path.abspath(export_manifest_path or "") if export_manifest_path else ""
@@ -510,32 +506,21 @@ def regenerate_bonestore_runtime_files(
             _local_palette_record_from_export_record(record)
             for record in export_manifest.get("palettes", [])
         ]
-    lod_runtime = materialize_lod_runtime_assets(output_dir, part_records, palette_records, mapping_payload or {})
-    ini_path = write_bonestore_ini(output_dir, part_records, palette_records, lod_runtime=lod_runtime)
+    runtime_plan = materialize_bonestore_runtime(output_dir, manifest, palette_records)
+    ini_path = write_bonestore_ini(output_dir, runtime_plan)
 
     if normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
         export_manifest = read_json(normalized_export_manifest_path)
-        export_manifest["lod_variants"] = list(lod_runtime.get("variants", []) or [])
-        export_manifest["lod_host_map"] = list(lod_runtime.get("lod_host_map", []) or [])
+        export_manifest["runtime"] = {
+            "schema_version": int(runtime_plan.get("schema_version", 2)),
+            "namespace": str(runtime_plan.get("namespace", "")),
+            "global_bone_count": int(runtime_plan.get("global_bone_count", 0) or 0),
+            "capture_records": list(runtime_plan.get("capture_records", []) or []),
+            "lod_capture_records": list(runtime_plan.get("lod_capture_records", []) or []),
+            "buffers": dict(runtime_plan.get("buffers", {}) or {}),
+        }
         write_json(normalized_export_manifest_path, export_manifest)
     return ini_path
-
-
-def _part_record_from_manifest_record(record: dict) -> PartRecord:
-    return PartRecord(
-        draw_index=int(record.get("draw_index", 0)),
-        object_name=str(record.get("object_name", "")),
-        vs_hash=str(record.get("vs_hash", "")).lower(),
-        ib_hash=str(record.get("ib_hash", "")).lower(),
-        match_index_count=int(record.get("match_index_count", 0)),
-        bone_count=int(record.get("capture_bone_count", record.get("bone_count", 0))),
-        global_bone_base=int(record.get("global_bone_base", 0)),
-        vb2_path=str(record.get("vb2_path", "")),
-        vs_t0_path=str(record.get("vs_t0_path", "")),
-        vs_cb1_path=str(record.get("vs_cb1_path", "")),
-        vs_cb1_first_constant=int(record.get("vs_cb1_first_constant", -1)),
-        vs_cb1_num_constants=int(record.get("vs_cb1_num_constants", -1)),
-    )
 
 
 def _local_palette_record_from_export_record(record: dict) -> LocalPaletteRecord:

@@ -188,14 +188,6 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         export_box.operator("object.bmc_apply_export_collection_global_names", icon="GROUP_VERTEX")
         export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT")
 
-        shadow_box = layout.box()
-        shadow_box.label(text="Modify Main INI", icon="SHADING_RENDERED")
-        shadow_box.prop(scene, "bmc_source_ini_path")
-        shadow_box.prop(scene, "bmc_shadow_host_hash")
-        shadow_box.prop(scene, "bmc_shadow_host_match_index_count")
-        shadow_box.prop(scene, "bmc_shadow_host_vs_hash")
-        shadow_box.operator("object.bmc_generate_shadow_split", icon="SHADING_RENDERED")
-
 
 class VIEW3D_PT_bone_merge_hash_tools(bpy.types.Panel):
     bl_space_type = "VIEW_3D"

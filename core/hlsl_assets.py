@@ -13,6 +13,7 @@ _REQUIRED_HLSL_FILES = (
     "extract_cb1_ps.hlsl",
     "gather_bones_cs.hlsl",
     "record_bones_dynamic_cs.hlsl",
+    "record_bones_scatter_cs.hlsl",
     "redirect_cb1_cs.hlsl",
 )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -27,11 +28,13 @@ class LoadedCandidateGeometry:
     positions: list[tuple[float, float, float]]
     triangles: list[tuple[int, int, int]]
     original_vertex_ids: list[int]
-    uv0: list[tuple[float, float]]
-    uv1: list[tuple[float, float]]
+    uv0: list[tuple[float, float]] | None
+    uv1: list[tuple[float, float]] | None
     normals: list[tuple[float, float, float]]
     normal_packed: list[int]
     texcoord4_raw: list[tuple[int, int, int, int]]
+    texcoord_semantics: list[dict]
+    vertex_layout: dict
     blend_indices: list[tuple[int, int, int, int]]
     blend_weights: list[tuple[float, float, float, float]]
     warnings: list[str] = field(default_factory=list)
@@ -74,9 +77,16 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         for triangle in raw_triangles
     ]
 
-    vb_payload = dict(import_paths.get("vb", {}) or {})
     warnings: list[str] = []
-    vb0 = _load_slot_slice(vb_payload, "vb0", 0, frameanalysis_dir, warnings)
+    vb_payload = dict(import_paths.get("vb", {}) or {})
+    slot_slices: dict[str, _SlotSlice | None] = {}
+
+    def get_slot(slot_name: str, slot_index: int) -> _SlotSlice | None:
+        if slot_name not in slot_slices:
+            slot_slices[slot_name] = _load_slot_slice(vb_payload, slot_name, slot_index, frameanalysis_dir, warnings)
+        return slot_slices[slot_name]
+
+    vb0 = get_slot("vb0", 0)
     if vb0 is None:
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no vb0 slice")
     positions = _read_required_float3(vb0, "POSITION", 0, original_vertex_ids)
@@ -96,27 +106,17 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         normal_packed = [0 for _ in original_vertex_ids]
         normals = [(0.0, 0.0, 1.0) for _ in original_vertex_ids]
 
-    vb1 = _load_slot_slice(vb_payload, "vb1", 1, frameanalysis_dir, warnings)
+    vb1 = get_slot("vb1", 1)
     if vb1 is not None:
-        uv0 = _read_float2_or_default(vb1, "TEXCOORD", 0, original_vertex_ids, (0.0, 0.0))
-        uv1_element = _find_element(vb1, "TEXCOORD", 1)
-        if uv1_element is not None:
-            uv1 = _read_float2_or_default(vb1, "TEXCOORD", 1, original_vertex_ids, (0.0, 0.0))
-        else:
-            uv1 = list(uv0)
-        texcoord4_element = _find_element(vb1, "TEXCOORD", 4)
-        if texcoord4_element is not None and _is_format(texcoord4_element.fmt, "R8G8B8A8_SNORM"):
-            texcoord4_raw = _read_int8x4_records(vb1, texcoord4_element, original_vertex_ids)
-        else:
-            texcoord4_raw = [(0, 0, 0, 0) for _ in original_vertex_ids]
+        uv0 = _read_float2_if_present(vb1, "TEXCOORD", 0, original_vertex_ids)
+        uv1 = _read_float2_if_present(vb1, "TEXCOORD", 1, original_vertex_ids)
     else:
-        warnings.append("vb1 is missing; UV0/UV1/TEXCOORD4 use fallback values")
-        uv0 = [(0.0, 0.0) for _ in original_vertex_ids]
-        uv1 = list(uv0)
-        texcoord4_raw = [(0, 0, 0, 0) for _ in original_vertex_ids]
+        warnings.append("vb1 is missing; no UV layers are imported from vb1")
+        uv0 = None
+        uv1 = None
 
     skin_slot_name, skin_slot_index = _skin_slot_from_candidate(candidate)
-    skin_slot = _load_slot_slice(vb_payload, skin_slot_name, skin_slot_index, frameanalysis_dir, warnings)
+    skin_slot = get_slot(skin_slot_name, skin_slot_index)
     if skin_slot is not None:
         _validate_skin_format(skin_slot, dict(candidate.get("skin_format", {}) or {}), warnings)
         blend_weights = _read_blend_weights(skin_slot, original_vertex_ids)
@@ -129,6 +129,14 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         warnings.append(f"{skin_slot_name} is missing; blend weights and indices use fallback values")
         blend_weights = [(0.0, 0.0, 0.0, 0.0) for _ in original_vertex_ids]
         blend_indices = [(0, 0, 0, 0) for _ in original_vertex_ids]
+
+    for slot_name in sorted(vb_payload, key=_slot_sort_key):
+        if re.match(r"^vb\d+$", str(slot_name)):
+            get_slot(str(slot_name), int(str(slot_name)[2:]))
+    loaded_slots = [slot for slot in slot_slices.values() if slot is not None]
+    texcoord_semantics = _read_texcoord_semantics(loaded_slots, original_vertex_ids)
+    texcoord4_raw = _first_raw_snorm_texcoord4(texcoord_semantics, len(original_vertex_ids))
+    vertex_layout = _build_loaded_vertex_layout(loaded_slots)
 
     return LoadedCandidateGeometry(
         display_name=str(candidate.get("display_name", "") or _candidate_display_name(candidate)),
@@ -143,6 +151,8 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         normals=normals,
         normal_packed=normal_packed,
         texcoord4_raw=texcoord4_raw,
+        texcoord_semantics=texcoord_semantics,
+        vertex_layout=vertex_layout,
         blend_indices=blend_indices,
         blend_weights=blend_weights,
         warnings=warnings,
@@ -212,11 +222,14 @@ def create_blender_object_from_geometry(
     for polygon in mesh.polygons:
         polygon.use_smooth = True
 
-    _apply_uv_layer(mesh, "UV0", geometry.uv0)
-    _apply_uv_layer(mesh, "UV1", geometry.uv1)
+    if geometry.uv0 is not None:
+        _apply_uv_layer(mesh, "UV0", geometry.uv0)
+    if geometry.uv1 is not None:
+        _apply_uv_layer(mesh, "UV1", geometry.uv1)
     _apply_custom_normals(mesh, blender_normals)
     _store_int_attribute(mesh, "bmc_orig_vertex_id", geometry.original_vertex_ids)
     _store_uint32_split_attributes(mesh, "bmc_normal_packed", geometry.normal_packed)
+    _store_texcoord_semantic_attributes(mesh, geometry.texcoord_semantics)
     for channel_index in range(4):
         _store_int_attribute(
             mesh,
@@ -245,6 +258,18 @@ def create_blender_object_from_geometry(
     imported_object["bmc_shadow_draw_indices"] = ",".join(str(value) for value in shadow_draw_indices)
     imported_object["bmc_mirror_flip"] = bool(mirror_flip)
     imported_object["modimp_mirror_flip"] = bool(mirror_flip)
+    imported_object["bmc_uv0_present"] = geometry.uv0 is not None
+    imported_object["bmc_uv1_present"] = geometry.uv1 is not None
+    imported_object["bmc_vertex_layout_json"] = json.dumps(
+        geometry.vertex_layout,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    imported_object["bmc_vertex_semantics_json"] = json.dumps(
+        [_semantic_metadata(record) for record in geometry.texcoord_semantics],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     if geometry.warnings:
         imported_object["bmc_import_warnings"] = "\n".join(geometry.warnings)
     return imported_object
@@ -320,6 +345,13 @@ def _skin_slot_from_candidate(candidate: dict) -> tuple[str, int]:
     if not re.match(r"^vb\d+$", slot_name):
         slot_name = "vb2"
     return slot_name, int(slot_name[2:])
+
+
+def _slot_sort_key(slot_name: str) -> tuple[int, str]:
+    match = re.match(r"^vb(?P<index>\d+)$", str(slot_name))
+    if not match:
+        return 9999, str(slot_name)
+    return int(match.group("index")), str(slot_name)
 
 
 def _resolve_path(path: str, frameanalysis_dir: str = "") -> str:
@@ -578,6 +610,96 @@ def _read_float2_or_default(
     return [(float(record[0]), float(record[1])) for record in values]
 
 
+def _read_float2_if_present(
+    slot: _SlotSlice,
+    semantic_name: str,
+    semantic_index: int,
+    vertex_ids: list[int],
+) -> list[tuple[float, float]] | None:
+    element = _find_element(slot, semantic_name, semantic_index)
+    if element is None:
+        return None
+    if not _is_format(element.fmt, "R32G32_FLOAT"):
+        return None
+    values = _read_format_records(slot, element, vertex_ids)
+    return [(float(record[0]), float(record[1])) for record in values]
+
+
+def _read_texcoord_semantics(slots: list[_SlotSlice], vertex_ids: list[int]) -> list[dict]:
+    records: list[dict] = []
+    for slot in sorted(slots, key=lambda item: item.slot_index):
+        for key in sorted(slot.elements, key=lambda item: (item[0], item[1])):
+            element = slot.elements[key]
+            if str(element.semantic_name).upper() != "TEXCOORD":
+                continue
+            records.append(_read_semantic_payload(slot, element, vertex_ids))
+    return records
+
+
+def _read_semantic_payload(slot: _SlotSlice, element: HeaderElement, vertex_ids: list[int]) -> dict:
+    fmt = str(element.fmt or "").upper()
+    if _is_format(fmt, "R8G8B8A8_SNORM"):
+        values = _read_int8x4_records(slot, element, vertex_ids)
+        storage = "sint8_raw"
+    else:
+        values = _read_format_records(slot, element, vertex_ids)
+        storage = "float"
+    component_count = len(values[0]) if values else max(1, _format_size(fmt) // 4)
+    return {
+        "slot_name": slot.slot_name,
+        "slot_index": int(slot.slot_index),
+        "semantic_name": str(element.semantic_name).upper(),
+        "semantic_index": int(element.semantic_index),
+        "format": fmt,
+        "aligned_byte_offset": int(element.aligned_byte_offset),
+        "component_count": int(component_count),
+        "storage": storage,
+        "values": [tuple(value) for value in values],
+    }
+
+
+def _first_raw_snorm_texcoord4(texcoord_semantics: list[dict], vertex_count: int) -> list[tuple[int, int, int, int]]:
+    for record in texcoord_semantics:
+        if (
+            str(record.get("semantic_name", "")).upper() == "TEXCOORD"
+            and int(record.get("semantic_index", -1)) == 4
+            and str(record.get("storage", "")) == "sint8_raw"
+            and int(record.get("component_count", 0)) == 4
+        ):
+            return [tuple(int(component) for component in value) for value in record.get("values", [])]
+    return [(0, 0, 0, 0) for _ in range(vertex_count)]
+
+
+def _build_loaded_vertex_layout(slots: list[_SlotSlice]) -> dict:
+    return {
+        "buffers": {
+            slot.slot_name: {
+                "slot": slot.slot_name,
+                "slot_index": int(slot.slot_index),
+                "stride": int(slot.header.stride),
+                "vertex_count": int(slot.header.vertex_count),
+                "byte_offset": int(slot.header.byte_offset),
+                "base_offset": int(slot.base_offset),
+                "elements": [
+                    _element_layout_payload(element)
+                    for _key, element in sorted(slot.elements.items(), key=lambda item: (item[1].aligned_byte_offset, item[1].semantic_name, item[1].semantic_index))
+                ],
+            }
+            for slot in sorted(slots, key=lambda item: item.slot_index)
+        }
+    }
+
+
+def _element_layout_payload(element: HeaderElement) -> dict:
+    return {
+        "semantic_name": str(element.semantic_name).upper(),
+        "semantic_index": int(element.semantic_index),
+        "format": str(element.fmt or "").upper(),
+        "input_slot": int(element.input_slot),
+        "aligned_byte_offset": int(element.aligned_byte_offset),
+    }
+
+
 def _read_uint32_records(slot: _SlotSlice, element: HeaderElement, vertex_ids: list[int]) -> list[int]:
     raw_records = _read_raw_records(slot, element, vertex_ids, 4)
     return [int(struct.unpack("<I", record)[0]) for record in raw_records]
@@ -760,6 +882,41 @@ def _store_float_attribute(mesh, name: str, values: list[float]) -> None:
 def _store_uint32_split_attributes(mesh, base_name: str, values: list[int]) -> None:
     _store_int_attribute(mesh, f"{base_name}_lo16", [int(value) & 0xFFFF for value in values])
     _store_int_attribute(mesh, f"{base_name}_hi16", [(int(value) >> 16) & 0xFFFF for value in values])
+
+
+def _store_texcoord_semantic_attributes(mesh, records: list[dict]) -> None:
+    for record in records:
+        slot_index = int(record.get("slot_index", -1))
+        semantic_index = int(record.get("semantic_index", -1))
+        values = list(record.get("values", []) or [])
+        component_count = int(record.get("component_count", 0) or 0)
+        storage = str(record.get("storage", "") or "")
+        if slot_index < 0 or semantic_index < 0 or component_count <= 0:
+            continue
+        base_name = f"bmc_vb{slot_index}_texcoord{semantic_index}"
+        for component_index in range(component_count):
+            component_values = [
+                value[component_index] if component_index < len(value) else 0
+                for value in values
+            ]
+            attr_name = f"{base_name}_{component_index}"
+            if storage == "sint8_raw":
+                _store_int_attribute(mesh, attr_name, [int(value) for value in component_values])
+            else:
+                _store_float_attribute(mesh, attr_name, [float(value) for value in component_values])
+
+
+def _semantic_metadata(record: dict) -> dict:
+    return {
+        "slot_name": str(record.get("slot_name", "") or ""),
+        "slot_index": int(record.get("slot_index", -1)),
+        "semantic_name": str(record.get("semantic_name", "") or ""),
+        "semantic_index": int(record.get("semantic_index", -1)),
+        "format": str(record.get("format", "") or ""),
+        "aligned_byte_offset": int(record.get("aligned_byte_offset", -1)),
+        "component_count": int(record.get("component_count", 0) or 0),
+        "storage": str(record.get("storage", "") or ""),
+    }
 
 
 def _assign_vertex_groups(

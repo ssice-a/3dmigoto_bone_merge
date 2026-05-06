@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "source": "observed_frameanalysis_slot_layouts",
+  "profiles": {
+    "position_packed_normal_stride16": {
+      "slot": "vb0",
+      "stride": 16,
+      "purpose": "position plus packed game normal",
+      "fields": [
+        {"semantic": "POSITION0", "offset": 0, "format": "R32G32B32_FLOAT"},
+        {"semantic": "NORMAL0", "offset": 12, "format": "R32_FLOAT"}
+      ]
+    },
+    "position_float_normal_stride40": {
+      "slot": "vb0",
+      "stride": 40,
+      "purpose": "dynamic position plus float normal",
+      "fields": [
+        {"semantic": "POSITION0", "offset": 0, "format": "R32G32B32_FLOAT"},
+        {"semantic": "NORMAL0", "offset": 12, "format": "R32G32B32_FLOAT"}
+      ]
+    },
+    "position_only_stride16": {
+      "slot": "vb0",
+      "stride": 16,
+      "purpose": "position-only minimal pass",
+      "fields": [
+        {"semantic": "POSITION0", "offset": 0, "format": "R32G32B32_FLOAT"}
+      ]
+    },
+    "texcoord_uv0_aux_snorm_stride12": {
+      "slot": "vb1",
+      "stride": 12,
+      "purpose": "UV0 plus packed auxiliary bytes at offset 8",
+      "fields": [
+        {"semantic": "TEXCOORD0", "offset": 0, "format": "R32G32_FLOAT"},
+        {"semantic": "TEXCOORD4", "offset": 8, "format": "R8G8B8A8_SNORM"}
+      ]
+    },
+    "texcoord_uv0_aux_snorm_stride20": {
+      "slot": "vb1",
+      "stride": 20,
+      "purpose": "UV0 plus padding or pass-specific data plus packed auxiliary bytes at offset 16",
+      "fields": [
+        {"semantic": "TEXCOORD0", "offset": 0, "format": "R32G32_FLOAT"},
+        {"semantic": "TEXCOORD4", "offset": 16, "format": "R8G8B8A8_SNORM"}
+      ]
+    },
+    "texcoord_uv0_at4_aux_snorm_stride24": {
+      "slot": "vb1",
+      "stride": 24,
+      "purpose": "UV0 starts at offset 4 and packed auxiliary bytes start at offset 20",
+      "fields": [
+        {"semantic": "TEXCOORD0", "offset": 4, "format": "R32G32_FLOAT"},
+        {"semantic": "TEXCOORD4", "offset": 20, "format": "R8G8B8A8_SNORM"}
+      ]
+    },
+    "texcoord_uv0_only_stride8": {
+      "slot": "vb1",
+      "stride": 8,
+      "purpose": "UV0 only",
+      "fields": [
+        {"semantic": "TEXCOORD0", "offset": 0, "format": "R32G32_FLOAT"}
+      ]
+    },
+    "blend_r16_weights_r8_indices_stride12": {
+      "slot": "vb2",
+      "stride": 12,
+      "purpose": "half/unorm weights plus byte local palette indices",
+      "fields": [
+        {"semantic": "BLENDWEIGHTS0", "offset": 0, "format": "R16G16B16A16_UNORM"},
+        {"semantic": "BLENDINDICES0", "offset": 8, "format": "R8G8B8A8_UINT"}
+      ]
+    },
+    "blend_r32_weights_r32_indices_stride32": {
+      "slot": "vb2",
+      "stride": 32,
+      "purpose": "float weights plus uint local palette indices",
+      "fields": [
+        {"semantic": "BLENDWEIGHTS0", "offset": 0, "format": "R32G32B32A32_FLOAT"},
+        {"semantic": "BLENDINDICES0", "offset": 16, "format": "R32G32B32A32_UINT"}
+      ]
+    },
+    "aux_texcoord4_float3_stride40": {
+      "slot": "vb3",
+      "stride": 40,
+      "purpose": "dynamic auxiliary float3 bound as TEXCOORD4",
+      "fields": [
+        {"semantic": "TEXCOORD4", "offset": 0, "format": "R32G32B32_FLOAT"}
+      ]
+    }
+  }
+}

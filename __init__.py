@@ -56,6 +56,7 @@ def register():
         operators.BMC_OT_remove_lod_target,
         operators.BMC_OT_clear_lod_targets,
         operators.BMC_OT_analyze_main_frameanalysis,
+        operators.BMC_OT_import_selected_candidates,
         operators.BMC_OT_scan_targets,
         operators.BMC_OT_scan_lod_targets,
         operators.BMC_OT_analyze_duplicate_bones,

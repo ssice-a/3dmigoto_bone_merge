@@ -42,6 +42,7 @@ class BMC_CandidateItem(bpy.types.PropertyGroup):
     local_bone_count: bpy.props.IntProperty(name="Local Bones", default=0, min=0)
     draw_count: bpy.props.IntProperty(name="Draws", default=0, min=0)
     shadow_draw_count: bpy.props.IntProperty(name="Shadow Draws", default=0, min=0)
+    manual: bpy.props.BoolProperty(name="Manual", default=False)
 
 
 class BMC_AliasItem(bpy.types.PropertyGroup):

@@ -39,6 +39,9 @@ _HEADER_INT_RE = re.compile(r"^(?P<name>byte offset|first index|index count|stri
 _HEADER_TEXT_RE = re.compile(r"^(?P<name>topology|format):\s*(?P<value>.+)$")
 _ELEMENT_RE = re.compile(r"^element\[(?P<index>\d+)\]:")
 _CB1_RE = re.compile(r"^cb1\[(?P<row>\d+)\]\.(?P<component>[xyzw]):\s*(?P<value>[-+0-9.eE]+)")
+_VERTEX_DATA_RE = re.compile(
+    r"^vb(?P<slot>\d+)\[(?P<vertex>\d+)\]\+(?P<offset>\d+)\s+[^:]+:\s*(?P<values>.+)$"
+)
 
 
 @dataclass(frozen=True)
@@ -118,8 +121,6 @@ def write_main_analysis_manifest(
 def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterable[str]) -> dict:
     normalized_frameanalysis_dir = os.path.abspath(frameanalysis_dir)
     target_hashes = _normalize_target_hashes(target_ib_hashes)
-    if not target_hashes:
-        raise ValueError("Target IB hash is required for Main Analyze")
     log_path = os.path.join(normalized_frameanalysis_dir, "log.txt")
     if not os.path.exists(log_path):
         raise ValueError(f"log.txt not found in {normalized_frameanalysis_dir}")
@@ -129,19 +130,10 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
     draw_states = _parse_draw_states(log_path)
     warnings: list[dict] = []
 
-    target_hits = [
-        dump_file
-        for dump_files in files_by_draw.values()
-        for dump_file in dump_files
-        if dump_file.slot == "ib" and dump_file.resource_hash in target_hashes and dump_file.extension == "txt"
-    ]
-    target_hits.sort(key=lambda item: item.draw_index)
-    if not target_hits:
-        raise ValueError(f"No target IB dump found for: {', '.join(target_hashes)}")
-
-    shadow_vs_hashes = _first_distinct_vs_pair(target_hits, draw_states, warnings)
+    discovery = _discover_shadow_vs_hashes(files_by_draw, draw_states, target_hashes, warnings)
+    shadow_vs_hashes = list(discovery["shadow_vs_hashes"])
     if not shadow_vs_hashes:
-        raise ValueError("Could not infer shadow VS hash pair from target IB hits")
+        raise ValueError("Could not infer shadow VS hash pair from FrameAnalysis")
     normal_vs_hash = shadow_vs_hashes[0]
     transparent_vs_hash = shadow_vs_hashes[1] if len(shadow_vs_hashes) > 1 else ""
 
@@ -215,7 +207,8 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
         "frameanalysis_dir": normalized_frameanalysis_dir,
         "target": {
             "source_ib_hashes": target_hashes,
-            "selection_mode": "manual_ib_hash_or_target_list",
+            "selection_mode": discovery["selection_mode"],
+            "auto_discovery": discovery,
         },
         "shadow_stage": {
             "shadow_vs_hashes": shadow_vs_hashes,
@@ -407,6 +400,188 @@ def _first_distinct_vs_pair(
     return selected
 
 
+def _discover_shadow_vs_hashes(
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    target_hashes: list[str],
+    warnings: list[dict],
+) -> dict:
+    if target_hashes:
+        target_hits = [
+            dump_file
+            for dump_files in files_by_draw.values()
+            for dump_file in dump_files
+            if dump_file.slot == "ib" and dump_file.resource_hash in target_hashes and dump_file.extension == "txt"
+        ]
+        target_hits.sort(key=lambda item: item.draw_index)
+        if not target_hits:
+            raise ValueError(f"No target IB dump found for: {', '.join(target_hashes)}")
+        shadow_vs_hashes = _first_distinct_vs_pair(target_hits, draw_states, warnings)
+        return {
+            "selection_mode": "manual_ib_hash_seed",
+            "shadow_vs_hashes": shadow_vs_hashes,
+            "seed_ib_hashes": target_hashes,
+            "seed_draw_indices": [dump_file.draw_index for dump_file in target_hits[:16]],
+            "auto_candidates": [],
+        }
+
+    auto_candidates = _auto_shadow_vs_pair_candidates(files_by_draw, draw_states, warnings)
+    if not auto_candidates:
+        raise ValueError("No skinned shadow VS candidate pair found in FrameAnalysis")
+    selected_candidate = auto_candidates[0]
+    return {
+        "selection_mode": "auto_shadow_vs_pair",
+        "shadow_vs_hashes": list(selected_candidate["shadow_vs_hashes"]),
+        "seed_ib_hashes": [],
+        "seed_draw_indices": [],
+        "auto_candidates": auto_candidates[:8],
+    }
+
+
+def _auto_shadow_vs_pair_candidates(
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    warnings: list[dict],
+) -> list[dict]:
+    hits_by_vs: dict[str, list[DumpFile]] = {}
+    all_ib_dumps: list[DumpFile] = []
+    for dump_files in files_by_draw.values():
+        for dump_file in dump_files:
+            if dump_file.slot != "ib" or dump_file.extension != "txt":
+                continue
+            key = _candidate_key_from_ib_dump(dump_file)
+            if key[2] <= 0:
+                continue
+            all_ib_dumps.append(dump_file)
+            vs_hash = _state_vs_hash(draw_states, dump_file)
+            if not vs_hash:
+                continue
+            hits_by_vs.setdefault(vs_hash, []).append(dump_file)
+
+    key_index: dict[tuple[str, int, int], list[DumpFile]] = {}
+    for dump_file in all_ib_dumps:
+        key_index.setdefault(_candidate_key_from_ib_dump(dump_file), []).append(dump_file)
+
+    vs_infos = {
+        vs_hash: _build_vs_group_info(vs_hash, hits, files_by_draw, draw_states, key_index)
+        for vs_hash, hits in hits_by_vs.items()
+    }
+    pairs: list[dict] = []
+    vs_hashes = sorted(vs_infos, key=lambda value: vs_infos[value]["draw_start"])
+    for left_index, left_vs in enumerate(vs_hashes):
+        for right_vs in vs_hashes[left_index + 1 :]:
+            left_info = vs_infos[left_vs]
+            right_info = vs_infos[right_vs]
+            if not _could_be_shadow_pair(left_info, right_info):
+                continue
+            union_keys = left_info["candidate_keys"] | right_info["candidate_keys"]
+            skinned_keys = left_info["skinned_keys"] | right_info["skinned_keys"]
+            if len(skinned_keys) < 3:
+                continue
+            overlap_keys = left_info["candidate_keys"] & right_info["candidate_keys"]
+            shared_index_count_sum = sum(key[2] for key in overlap_keys)
+            index_count_sum = sum(key[2] for key in union_keys)
+            draw_start = min(left_info["draw_start"], right_info["draw_start"])
+            draw_end = max(left_info["draw_end"], right_info["draw_end"])
+            rt0_count = int(left_info["rt_counts"].get(0, 0)) + int(right_info["rt_counts"].get(0, 0))
+            score = (
+                len(skinned_keys) * 100000
+                + min(index_count_sum, 800000)
+                + len(overlap_keys) * 10000
+                + min(shared_index_count_sum, 300000)
+                + rt0_count * 200000
+                + max(0, 260 - draw_start) * 5000
+                - draw_start * 1000
+                - max(0, draw_end - draw_start - 260) * 5000
+            )
+            pairs.append(
+                {
+                    "shadow_vs_hashes": [left_vs, right_vs],
+                    "score": int(score),
+                    "candidate_count": int(len(union_keys)),
+                    "skinned_candidate_count": int(len(skinned_keys)),
+                    "overlap_count": int(len(overlap_keys)),
+                    "index_count_sum": int(index_count_sum),
+                    "shared_index_count_sum": int(shared_index_count_sum),
+                    "rt0_draw_count": int(rt0_count),
+                    "draw_start": int(draw_start),
+                    "draw_end": int(draw_end),
+                    "rt_counts": {
+                        left_vs: dict(left_info["rt_counts"]),
+                        right_vs: dict(right_info["rt_counts"]),
+                    },
+                }
+            )
+    pairs.sort(
+        key=lambda item: (
+            int(item["score"]),
+            int(item["skinned_candidate_count"]),
+            int(item["index_count_sum"]),
+            -int(item["draw_start"]),
+        ),
+        reverse=True,
+    )
+    if len(pairs) > 1 and int(pairs[0]["score"]) - int(pairs[1]["score"]) < 50000:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "ambiguous_auto_shadow_vs_pair",
+                "message": "Auto Analyze found multiple plausible shadow VS pairs; using the highest score.",
+                "top_pairs": pairs[:3],
+            }
+        )
+    return pairs
+
+
+def _build_vs_group_info(
+    vs_hash: str,
+    hits: list[DumpFile],
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    key_index: dict[tuple[str, int, int], list[DumpFile]],
+) -> dict:
+    candidate_keys = {_candidate_key_from_ib_dump(dump_file) for dump_file in hits}
+    skinned_keys: set[tuple[str, int, int]] = set()
+    local_bone_counts: dict[str, int] = {}
+    for key in candidate_keys:
+        local_warnings: list[dict] = []
+        local_bone_count = _infer_candidate_local_bone_count(files_by_draw, key_index.get(key, []), local_warnings)
+        if local_bone_count > 0:
+            skinned_keys.add(key)
+        local_bone_counts[f"{key[0]}-{key[2]}-{key[1]}"] = int(local_bone_count)
+    draw_indices = sorted({dump_file.draw_index for dump_file in hits})
+    rt_counter: dict[int, int] = {}
+    for dump_file in hits:
+        draw_state = draw_states.get(dump_file.draw_index)
+        rt_count = int(draw_state.rt_count if draw_state else -1)
+        rt_counter[rt_count] = rt_counter.get(rt_count, 0) + 1
+    return {
+        "vs_hash": vs_hash,
+        "candidate_keys": candidate_keys,
+        "skinned_keys": skinned_keys,
+        "local_bone_counts": local_bone_counts,
+        "draw_start": min(draw_indices) if draw_indices else 0,
+        "draw_end": max(draw_indices) if draw_indices else 0,
+        "draw_count": len(draw_indices),
+        "index_count_sum": sum(key[2] for key in candidate_keys),
+        "rt_counts": rt_counter,
+    }
+
+
+def _could_be_shadow_pair(left_info: dict, right_info: dict) -> bool:
+    left_start = int(left_info["draw_start"])
+    right_start = int(right_info["draw_start"])
+    if abs(left_start - right_start) > 260:
+        return False
+    if int(left_info["draw_count"]) < 3 or int(right_info["draw_count"]) < 3:
+        return False
+    if not (left_info["skinned_keys"] or right_info["skinned_keys"]):
+        return False
+    if not (left_info["candidate_keys"] & right_info["candidate_keys"]):
+        return False
+    return True
+
+
 def _state_vs_hash(draw_states: dict[int, DrawState], dump_file: DumpFile) -> str:
     draw_state = draw_states.get(dump_file.draw_index)
     if draw_state and draw_state.vs_hash:
@@ -562,7 +737,8 @@ def _build_vb_paths_payload(frameanalysis_dir: str, draw_files: list[DumpFile]) 
     for dump_file in draw_files:
         if not dump_file.slot.startswith("vb") or dump_file.extension != "txt":
             continue
-        header = _parse_buffer_header(dump_file.path)
+        header_path = dump_file.data_path if dump_file.data_path and dump_file.data_path.endswith(".txt") else dump_file.path
+        header = _parse_buffer_header(header_path)
         slot_index = _slot_index(dump_file.slot)
         binary_data_path = _binary_data_path_for_slot(draw_files, dump_file.slot)
         payload[dump_file.slot] = {
@@ -599,6 +775,14 @@ def _build_import_paths_payload(files_by_draw: dict[int, list[DumpFile]], all_hi
                     for dump_file in all_draw_files
                     if dump_file.slot == slot and dump_file.extension == "txt"
                 ],
+                "layout_txt": [
+                    dump_file.data_path
+                    for dump_file in all_draw_files
+                    if dump_file.slot == slot
+                    and dump_file.extension == "txt"
+                    and dump_file.data_path
+                    and dump_file.data_path != dump_file.path
+                ],
                 "buf": next(
                     (
                         dump_file.data_path
@@ -624,7 +808,8 @@ def _infer_candidate_local_bone_count(
         for dump_file in draw_files:
             if not dump_file.slot.startswith("vb") or dump_file.extension != "txt":
                 continue
-            header = _parse_buffer_header(dump_file.path)
+            header_path = dump_file.data_path if dump_file.data_path and dump_file.data_path.endswith(".txt") else dump_file.path
+            header = _parse_buffer_header(header_path)
             slot_index = _slot_index(dump_file.slot)
             blend_index_element = next(
                 (
@@ -634,12 +819,19 @@ def _infer_candidate_local_bone_count(
                 ),
                 None,
             )
-            if blend_index_element is None:
+            if blend_index_element is None or not _header_format_is(blend_index_element.fmt, "R8G8B8A8_UINT"):
                 continue
             binary_data_path = _binary_data_path_for_slot(draw_files, dump_file.slot)
+            base_offset = _infer_buffer_data_base_offset(
+                data_path=binary_data_path,
+                header_path=header_path,
+                header=header,
+                slot=dump_file.slot,
+                slot_index=slot_index,
+            )
             max_index = _read_max_blend_index(
                 data_path=binary_data_path,
-                byte_offset=header.byte_offset,
+                byte_offset=base_offset,
                 stride=header.stride,
                 vertex_count=header.vertex_count,
                 blend_offset=blend_index_element.aligned_byte_offset,
@@ -656,6 +848,154 @@ def _infer_candidate_local_bone_count(
             }
         )
     return 0
+
+
+def _infer_buffer_data_base_offset(
+    data_path: str,
+    header_path: str,
+    header: BufferHeader,
+    slot: str,
+    slot_index: int,
+) -> int:
+    if not data_path or not os.path.exists(data_path):
+        return int(header.byte_offset)
+    samples = _first_vertex_samples_from_path(header_path, slot, slot_index)
+    if not samples:
+        return int(header.byte_offset)
+    keyed_by_offset = {
+        int(element.aligned_byte_offset): element
+        for element in header.elements
+        if element.input_slot == slot_index and element.aligned_byte_offset >= 0
+    }
+    comparable_samples = [
+        (field_offset, keyed_by_offset[field_offset], values)
+        for field_offset, values in samples.items()
+        if field_offset in keyed_by_offset
+    ]
+    if not comparable_samples:
+        return int(header.byte_offset)
+    try:
+        with open(data_path, "rb") as file_handle:
+            for delta in range(-64, 65):
+                base_offset = int(header.byte_offset) + delta
+                if base_offset < 0:
+                    continue
+                if all(
+                    _buffer_sample_matches(file_handle, base_offset + field_offset, element, values)
+                    for field_offset, element, values in comparable_samples
+                ):
+                    return base_offset
+    except OSError:
+        return int(header.byte_offset)
+    return int(header.byte_offset)
+
+
+def _first_vertex_samples_from_path(header_path: str, slot: str, slot_index: int) -> dict[int, list[float]]:
+    samples: dict[int, list[float]] = {}
+    if not header_path or not os.path.exists(header_path) or not slot.startswith("vb"):
+        return samples
+    try:
+        slot_number = int(slot[2:])
+    except ValueError:
+        return samples
+    if slot_number != slot_index:
+        return samples
+    in_vertex_data = False
+    with open(header_path, "r", encoding="utf-8", errors="replace") as file_handle:
+        for raw_line in file_handle:
+            line = raw_line.strip()
+            if line == "vertex-data:":
+                in_vertex_data = True
+                continue
+            if not in_vertex_data:
+                continue
+            match = _VERTEX_DATA_RE.match(line)
+            if not match:
+                continue
+            if int(match.group("slot")) != slot_number:
+                continue
+            if int(match.group("vertex")) != 0:
+                break
+            samples[int(match.group("offset"))] = _parse_vertex_data_values(match.group("values"))
+    return samples
+
+
+def _parse_vertex_data_values(value_text: str) -> list[float]:
+    values: list[float] = []
+    for raw_value in value_text.split(","):
+        value = raw_value.strip()
+        if not value:
+            continue
+        try:
+            values.append(float(value))
+        except ValueError:
+            pass
+    return values
+
+
+def _buffer_sample_matches(file_handle, byte_offset: int, element: HeaderElement, expected: list[float]) -> bool:
+    if not expected:
+        return False
+    size = _vertex_format_size(element.fmt)
+    if size <= 0:
+        return False
+    try:
+        file_handle.seek(byte_offset)
+        raw_data = file_handle.read(size)
+    except OSError:
+        return False
+    if len(raw_data) < size:
+        return False
+    actual = _unpack_vertex_format(raw_data, element.fmt)
+    if len(actual) < len(expected):
+        return False
+    return all(abs(float(actual[index]) - float(expected[index])) <= 1e-4 for index in range(len(expected)))
+
+
+def _vertex_format_size(fmt: str) -> int:
+    upper_fmt = str(fmt or "").upper()
+    if upper_fmt in {"R32_FLOAT", "DXGI_FORMAT_R32_FLOAT"}:
+        return 4
+    if upper_fmt in {"R32G32_FLOAT", "DXGI_FORMAT_R32G32_FLOAT"}:
+        return 8
+    if upper_fmt in {"R32G32B32_FLOAT", "DXGI_FORMAT_R32G32B32_FLOAT"}:
+        return 12
+    if upper_fmt in {"R32G32B32A32_FLOAT", "DXGI_FORMAT_R32G32B32A32_FLOAT"}:
+        return 16
+    if upper_fmt in {"R16G16B16A16_UNORM", "DXGI_FORMAT_R16G16B16A16_UNORM"}:
+        return 8
+    if upper_fmt in {"R8G8B8A8_UINT", "DXGI_FORMAT_R8G8B8A8_UINT"}:
+        return 4
+    if upper_fmt in {"R8G8B8A8_SNORM", "DXGI_FORMAT_R8G8B8A8_SNORM"}:
+        return 4
+    return 0
+
+
+def _header_format_is(fmt: str, name: str) -> bool:
+    upper_fmt = str(fmt or "").upper()
+    upper_name = str(name or "").upper()
+    return upper_fmt == upper_name or upper_fmt == f"DXGI_FORMAT_{upper_name}"
+
+
+def _unpack_vertex_format(raw_data: bytes, fmt: str) -> tuple[float, ...]:
+    import struct
+
+    upper_fmt = str(fmt or "").upper()
+    if upper_fmt in {"R32_FLOAT", "DXGI_FORMAT_R32_FLOAT"}:
+        return (float(struct.unpack_from("<f", raw_data, 0)[0]),)
+    if upper_fmt in {"R32G32_FLOAT", "DXGI_FORMAT_R32G32_FLOAT"}:
+        return tuple(float(value) for value in struct.unpack_from("<2f", raw_data, 0))
+    if upper_fmt in {"R32G32B32_FLOAT", "DXGI_FORMAT_R32G32B32_FLOAT"}:
+        return tuple(float(value) for value in struct.unpack_from("<3f", raw_data, 0))
+    if upper_fmt in {"R32G32B32A32_FLOAT", "DXGI_FORMAT_R32G32B32A32_FLOAT"}:
+        return tuple(float(value) for value in struct.unpack_from("<4f", raw_data, 0))
+    if upper_fmt in {"R16G16B16A16_UNORM", "DXGI_FORMAT_R16G16B16A16_UNORM"}:
+        return tuple(float(value) / 65535.0 for value in struct.unpack_from("<4H", raw_data, 0))
+    if upper_fmt in {"R8G8B8A8_UINT", "DXGI_FORMAT_R8G8B8A8_UINT"}:
+        return tuple(float(value) for value in struct.unpack_from("<4B", raw_data, 0))
+    if upper_fmt in {"R8G8B8A8_SNORM", "DXGI_FORMAT_R8G8B8A8_SNORM"}:
+        return tuple(float(value - 256 if value >= 128 else value) / 127.0 for value in struct.unpack_from("<4B", raw_data, 0))
+    return ()
 
 
 def _binary_data_path_for_slot(draw_files: list[DumpFile], slot: str) -> str:

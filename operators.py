@@ -29,6 +29,7 @@ from .core.presets import delete_preset, load_preset, save_preset
 from .core.export_prepare import prepare_export_collection, regenerate_bonestore_runtime_files
 from .core.frameanalysis import infer_mesh_identity_from_name
 from .core.io import read_json
+from .core.import_candidates import import_selected_candidates
 from .core.lod_runtime import build_lod_mapping, scan_lod_targets_and_generate_manifest
 from .core.main_analyze import write_main_analysis_manifest
 from .core.shadow_split import generate_shadow_split
@@ -772,6 +773,7 @@ def _replace_candidate_items_from_manifest(scene, manifest: dict) -> None:
         item.local_bone_count = int(candidate.get("local_bone_count", 0))
         item.draw_count = len(candidate.get("draw_indices", []) or [])
         item.shadow_draw_count = len(candidate.get("shadow_draw_indices", []) or [])
+        item.manual = False
     scene.bmc_candidate_index = min(scene.bmc_candidate_index, max(0, len(scene.bmc_candidate_items) - 1))
 
 
@@ -1801,6 +1803,49 @@ class BMC_OT_analyze_main_frameanalysis(bpy.types.Operator):
         )
         if warning_count:
             message += f"; warnings {warning_count}"
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class BMC_OT_import_selected_candidates(bpy.types.Operator):
+    bl_idname = "object.bmc_import_selected_candidates"
+    bl_label = "Import Selected IBs"
+    bl_description = "Import enabled redesigned candidate IBs from the current capture manifest"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_manifest_path and scene.bmc_candidate_items)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist; run Analyze Main first")
+            return {"CANCELLED"}
+        selected_names = [
+            str(item.display_name)
+            for item in scene.bmc_candidate_items
+            if item.enabled and str(item.display_name)
+        ]
+        if not selected_names:
+            self.report({"ERROR"}, "No enabled candidate IBs selected")
+            return {"CANCELLED"}
+        try:
+            manifest = read_json(manifest_path)
+            target_collection = _ensure_export_collection(context)
+            imported_objects = import_selected_candidates(context, manifest, selected_names, target_collection)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Import Selected IBs failed: {exc}")
+            return {"CANCELLED"}
+        if not imported_objects:
+            self.report({"ERROR"}, "No candidate IBs matched the enabled UI list")
+            return {"CANCELLED"}
+        warning_count = sum(1 for obj in imported_objects if obj.get("bmc_import_warnings"))
+        message = f"Imported {len(imported_objects)} candidate IB object(s) into {target_collection.name}"
+        if warning_count:
+            message += f"; {warning_count} with warnings"
         self.report({"INFO"}, message)
         return {"FINISHED"}
 

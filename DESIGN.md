@@ -109,15 +109,20 @@ The global store placement should be deterministic after validation:
 5. Assign `capture_store_base` sequentially.
 6. Write the resolved mapping into `capture_manifest.json`.
 
-The stable manifest order is based on the source draw's `index_count`, sorted from large to small. The scanner still starts from the target model's known IB hash to find candidate draws in FrameAnalysis, but once the target draw is resolved, global bone placement is assigned by `index_count` order rather than hash order.
+The stable manifest order is based on the user-confirmed Candidate IB list's `match_index_count`, sorted from large to small. The scanner must not depend on fixed VS hashes. Shader hashes are frame-local evidence only.
+
+Analyze should use the g-buffer/display stage as the strongest anchor for locating the target character and then walk back to the early shadow/capture stage to discover the two current shadow VS hashes. This makes the scan resilient when game updates change shader hashes: as long as the visible mesh IBs can be found in g-buffer/display draws and matched back to early shadow draws, the shadow VS pair can be rediscovered.
+
+Transparent parts may not have a g-buffer pass, so g-buffer is not the only source of import candidates. Import candidates can still be discovered from the whole frame as unique IB/VB geometry. The g-buffer anchor is used to resolve the character and the shadow VS pair; the editable Candidate IB list remains the final user-confirmed source for import and global-pool building.
 
 The intended rule is:
 
-1. Read target part identity from the model or preset.
-2. Find the matching FrameAnalysis draw by part IB hash and `match_index_count`.
-3. Record that draw's `index_count` as the primary ordering feature.
-4. Sort accepted capture records by descending `index_count`.
-5. Assign `capture_store_base` sequentially in that sorted order.
+1. Analyze FrameAnalysis and populate the editable Candidate IB list.
+2. Let the user remove unneeded candidates or add/refresh candidates from scene objects.
+3. For each enabled candidate, verify whether the same IB slice appears in the discovered early shadow/capture stage.
+4. Exclude enabled candidates that cannot provide an early-shadow palette from global-pool construction.
+5. Sort accepted capture records by descending `match_index_count`.
+6. Assign `capture_store_base` sequentially in that sorted order.
 
 This keeps large, high-bone parts earlier in the global table and avoids making the global bone layout depend on hash values that may change after a game update.
 
@@ -635,11 +640,13 @@ Sort Selected By Object Hash
 
 This button reads each selected object's first independent 8-hex source hash, finds or creates the matching hash collection under the root, and moves/links the object there. This is only a workflow accelerator. The final export identity is still determined by the destination hash collection.
 
-### Global Pool List And Rename
+### Candidate List And Rename
 
 Global bone mapping is driven by a UI list, not by an extra Blender collection. Too many collections make the workflow harder to understand.
 
-Users select source objects and add them to the Global Pool list. The object source hash is the first independent 8-hex value in the object name. This is used only for building/renaming the source mapping list, not for export identity.
+The Candidate IB list is the single editable source for import and global-pool building. Analyze fills it automatically from FrameAnalysis. Users can add/remove entries manually, and a refresh action can merge source hashes from objects currently under the root collection.
+
+For collection refresh and compatibility renaming, the object source hash is the first independent 8-hex value in the object name or stored custom property. This is used only for refreshing/building/renaming the source mapping list, not for export identity.
 
 The scanner uses the source hash to find current FrameAnalysis data:
 
@@ -655,12 +662,12 @@ Build Global Bone Pool creates:
 
 ```text
 source local bone -> global bone
-capture records sorted by source_index_count descending
+capture records sorted by match_index_count descending
 CaptureMeta / global pool manifest entries
 the single export root collection, if missing
 ```
 
-The pool build may immediately rename mapping-list objects into global vertex-group semantics. A separate Apply Global Bone Names button must also remain available for objects not imported by this plugin.
+The pool build may immediately rename matched source objects into global vertex-group semantics. A separate Apply Global Bone Names button must also remain available for objects not imported by this plugin.
 
 Rename logic:
 
@@ -713,11 +720,12 @@ Analyze follows `mod_importer` where possible, with BoneMerge-specific discovery
 Purpose:
 
 ```text
-find candidate source IBs
-find early shadow/capture region
-find the shadow VS hash pair used by the target character
-collect every draw that matches those shadow VS hashes
-collect draw metadata needed for import and pool building
+find visible/g-buffer anchors for the target character
+walk back to the early shadow/capture region from those anchors
+rediscover the current frame's two shadow VS hashes without hardcoding them
+find unique importable IB/VB geometry across the frame
+mark which candidates have matching early-shadow capture data
+collect draw metadata needed for import, texture marking, and pool building
 populate an editable candidate IB list
 ```
 
@@ -725,19 +733,22 @@ Suggested discovery:
 
 ```text
 1. Parse FrameAnalysis log and dumped draw files.
-2. Locate the target character's early shadow/capture stage.
-3. Identify the two shadow VS hashes used by that stage.
-4. Traverse FrameAnalysis draws and collect every model/draw whose VS hash matches either shadow VS hash.
-5. Merge those hits into candidate IB entries by IB hash plus draw slice identity.
-6. For each candidate IB, record IB hash, match_first_index, match_index_count, index_count, draw indices, VS/PS hashes, VB/IB dump paths, texture candidates, vs-t0 hash, and cb1[5].x/y.
-7. Fill the Candidate IB list.
+2. Find visible/g-buffer-like draws for the target character by output/RT evidence and IB/VB mesh identity.
+3. Use those visible IB slices to locate the earlier matching shadow/capture draws.
+4. Identify the two shadow VS hashes from that early shadow/capture region.
+5. Traverse all FrameAnalysis draws and merge unique importable IB/VB geometry into candidate entries.
+6. For each candidate, choose one import source draw, preferring the strongest visible/material draw and falling back to any valid dump with complete VB0-VB3/IB data.
+7. For each candidate, separately record whether it has matching early-shadow hits under the discovered shadow VS pair.
+8. Fill the Candidate IB list.
 ```
 
-The g-buffer/display stage must not be the source of truth for model import candidates. Transparent objects may not have a g-buffer pass, so a g-buffer-first importer would silently miss valid transparent parts. G-buffer-like draws are still useful as texture and material references, but they are secondary evidence only.
+G-buffer/display draws are the most stable anchor for resolving the target character and finding the current shadow VS pair, because they expose visible material geometry without requiring shader hashes to stay constant across updates. They are not the only import source: transparent objects may not have a g-buffer pass, and some valid meshes may only be available through other material/effect passes. The final import set is therefore the editable Candidate IB list, not "every draw that used a particular VS".
+
+The two shadow VS hashes discovered during Analyze are frame-local filters for capture and delayed shadow replay. They must not become persistent identity. If a game update changes them, a fresh Analyze should rediscover them from the current FrameAnalysis by matching g-buffer/display IBs back to the early shadow/capture stage.
 
 For vertex/index payloads, raw `.buf` dumps are the source of truth. Expanded text dumps and shader disassembly are layout evidence, but actual import data must be sliced from `.buf` with the draw's recorded offset, stride, index count, vertex count, and IA format. This is important because a shared backing buffer can contain many parts, and a deduped or expanded view can appear correct while starting from the wrong byte range.
 
-Users may add/remove candidate IBs before import. This supports partial imports where the user only wants one or a few IBs.
+Users may add/remove candidate IBs before import. This supports partial imports where the user only wants one or a few IBs. The UI may also refresh the Candidate IB list from the current collection, reading object metadata or hash-like names and merging those IBs into the same list.
 
 ### Analysis Manifest
 
@@ -765,21 +776,22 @@ Top-level fields:
 
 #### target
 
-The target describes the user-selected starting point for Analyze.
+The target section describes the automatically resolved frame anchors for Analyze. It is diagnostic output, not a required manual IB input.
 
 ```json
 {
-  "source_ib_hash": "ae1ab184",
-  "source_name": "",
-  "selection_mode": "manual_ib_hash"
+  "visible_anchor_ibs": [
+    "ae1ab184"
+  ],
+  "selection_mode": "auto_gbuffer_anchor"
 }
 ```
 
-`selection_mode` is diagnostic only. It can describe whether the target came from an explicit IB hash, a selected Blender object, or a cached project setting.
+`selection_mode` is diagnostic only. It should describe whether the anchor came from g-buffer/display detection, collection refresh, or a manual candidate entry.
 
 #### shadow_stage
 
-The shadow stage is the source of import candidates.
+The shadow stage is the source of native bone palettes and delayed shadow replay scheduling. It is not the only source of import geometry.
 
 ```json
 {
@@ -797,11 +809,11 @@ The shadow stage is the source of import candidates.
 }
 ```
 
-`shadow_vs_hashes` is the required import filter. `transparent_vs_hash` and `normal_vs_hash` are optional classifications used later by replay scheduling. If classification is ambiguous, keep both VS hashes in `shadow_vs_hashes` and leave the classification fields empty.
+`shadow_vs_hashes` is the required capture filter for this FrameAnalysis. `transparent_vs_hash` and `normal_vs_hash` are optional classifications used later by replay scheduling. If classification is ambiguous, keep both VS hashes in `shadow_vs_hashes` and leave the classification fields empty.
 
 #### draw_hits
 
-Every FrameAnalysis draw whose VS hash matches `shadow_stage.shadow_vs_hashes` becomes a draw hit.
+`draw_hits` records the evidence used by candidates. A candidate can have both import hits from visible/material passes and capture hits from the early shadow stage. Only early-shadow hits whose VS hash matches `shadow_stage.shadow_vs_hashes` are valid bone-palette producers.
 
 ```json
 {
@@ -821,11 +833,12 @@ Every FrameAnalysis draw whose VS hash matches `shadow_stage.shadow_vs_hashes` b
   "cb1_palette_current": 1024,
   "cb1_palette_previous": 1024,
   "producer_dispatch_index": 274,
-  "pass_role": "shadow_unknown"
+  "pass_role": "shadow_unknown",
+  "use_role": "capture"
 }
 ```
 
-`pass_role` is one of `transparent_shadow`, `normal_shadow`, or `shadow_unknown`. It is a scheduling hint, not import identity.
+`pass_role` is one of `transparent_shadow`, `normal_shadow`, `visible_material`, `effect`, or `unknown`. It is a scheduling and material hint, not import identity. `use_role` is one of `import`, `capture`, or `both`.
 
 #### candidate_ibs
 
@@ -839,6 +852,11 @@ Candidate IBs are the editable UI list. They are merged from `draw_hits` by draw
   "match_index_count": 8148,
   "display_name": "ae1ab184-8148-190539",
   "draw_indices": [314, 318, 349, 357],
+  "import_draw_index": 357,
+  "import_vs_hash": "",
+  "import_ps_hash": "",
+  "shadow_capture_ready": true,
+  "shadow_draw_indices": [314, 318],
   "source_index_count": 8148,
   "producer_dispatch_index": 274,
   "local_bone_count": 16,
@@ -851,7 +869,9 @@ Candidate IBs are the editable UI list. They are merged from `draw_hits` by draw
 }
 ```
 
-`enabled` is user-editable. Disabled candidates stay in the manifest for diagnostics but are not imported.
+`enabled` is user-editable. Disabled candidates stay in the manifest for diagnostics but are not imported and do not build the global pool.
+
+`shadow_capture_ready` is the gate for Build Global Bone Pool. A candidate can be importable even when this field is false, but it must be excluded from the global bone pool because the runtime cannot safely capture its native palette from the early shadow stage.
 
 #### texture_candidates
 
@@ -894,7 +914,7 @@ Producer dispatches describe the native bone-palette writes that can be captured
 The dispatch order used for global-pool base assignment is:
 
 ```text
-source_index_count descending for source candidate grouping
+match_index_count descending for source candidate grouping
 then collect_key_value/start_vertex ascending inside one source buffer chain
 then producer_dispatch_index as tie-breaker
 ```
@@ -1180,7 +1200,19 @@ Shape key and morph handling should be reused from `E:/vscode/mod_importer` wher
 
 ### Build Global Bone Pool
 
-Users add source objects to the Global Pool list. Build Global Bone Pool uses the object-name source hash and current FrameAnalysis metadata to create the global capture mapping.
+Build Global Bone Pool consumes the editable Candidate IB list. There is no separate mapping collection or preset list in the simplified workflow.
+
+The accepted pool inputs are:
+
+```text
+enabled candidate
+shadow_capture_ready == true
+local_bone_count > 0
+```
+
+Candidates that were imported only for editing/reference but cannot be matched to the early shadow/capture stage are skipped. This keeps the runtime tables honest: every global-pool source must correspond to native matrices that can actually be captured before delayed replay.
+
+Accepted candidates are sorted by descending `match_index_count`, with larger source chunks occupying earlier global-bone positions and earlier vertex-group naming ranges. Ties use local bone count, mesh fingerprint, first index, and hash only as deterministic tie-breakers.
 
 It also creates the single export root collection if it does not exist. After this step, users edit models and place final meshes under hash collections inside the export root.
 
@@ -1200,12 +1232,12 @@ The main FrameAnalysis is the source of truth for:
 ```text
 candidate IB list
 imported source models
-Global Pool list
+canonical global pool built from enabled capture-ready candidates
 canonical global bone indices
 final export chunks and PaletteTable semantics
 ```
 
-LOD FrameAnalysis folders are optional secondary sources. They are analyzed only after Build Global Bone Pool, because LOD mapping needs the canonical global bone indices created from the user-confirmed Global Pool list.
+LOD FrameAnalysis folders are optional secondary sources. They are analyzed only after Build Global Bone Pool, because LOD mapping needs the canonical global bone indices created from the user-confirmed Candidate IB list.
 
 ### LOD Flow
 
@@ -1214,24 +1246,22 @@ The intended user flow is:
 ```text
 1. Analyze Main.
 2. Import selected main candidates.
-3. User deletes or ignores unneeded imported objects.
-4. User adds only wanted source objects to the Global Pool list.
-5. Build Global Bone Pool.
-6. Analyze LOD.
-7. Generate runtime buffers and INI.
+3. User deletes unwanted candidates from the Candidate IB list or refreshes the list from collection objects.
+4. Build Global Bone Pool from enabled, shadow-capture-ready candidates.
+5. Analyze LOD.
+6. Generate runtime buffers and INI.
 ```
 
-This keeps the two editable lists separate:
+This keeps one editable list as the UI source of truth:
 
 ```text
 Candidate IB List:
-  all main candidates discovered from FrameAnalysis and available for import
-
-Global Pool List:
-  user-confirmed source objects that define the canonical global bone pool
+  all main candidates discovered from FrameAnalysis, plus manual or collection-refreshed entries
+  enabled entries control import
+  enabled + shadow_capture_ready entries control Build Global Bone Pool
 ```
 
-The LOD analyzer must consume the Global Pool list, not the full Candidate IB list. Imported candidates that the user deleted or chose not to add to the pool must not pollute LOD matching.
+The LOD analyzer must consume the built global pool, not the full Candidate IB list. Imported candidates that the user deleted, disabled, or that failed `shadow_capture_ready` must not pollute LOD matching.
 
 ### Main To LOD Draw Linking
 
@@ -1532,7 +1562,7 @@ The core architecture is ready for implementation. Remaining items are verificat
 Implementation should not be constrained by the old plugin architecture. The old Scan/BoneStore/preset code can be used as reference material, but the v2 path should be allowed to replace modules outright when the old shape conflicts with the new data contract. Compatibility is useful only when it does not compromise the main flow:
 
 ```text
-Analyze Main -> Candidate IB List -> Import Selected -> Global Pool List -> Build Global Pool -> Export -> Generate INI
+Analyze Main -> Candidate IB List -> Import Selected -> Build Global Bone Pool -> Export -> Generate INI
 ```
 
 Legacy panels/operators may remain temporarily while the v2 path is built, but they are not architectural requirements.

@@ -1379,6 +1379,42 @@ Candidate IB List:
 
 The LOD analyzer must consume the built global pool, not the full Candidate IB list. Imported candidates that the user deleted or disabled must not pollute LOD matching. Mapping-only/no-shadow candidates can appear in the pool, but they must not be treated as native capture sources unless an LOD mapping explicitly provides a valid capture path. Dynamic/pre-skinned `vb0` candidates are a special ignored class: their collection and pool record are marked, their geometry is skipped when building the canonical/LOD point clouds, and their global slots are not counted as required missing bones during LOD review.
 
+### LOD Repair Fallback
+
+LOD Repair is an advanced, default-collapsed tool. It is not part of the normal exact matching path and must be presented as a cautious fallback.
+
+Prepare Export must check the final export collection against the latest `lod_mapping`:
+
+```text
+if unmatched global bones are not used by exported meshes:
+  export normally
+
+if unmatched global bones are used by exported meshes:
+  block export and ask the user to use LOD Repair
+```
+
+The fallback tool works from the exported mesh weights, not from the original LOD mesh. For each used unmatched global bone `G`, it searches for a matched donor global bone `H`:
+
+```text
+1. Prefer matched groups that share vertices with G.
+2. If none, choose a matched group on the same object with closest weighted point-cloud support.
+3. If none, choose the closest matched group in the export collection.
+4. If no donor exists, keep G unresolved and continue blocking LOD export.
+```
+
+Applying a fallback records:
+
+```text
+G -> inherit donor H
+lod_record_key = H.lod_record_key
+lod_local_bone = H.lod_local_bone
+status = fallback_inherited
+fallback_method
+fallback_confidence
+```
+
+This may make the affected area stiffer, but it should avoid the destructive case where an unfilled or wrong global matrix twists the mesh. The UI must make this distinction clear: fallback means "safe inherited motion", not "true LOD bone match".
+
 ### Main To LOD Draw Linking
 
 Main and LOD IB hashes usually differ. Hash is therefore not the primary relationship key between a main part and a LOD part.

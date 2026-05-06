@@ -106,6 +106,18 @@ class BMC_LodMappingItem(bpy.types.PropertyGroup):
     note: bpy.props.StringProperty(name="Note", default="")
 
 
+class BMC_LodFallbackItem(bpy.types.PropertyGroup):
+    enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+    canonical_global_bone: bpy.props.IntProperty(name="Missing Global", default=0, min=0)
+    donor_global_bone: bpy.props.IntProperty(name="Donor Global", default=-1, min=-1)
+    lod_record_key: bpy.props.StringProperty(name="LOD Source", default="")
+    lod_local_bone: bpy.props.IntProperty(name="LOD Local", default=-1, min=-1)
+    method: bpy.props.StringProperty(name="Method", default="")
+    confidence: bpy.props.FloatProperty(name="Confidence", default=0.0, min=0.0, max=1.0)
+    status: bpy.props.StringProperty(name="Status", default="")
+    note: bpy.props.StringProperty(name="Note", default="")
+
+
 REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Object, "merge_ib_hash"),
     (bpy.types.Object, "merge_match_index_count"),
@@ -132,6 +144,8 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_lod_shadow_host_vs_hash"),
     (bpy.types.Scene, "bmc_lod_match_summary"),
     (bpy.types.Scene, "bmc_lod_match_warning"),
+    (bpy.types.Scene, "bmc_lod_fallback_summary"),
+    (bpy.types.Scene, "bmc_lod_fallback_warning"),
     (bpy.types.Scene, "bmc_scan_auto_apply_mapping"),
     (bpy.types.Scene, "bmc_mapping_payload_json"),
     (bpy.types.Scene, "bmc_target_items"),
@@ -146,6 +160,8 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_alias_index"),
     (bpy.types.Scene, "bmc_lod_mapping_items"),
     (bpy.types.Scene, "bmc_lod_mapping_index"),
+    (bpy.types.Scene, "bmc_lod_fallback_items"),
+    (bpy.types.Scene, "bmc_lod_fallback_index"),
     (bpy.types.Scene, "bmc_seam_match_items"),
     (bpy.types.Scene, "bmc_seam_match_index"),
     (bpy.types.Scene, "bmc_seam_alias_items"),
@@ -302,6 +318,16 @@ def register_addon_properties():
         default="",
         description="Most important warning from the latest Analyze LOD result.",
     )
+    bpy.types.Scene.bmc_lod_fallback_summary = bpy.props.StringProperty(
+        name="LOD Fallback Summary",
+        default="",
+        description="Compact summary of the latest LOD fallback preview/apply operation.",
+    )
+    bpy.types.Scene.bmc_lod_fallback_warning = bpy.props.StringProperty(
+        name="LOD Fallback Warning",
+        default="",
+        description="Most important warning from the latest LOD fallback operation.",
+    )
     bpy.types.Scene.bmc_scan_auto_apply_mapping = bpy.props.BoolProperty(
         name="Auto remap after Scan",
         default=False,
@@ -333,6 +359,8 @@ def register_addon_properties():
     bpy.types.Scene.bmc_alias_index = bpy.props.IntProperty(name="Alias Index", default=0, min=0)
     bpy.types.Scene.bmc_lod_mapping_items = bpy.props.CollectionProperty(type=BMC_LodMappingItem)
     bpy.types.Scene.bmc_lod_mapping_index = bpy.props.IntProperty(name="LOD Mapping Index", default=0, min=0)
+    bpy.types.Scene.bmc_lod_fallback_items = bpy.props.CollectionProperty(type=BMC_LodFallbackItem)
+    bpy.types.Scene.bmc_lod_fallback_index = bpy.props.IntProperty(name="LOD Fallback Index", default=0, min=0)
     bpy.types.Scene.bmc_seam_match_items = bpy.props.CollectionProperty(type=BMC_SeamMatchItem)
     bpy.types.Scene.bmc_seam_match_index = bpy.props.IntProperty(name="Seam Object Index", default=0, min=0)
     bpy.types.Scene.bmc_seam_alias_items = bpy.props.CollectionProperty(type=BMC_SeamAliasItem)

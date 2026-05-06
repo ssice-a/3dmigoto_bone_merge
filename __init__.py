@@ -33,6 +33,7 @@ def register():
         properties.BMC_AliasItem,
         properties.BMC_LodTargetItem,
         properties.BMC_LodMappingItem,
+        properties.BMC_LodFallbackItem,
         properties.BMC_SeamMatchItem,
         properties.BMC_SeamAliasItem,
         panel.BMC_UL_target_items,
@@ -40,6 +41,7 @@ def register():
         panel.BMC_UL_alias_items,
         panel.BMC_UL_lod_target_items,
         panel.BMC_UL_lod_mapping_items,
+        panel.BMC_UL_lod_fallback_items,
         panel.BMC_UL_seam_match_items,
         panel.BMC_UL_seam_alias_items,
         operators.BMC_OT_add_selected_targets,
@@ -67,6 +69,8 @@ def register():
         operators.BMC_OT_build_global_bone_pool,
         operators.BMC_OT_apply_global_bone_pool,
         operators.BMC_OT_analyze_lod_frameanalysis,
+        operators.BMC_OT_preview_lod_fallbacks,
+        operators.BMC_OT_apply_lod_fallbacks,
         operators.BMC_OT_scan_targets,
         operators.BMC_OT_scan_lod_targets,
         operators.BMC_OT_analyze_duplicate_bones,
@@ -87,6 +91,7 @@ def register():
         operators.BMC_OT_delete_preset,
         panel.VIEW3D_PT_bone_merge_capture,
         panel.VIEW3D_PT_bone_merge_hash_tools,
+        panel.VIEW3D_PT_bone_merge_lod_repair,
     )
     _PROPERTIES_MODULE = properties
 

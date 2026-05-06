@@ -97,6 +97,19 @@ class BMC_UL_lod_mapping_items(bpy.types.UIList):
             layout.label(text=str(item.canonical_global_bone))
 
 
+class BMC_UL_lod_fallback_items(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            row.label(text=f"G{item.canonical_global_bone} <- G{item.donor_global_bone}")
+            row.label(text=item.method or item.status or "fallback")
+            row.label(text=f"{float(item.confidence):.2f}")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=str(item.canonical_global_bone))
+
+
 class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -197,3 +210,34 @@ class VIEW3D_PT_bone_merge_hash_tools(bpy.types.Panel):
         layout.operator("object.bmc_apply_global_names_by_object_hash", icon="GROUP_VERTEX", text="Rename To Global")
         layout.operator("object.bmc_revert_global_names_by_object_hash", icon="FILE_REFRESH", text="Rename To Local")
         layout.operator("object.bmc_merge_selected_seam_groups", icon="AUTOMERGE_ON", text="Merge Seam Groups")
+
+
+class VIEW3D_PT_bone_merge_lod_repair(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Bone Merge Capture"
+    bl_label = "LOD Repair"
+    bl_parent_id = "VIEW3D_PT_bone_merge_capture"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        row = layout.row(align=True)
+        row.operator("object.bmc_preview_lod_fallbacks", icon="VIEWZOOM", text="Preview Fallbacks")
+        row.operator("object.bmc_apply_lod_fallbacks", icon="CHECKMARK", text="Apply Fallbacks")
+        if scene.bmc_lod_fallback_summary:
+            icon = "CHECKMARK" if not scene.bmc_lod_fallback_warning else "ERROR"
+            layout.label(text=scene.bmc_lod_fallback_summary, icon=icon)
+        if scene.bmc_lod_fallback_warning:
+            layout.label(text=scene.bmc_lod_fallback_warning, icon="ERROR")
+        if scene.bmc_lod_fallback_items:
+            layout.template_list(
+                "BMC_UL_lod_fallback_items",
+                "",
+                scene,
+                "bmc_lod_fallback_items",
+                scene,
+                "bmc_lod_fallback_index",
+                rows=5,
+            )

@@ -38,7 +38,8 @@ from .core.export_prepare import prepare_export_collection, regenerate_bonestore
 from .core.frameanalysis import infer_mesh_identity_from_name
 from .core.io import read_json, write_json
 from .core.import_candidates import import_selected_candidates
-from .core.lod_analyze import analyze_lod_for_manifest
+from .core.lod_analyze import analyze_lod_for_manifest, review_lod_global_pool_coverage
+from .core.lod_fallback import apply_lod_fallbacks_to_manifest, preview_lod_fallbacks_for_export
 from .core.lod_runtime import build_lod_mapping, scan_lod_targets_and_generate_manifest
 from .core.main_analyze import build_bone_pool_order, write_main_analysis_manifest
 from .core.shadow_split import generate_shadow_split
@@ -623,6 +624,64 @@ def _replace_lod_mapping_items(scene, mapping_entries: list[dict]) -> None:
         item.score = float(mapping_entry.get("score", 0.0))
         item.note = str(mapping_entry.get("note", "") or _lod_mapping_note(mapping_entry))
     scene.bmc_lod_mapping_index = min(scene.bmc_lod_mapping_index, max(0, len(scene.bmc_lod_mapping_items) - 1))
+
+
+def _replace_lod_fallback_items(scene, fallback_entries: list[dict]) -> None:
+    scene.bmc_lod_fallback_items.clear()
+    for fallback in fallback_entries:
+        item = scene.bmc_lod_fallback_items.add()
+        item.enabled = bool(fallback.get("enabled", True))
+        item.canonical_global_bone = int(fallback.get("canonical_global_bone", 0) or 0)
+        item.donor_global_bone = int(fallback.get("donor_global_bone", -1) or -1)
+        item.lod_record_key = str(fallback.get("lod_record_key", "") or "")
+        item.lod_local_bone = int(fallback.get("lod_local_bone", -1) or -1)
+        item.method = str(fallback.get("method", "") or fallback.get("fallback_method", "") or "")
+        item.confidence = float(fallback.get("confidence", fallback.get("fallback_confidence", 0.0)) or 0.0)
+        item.status = str(fallback.get("status", "") or "")
+        item.note = str(fallback.get("note", "") or "")
+    scene.bmc_lod_fallback_index = min(scene.bmc_lod_fallback_index, max(0, len(scene.bmc_lod_fallback_items) - 1))
+
+
+def _store_lod_fallback_preview_on_scene(scene, preview: dict, *, applied: bool = False) -> None:
+    summary = dict(preview.get("summary", {}) or {})
+    fallback_count = int(summary.get("fallback_count", 0) or 0)
+    unresolved_count = int(summary.get("unresolved_count", 0) or 0)
+    unmatched_used_count = int(summary.get("unmatched_used_count", 0) or 0)
+    unused_unmatched_count = int(summary.get("unused_unmatched_count", 0) or 0)
+    prefix = "Applied" if applied else "Preview"
+    scene.bmc_lod_fallback_summary = (
+        f"{prefix}: used unmatched {unmatched_used_count}, fallback {fallback_count}, "
+        f"unresolved {unresolved_count}, unused unmatched {unused_unmatched_count}"
+    )
+    scene.bmc_lod_fallback_warning = ""
+    if unresolved_count:
+        scene.bmc_lod_fallback_warning = "Some used unmatched bones still have no donor; export remains blocked for LOD."
+    elif fallback_count and not applied:
+        scene.bmc_lod_fallback_warning = "Fallbacks are inherited donor bones; inspect before applying."
+    _replace_lod_fallback_items(scene, list(preview.get("fallbacks", []) or []) + list(preview.get("unresolved", []) or []))
+
+
+def _lod_export_blocking_preview(scene, manifest: dict) -> dict:
+    export_collection = scene.bmc_export_collection
+    preview = preview_lod_fallbacks_for_export(export_collection, manifest)
+    _store_lod_fallback_preview_on_scene(scene, preview, applied=False)
+    return preview
+
+
+def _raise_if_lod_unmatched_used_by_export(scene, manifest: dict) -> None:
+    if not manifest.get("lod_mapping"):
+        return
+    preview = _lod_export_blocking_preview(scene, manifest)
+    unmatched_used = list(preview.get("unmatched_used_global_bones", []) or [])
+    if not unmatched_used:
+        return
+    shown = ", ".join(f"G{int(value)}" for value in unmatched_used[:12])
+    if len(unmatched_used) > 12:
+        shown += ", ..."
+    raise ValueError(
+        f"LOD has {len(unmatched_used)} unmatched global bone(s) used by the export palette: {shown}. "
+        "Open LOD Repair, preview carefully, then apply fallbacks if the inherited result is acceptable."
+    )
 
 
 def _lod_mapping_note(mapping_entry: dict) -> str:
@@ -2112,6 +2171,9 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         try:
             source_collection = _ensure_export_collection(context)
             build_collection = _ensure_export_build_collection(context)
+            manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+            if manifest_path and os.path.exists(manifest_path):
+                _raise_if_lod_unmatched_used_by_export(scene, read_json(manifest_path))
             result = prepare_export_collection(
                 context=context,
                 source_collection=source_collection,
@@ -2973,6 +3035,91 @@ class BMC_OT_analyze_lod_frameanalysis(bpy.types.Operator):
         scene.bmc_lod_match_warning = warning_messages[0] if warning_messages else ""
         if warning_messages:
             self.report({"WARNING"}, " | ".join(warning_messages[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_preview_lod_fallbacks(bpy.types.Operator):
+    bl_idname = "object.bmc_preview_lod_fallbacks"
+    bl_label = "Preview LOD Fallbacks"
+    bl_description = "Preview inherited donor mappings for LOD globals that are unmatched but used by the export meshes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_manifest_path and scene.bmc_export_collection)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist")
+            return {"CANCELLED"}
+        try:
+            manifest = read_json(manifest_path)
+            preview = _lod_export_blocking_preview(scene, manifest)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Preview LOD fallbacks failed: {exc}")
+            return {"CANCELLED"}
+
+        summary = dict(preview.get("summary", {}) or {})
+        message = (
+            f"Previewed LOD fallbacks: used unmatched {int(summary.get('unmatched_used_count', 0) or 0)}, "
+            f"fallback {int(summary.get('fallback_count', 0) or 0)}, "
+            f"unresolved {int(summary.get('unresolved_count', 0) or 0)}"
+        )
+        self.report({"INFO"}, message)
+        if scene.bmc_lod_fallback_warning:
+            self.report({"WARNING"}, scene.bmc_lod_fallback_warning)
+        return {"FINISHED"}
+
+
+class BMC_OT_apply_lod_fallbacks(bpy.types.Operator):
+    bl_idname = "object.bmc_apply_lod_fallbacks"
+    bl_label = "Apply LOD Fallbacks"
+    bl_description = "Cautiously apply inherited donor mappings for currently used unmatched LOD globals"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_manifest_path and scene.bmc_export_collection)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist")
+            return {"CANCELLED"}
+        try:
+            manifest = read_json(manifest_path)
+            preview = preview_lod_fallbacks_for_export(scene.bmc_export_collection, manifest)
+            fallbacks = list(preview.get("fallbacks", []) or [])
+            if not fallbacks:
+                _store_lod_fallback_preview_on_scene(scene, preview, applied=False)
+                self.report({"WARNING"}, "No LOD fallback donor could be applied")
+                return {"CANCELLED"}
+            apply_result = apply_lod_fallbacks_to_manifest(manifest, preview)
+            manifest["lod_review"] = review_lod_global_pool_coverage(
+                manifest,
+                list(manifest.get("lod_capture_records", []) or []),
+            )
+            write_json(manifest_path, manifest)
+            _replace_lod_mapping_items(scene, list(manifest.get("lod_mapping", []) or []))
+            _store_lod_fallback_preview_on_scene(scene, preview, applied=True)
+            _update_scene_mapping_payload(scene, manifest_path)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Apply LOD fallbacks failed: {exc}")
+            return {"CANCELLED"}
+
+        applied_count = int(apply_result.get("applied_count", 0) or 0)
+        unresolved_count = len(preview.get("unresolved", []) or [])
+        message = f"Applied {applied_count} LOD fallback mapping(s)"
+        if unresolved_count:
+            message += f"; {unresolved_count} unresolved"
+        self.report({"INFO"}, message)
+        if scene.bmc_lod_fallback_warning:
+            self.report({"WARNING"}, scene.bmc_lod_fallback_warning)
         return {"FINISHED"}
 
 

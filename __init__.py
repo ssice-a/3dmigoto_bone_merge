@@ -65,6 +65,8 @@ def register():
         operators.BMC_OT_candidate_refresh_from_collection,
         operators.BMC_OT_import_selected_candidates,
         operators.BMC_OT_build_global_bone_pool,
+        operators.BMC_OT_apply_global_bone_pool,
+        operators.BMC_OT_analyze_lod_frameanalysis,
         operators.BMC_OT_scan_targets,
         operators.BMC_OT_scan_lod_targets,
         operators.BMC_OT_analyze_duplicate_bones,

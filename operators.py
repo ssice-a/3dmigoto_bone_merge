@@ -38,6 +38,7 @@ from .core.export_prepare import prepare_export_collection, regenerate_bonestore
 from .core.frameanalysis import infer_mesh_identity_from_name
 from .core.io import read_json, write_json
 from .core.import_candidates import import_selected_candidates
+from .core.lod_analyze import analyze_lod_for_manifest
 from .core.lod_runtime import build_lod_mapping, scan_lod_targets_and_generate_manifest
 from .core.main_analyze import build_bone_pool_order, write_main_analysis_manifest
 from .core.shadow_split import generate_shadow_split
@@ -2737,8 +2738,6 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
         if not manifest_path or not os.path.exists(manifest_path):
             self.report({"ERROR"}, "Capture manifest does not exist; run Analyze Main first")
             return {"CANCELLED"}
-        seam_result = None
-        seam_warnings: list[str] = []
         try:
             manifest = read_json(manifest_path)
             candidates = _candidate_payloads_from_ui(scene, manifest)
@@ -2780,6 +2779,47 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
                 ):
                     created_count += 1
             _update_scene_mapping_payload(scene, manifest_path)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Build Global Bone Pool failed: {exc}")
+            return {"CANCELLED"}
+
+        skipped_count = len([item for item in candidates if item.get("enabled", True)]) - len(bone_pool_order)
+        message = f"Built global pool with {len(bone_pool_order)} source IB(s)"
+        message += f"; collections {created_count}"
+        message += f"; compact bones {sum(int(item.get('local_bone_count', 0)) for item in bone_pool_order)}"
+        if unavailable_count > 0:
+            message += f"; {unavailable_count} mapping-only IB(s)"
+        if skipped_count > 0:
+            message += f"; skipped {skipped_count} invalid IB(s)"
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
+    bl_idname = "object.bmc_apply_global_bone_pool"
+    bl_label = "Apply Global Bone Pool"
+    bl_description = "Apply the built global bone pool to candidate source meshes by renaming groups and merging seam groups"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_manifest_path)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist; build the global pool first")
+            return {"CANCELLED"}
+        seam_result = None
+        seam_warnings: list[str] = []
+        try:
+            manifest = read_json(manifest_path)
+            if not manifest.get("bone_pool_order") or not manifest.get("object_remaps"):
+                self.report({"ERROR"}, "Global bone pool is empty; run Build Global Bone Pool first")
+                return {"CANCELLED"}
+            _update_scene_mapping_payload(scene, manifest_path)
             updated_objects, renamed_groups, rename_warnings = _apply_global_names_to_candidate_source_objects(
                 context,
                 manifest,
@@ -2789,21 +2829,15 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
             except Exception as seam_exc:
                 seam_warnings.append(f"Seam merge skipped: {seam_exc}")
         except Exception as exc:
-            self.report({"ERROR"}, f"Build Global Bone Pool failed: {exc}")
+            self.report({"ERROR"}, f"Apply Global Bone Pool failed: {exc}")
             return {"CANCELLED"}
 
-        skipped_count = len([item for item in candidates if item.get("enabled", True)]) - len(bone_pool_order)
-        message = f"Built global pool with {len(bone_pool_order)} source IB(s)"
-        message += f"; collections {created_count}"
-        message += f"; compact bones {sum(int(item.get('local_bone_count', 0)) for item in bone_pool_order)}"
-        if updated_objects:
-            message += f"; global-renamed {updated_objects} object(s), {renamed_groups} group(s)"
+        message = "Applied global bone pool"
+        message += f"; global-renamed {updated_objects} object(s), {renamed_groups} group(s)"
         if seam_result is not None:
             message += f"; seam-merged {seam_result.updated_objects} object(s), {seam_result.renamed_groups} group(s)"
-        if unavailable_count > 0:
-            message += f"; {unavailable_count} mapping-only IB(s)"
-        if skipped_count > 0:
-            message += f"; skipped {skipped_count} invalid IB(s)"
+        else:
+            message += "; seam-merged 0 object(s), 0 group(s)"
         self.report({"INFO"}, message)
         warnings = list(rename_warnings)
         if seam_result is not None:
@@ -2811,6 +2845,75 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
         warnings.extend(seam_warnings)
         if warnings:
             self.report({"WARNING"}, " | ".join(warnings[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_analyze_lod_frameanalysis(bpy.types.Operator):
+    bl_idname = "object.bmc_analyze_lod_frameanalysis"
+    bl_label = "Analyze LOD"
+    bl_description = "Analyze the LOD FrameAnalysis folder and write canonical global-bone scatter mappings into the manifest"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and scene.bmc_manifest_path and scene.bmc_lod_frameanalysis_dir)
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist; build the global pool first")
+            return {"CANCELLED"}
+        try:
+            manifest = read_json(manifest_path)
+            lod_result = analyze_lod_for_manifest(
+                manifest,
+                bpy.path.abspath(str(scene.bmc_lod_frameanalysis_dir or "")),
+                lod_level=1,
+            )
+            manifest["lod_frameanalysis"] = list(lod_result.get("lod_frameanalysis", []) or [])
+            manifest["lod_links"] = list(lod_result.get("lod_links", []) or [])
+            manifest["lod_capture_records"] = list(lod_result.get("lod_capture_records", []) or [])
+            manifest["lod_mapping"] = list(lod_result.get("lod_mapping", []) or [])
+            manifest["lod_validation"] = list(lod_result.get("validation", []) or [])
+            manifest["lod_manifest_snapshot"] = dict(lod_result.get("lod_manifest_snapshot", {}) or {})
+            manifest.setdefault("validation", []).append(
+                {
+                    "severity": "info",
+                    "code": "lod_analysis_built",
+                    "message": f"Built LOD scatter mapping with {len(manifest['lod_capture_records'])} capture record(s).",
+                    "draw_indices": [],
+                }
+            )
+            write_json(manifest_path, manifest)
+            _update_scene_mapping_payload(scene, manifest_path)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Analyze LOD failed: {exc}")
+            return {"CANCELLED"}
+
+        scene.bmc_lod_manifest_path = manifest_path
+        frame_records = list(lod_result.get("lod_frameanalysis", []) or [])
+        frame_record = frame_records[0] if frame_records else {}
+        shadow_stage = dict(frame_record.get("shadow_stage", {}) or {})
+        scene.bmc_lod_shadow_host_hash = str(shadow_stage.get("host_ib_hash", "") or "")
+        scene.bmc_lod_shadow_host_match_index_count = int(shadow_stage.get("host_match_index_count", -1) or -1)
+        scene.bmc_lod_shadow_host_vs_hash = str(shadow_stage.get("transparent_vs_hash", "") or shadow_stage.get("normal_vs_hash", "") or "")
+        matched_count = int(frame_record.get("matched_global_bone_count", 0) or 0)
+        total_count = int(frame_record.get("total_global_bone_count", 0) or 0)
+        capture_count = len(manifest.get("lod_capture_records", []) or [])
+        self.report(
+            {"INFO"},
+            f"Analyzed LOD: matched {matched_count}/{total_count} global bone(s); capture records {capture_count}",
+        )
+        lod_warnings = list(manifest.get("lod_validation", []) or [])
+        warning_messages = [
+            str(item.get("message", ""))
+            for item in lod_warnings
+            if str(item.get("severity", "")).lower() in {"warning", "error"} and str(item.get("message", ""))
+        ]
+        if warning_messages:
+            self.report({"WARNING"}, " | ".join(warning_messages[:3]))
         return {"FINISHED"}
 
 

@@ -519,10 +519,11 @@ Recommended workflow:
 4. Import selected IB models
 5. Add source objects to the global-pool UI list
 6. Build Global Bone Pool
-7. Analyze LOD mappings, if LOD FrameAnalysis folders are configured
-8. Organize/edit meshes inside the same single root collection
-9. Generate buffers, BoneMerge runtime tables, and INI
-10. Inject/modify main INI, if enabled
+7. Apply Global Bone Pool when source mesh vertex groups should be converted/normalized
+8. Analyze LOD mappings, if LOD FrameAnalysis folders are configured
+9. Organize/edit meshes inside the same single root collection
+10. Generate buffers, BoneMerge runtime tables, and INI
+11. Inject/modify main INI, if enabled
 ```
 
 Remove user-facing preset actions. A manifest is regenerated for each build and should not be presented as a reusable mapping preset.
@@ -681,7 +682,9 @@ the single export root collection, if missing
 empty export child collections for accepted candidates, with unavailable markers for no-shadow mappings
 ```
 
-The pool build may immediately rename matched imported/source objects into global vertex-group semantics. This is a convenience step for objects imported by this plugin, because they already carry `bmc_source_ib_hash`, `bmc_match_first_index`, and `bmc_match_index_count`.
+Build Global Bone Pool is data-only. It must not rename vertex groups or merge seam groups. This keeps the pool construction repeatable and lets users rebuild the manifest/collections without mutating meshes.
+
+Apply Global Bone Pool is the separate mutating step for imported/source objects. It renames matched source objects into global vertex-group semantics and then runs seam-group normalization. This is a convenience step for objects imported by this plugin, because they already carry `bmc_source_ib_hash`, `bmc_match_first_index`, and `bmc_match_index_count`.
 
 Rename logic:
 
@@ -730,7 +733,7 @@ Merge Seam Groups
 
 The rename buttons do not use collection membership. They inspect selected mesh objects, or all scene mesh objects when nothing is selected, and look for any 8-hex IB hash in the object name. If the hash uniquely matches a global-pool record, `Rename To Global` applies that source-local to global mapping. `Rename To Local` applies the inverse mapping and clears the global rename metadata. If one hash maps to multiple pool records, the object name must contain the full `hash-index_count-first_index` source key; otherwise the operation must report ambiguity instead of guessing.
 
-`Merge Seam Groups` reuses the same seam vertex-group matcher as the original standalone seam tool. It builds a seam-space mapping from selected mesh objects and renames matched seam groups to the canonical group. Build Global Bone Pool also calls this same function once after automatically renaming candidate source meshes to global groups, so imported IB pool meshes get seam-group normalization without a second UI step. A seam failure must warn instead of cancelling the global-pool build.
+`Merge Seam Groups` reuses the same seam vertex-group matcher as the original standalone seam tool. It builds a seam-space mapping from selected mesh objects and renames matched seam groups to the canonical group. Apply Global Bone Pool also calls this same function once after renaming candidate source meshes to global groups, so imported IB pool meshes get seam-group normalization without using the manual tool. A seam failure must warn instead of cancelling the apply step.
 
 The seam matcher is performance-sensitive. It must cache each mesh's weighted boundary vertices and spatial hash once, then reuse that cache for object-pair matching. Vertices without numeric weights are excluded from seam matching because they cannot contribute to a vertex-group alias. If two matched seam groups already have the same global group number, the matcher treats it as an idempotent no-op rather than an error.
 
@@ -763,12 +766,13 @@ Texture overrides are the exception to direct INI reuse: candidate detection and
 
 ## Analyze And Import Flow
 
-The UI should expose three core build buttons before export:
+The UI should expose four core build buttons before export:
 
 ```text
 Analyze
 Import Selected IBs
 Build Global Bone Pool
+Apply Global Bone Pool
 ```
 
 LOD projects add one optional button after the global pool exists:
@@ -816,7 +820,7 @@ Users may add/remove candidate IBs before import. This supports partial imports 
 
 ### Analysis Manifest
 
-Analyze produces one manifest. Import, Build Global Bone Pool, Generate, and Inject should consume this manifest instead of rescanning FrameAnalysis independently.
+Analyze produces one manifest. Import, Build Global Bone Pool, Apply Global Bone Pool, Generate, and Inject should consume this manifest instead of rescanning FrameAnalysis independently.
 
 Top-level fields:
 
@@ -1086,6 +1090,24 @@ The global bone index and capture-store index have the same meaning in HLSL. Exp
 
 The inline `pairs` array is for diagnostics and project portability. The generated runtime should materialize it into compact static buffers such as `LodCaptureMeta.buf` and `LodCapturePairs.buf`.
 
+#### lod_mapping
+
+`lod_mapping` is the diagnostic per-canonical-bone table generated by Analyze LOD. It is not the final runtime buffer by itself; `lod_capture_records[].scatter_pairs` is the grouped runtime input.
+
+```json
+{
+  "canonical_global_bone": 45,
+  "lod_record_key": "lodhash00-12345-0",
+  "lod_local_bone": 12,
+  "score": 18.5,
+  "votes": 57,
+  "average_distance": 0.002,
+  "status": "matched"
+}
+```
+
+The first implementation writes these LOD fields into the main capture manifest only. INI/HLSL generation should consume the same fields later, but Analyze LOD itself must not emit runtime files yet.
+
 #### validation
 
 Analyze should record warnings and hard failures instead of hiding them in console output.
@@ -1222,7 +1244,7 @@ stride/slot/layout are per candidate import draw
 +8/+16 BLENDINDICES0 R8G8B8A8_UINT or R32G32B32A32_UINT
 ```
 
-`BLENDINDICES0` are source-local palette indices. They are not global bone indices. Import must decode them using the current candidate's `skin_format`, never a project-wide default. Import should keep them as local vertex groups until Build Global Bone Pool renames or maps them. Export localizes the final chunk again and writes compact local indices, while `PaletteTable.buf` maps those final local indices back to global capture-store indices.
+`BLENDINDICES0` are source-local palette indices. They are not global bone indices. Import must decode them using the current candidate's `skin_format`, never a project-wide default. Import should keep them as local vertex groups until Apply Global Bone Pool renames or maps them. Export localizes the final chunk again and writes compact local indices, while `PaletteTable.buf` maps those final local indices back to global capture-store indices.
 
 The source `IB` can be `DXGI_FORMAT_R16_UINT`, even if older exported mods wrote `DXGI_FORMAT_R32_UINT`. Import should record the native index format from FrameAnalysis. Export may choose a wider format only when the generated index data requires it or when reusing an inherited mod_importer rule.
 
@@ -1297,7 +1319,7 @@ global = global_bone_base + compact_index
 compact_index = index of source_local_bone in used_local_bone_indices
 ```
 
-This means imported raw vertex groups may be sparse and overlapping across IBs, but after global renaming they become compact and globally unique for the selected source identity. Runtime capture must therefore use the same sparse-source table; a continuous copy of `0..source_local_bone_count` is no longer semantically correct for compact pools.
+This means imported raw vertex groups may be sparse and overlapping across IBs, but after Apply Global Bone Pool global-renames them they become compact and globally unique for the selected source identity. Runtime capture must therefore use the same sparse-source table; a continuous copy of `0..source_local_bone_count` is no longer semantically correct for compact pools.
 
 It also creates the single export root collection if it does not exist. After this step, users edit models and place final meshes under hash collections inside the export root.
 
@@ -1647,7 +1669,7 @@ The core architecture is ready for implementation. Remaining items are verificat
 Implementation should not be constrained by the old plugin architecture. The old Scan/BoneStore/preset code can be used as reference material, but the v2 path should be allowed to replace modules outright when the old shape conflicts with the new data contract. Compatibility is useful only when it does not compromise the main flow:
 
 ```text
-Analyze Main -> Candidate IB List -> Import Selected -> Build Global Bone Pool -> Export -> Generate INI
+Analyze Main -> Candidate IB List -> Import Selected -> Build Global Bone Pool -> Apply Global Bone Pool -> Export -> Generate INI
 ```
 
 Legacy panels/operators may remain temporarily while the v2 path is built, but they are not architectural requirements.

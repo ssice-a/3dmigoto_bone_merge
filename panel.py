@@ -7,19 +7,6 @@ def _has_scene_props(scene, *names: str) -> bool:
     return all(hasattr(scene, name) for name in names)
 
 
-class BMC_UL_target_items(bpy.types.UIList):
-    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        object_label = item.object_ref.name if getattr(item, "object_ref", None) else item.object_name
-        if self.layout_type in {"DEFAULT", "COMPACT"}:
-            row = layout.row(align=True)
-            row.prop(item, "enabled", text="")
-            row.label(text=object_label or "(unnamed)")
-            row.label(text=item.ib_hash)
-        elif self.layout_type == "GRID":
-            layout.alignment = "CENTER"
-            layout.label(text=object_label or "?")
-
-
 class BMC_UL_candidate_items(bpy.types.UIList):
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
         if self.layout_type in {"DEFAULT", "COMPACT"}:
@@ -35,54 +22,6 @@ class BMC_UL_candidate_items(bpy.types.UIList):
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text=item.ib_hash or "?")
-
-
-class BMC_UL_alias_items(bpy.types.UIList):
-    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        if self.layout_type in {"DEFAULT", "COMPACT"}:
-            row = layout.row(align=True)
-            row.prop(item, "enabled", text="")
-            row.label(text=f"{item.src_object_name}:{item.src_local_bone} -> {item.canonical_object_name}:{item.canonical_local_bone}")
-        elif self.layout_type == "GRID":
-            layout.alignment = "CENTER"
-            layout.label(text=str(item.src_local_bone))
-
-
-class BMC_UL_seam_match_items(bpy.types.UIList):
-    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        object_label = item.object_ref.name if getattr(item, "object_ref", None) else item.object_name
-        if self.layout_type in {"DEFAULT", "COMPACT"}:
-            row = layout.row(align=True)
-            row.prop(item, "enabled", text="")
-            row.label(text=object_label or "(missing)")
-        elif self.layout_type == "GRID":
-            layout.alignment = "CENTER"
-            layout.label(text=object_label or "?")
-
-
-class BMC_UL_seam_alias_items(bpy.types.UIList):
-    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        if self.layout_type in {"DEFAULT", "COMPACT"}:
-            row = layout.row(align=True)
-            row.prop(item, "enabled", text="")
-            row.label(text=f"{item.src_object_name}:{item.src_group} -> {item.dst_object_name}:{item.dst_group}")
-            row.label(text=f"votes={item.votes}")
-        elif self.layout_type == "GRID":
-            layout.alignment = "CENTER"
-            layout.label(text=str(item.src_group))
-
-
-class BMC_UL_lod_target_items(bpy.types.UIList):
-    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        object_label = item.object_ref.name if getattr(item, "object_ref", None) else item.object_name
-        if self.layout_type in {"DEFAULT", "COMPACT"}:
-            row = layout.row(align=True)
-            row.prop(item, "enabled", text="")
-            row.label(text=object_label or "(unnamed)")
-            row.label(text=item.ib_hash)
-        elif self.layout_type == "GRID":
-            layout.alignment = "CENTER"
-            layout.label(text=object_label or "?")
 
 
 class BMC_UL_lod_mapping_items(bpy.types.UIList):

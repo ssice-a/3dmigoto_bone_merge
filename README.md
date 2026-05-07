@@ -2,199 +2,38 @@
 
 Blender addon for building a 3Dmigoto bone-capture pipeline around multiple IBs.
 
-It helps with four related jobs:
+The current workflow is manifest-driven. Presets, legacy target scans, and INI repair flows have been removed so the UI matches the runtime design.
 
-- Scan a `FrameAnalysis` folder and freeze a bone mapping.
-- Save/load that mapping as a preset.
-- Prepare local palettes and `BoneStore.ini` for export.
-- Optionally split `vs == 200` shadow drawing to the final shadow host.
+## Workflow
 
-It also includes an independent `Seam Group Matcher` for fast seam-only vertex group renaming. That tool does not depend on Scan, BoneStore, manifests, or shader dumps.
+1. Set `FrameAnalysis Dir`, then run `Analyze Main`.
+2. Review the generated Candidate IB list. Use `+`, `-`, and refresh to adjust it.
+3. Import enabled candidates when native meshes are needed in Blender.
+4. Run `Build Pool` to create the compact global bone pool and IB region collections.
+5. Run `Apply Pool` to rename candidate vertex groups and merge seam groups.
+6. Optionally set `LOD FrameAnalysis Dir`, then run `Analyze LOD`.
+7. Set `Output Dir`, choose `Buffer Only` or `Buffer + INI`, then run `Export`.
 
-## Install
+The export root is the single source of truth. Child collections under the export root represent final runtime IB regions, and optional `partNN` children split a region when its actually weighted global vertex groups exceed 256.
 
-Copy this folder as `3dmigoto_bone_merge` into Blender's addon folder, then enable:
+## Runtime Shape
 
-`Edit > Preferences > Add-ons > Bone Merge Capture`
+The generated runtime does two jobs:
 
-The panel appears at:
+- Capture native current/previous bone matrices into the canonical global pool.
+- Gather each exported part's `PartLocalToGlobalBoneMap` into a small local pool before replay, bind that pool as `vs-t0`, and redirect `cb1`.
 
-`View3D > Sidebar > Bone Merge Capture`
+Main and LOD capture use the same semantic contract. LOD has its own capture map file because its IB hashes and local bone palettes can differ from the main model.
 
-When developing, close Blender before overwriting the installed addon files. Blender can keep `__init__.py`, `operators.py`, and other files locked.
+`vb0` is Position, `vb1` is Texcoord, `vb2` is Blend, and runtime binds `vb3` to the same Position resource.
 
-## Recommended Workflow
+## Safety Notes
 
-### 1. Target Objects
-
-Use `Target Objects` for the original game IBs whose bone palettes should be captured.
-
-- `Create Target Collection` creates `BMC Bone Palette Targets`.
-- `Add Selected Objects` adds selected mesh objects to the target list.
-- `Sync Targets From Collection` rebuilds the target list from the target collection.
-- `Refresh Target Identity` refreshes only the selected target item.
-
-Target identity is frozen when added or refreshed:
-
-- `object_name`
-- `ib_hash`
-- `local_bone_count`
-
-The `ib_hash` is inferred from the first independent 8-digit hexadecimal fragment in the Blender object name. Names such as `fe47dc61-7014-0.body`, `component_fe47dc61`, and `part_fe47dc61_mesh` all resolve to `fe47dc61`.
-
-`Scan` does not silently re-read edited vertex groups unless you explicitly refresh target identity first.
-
-### 2. Scan / Freeze Mapping
-
-Set `FrameAnalysis Dir`, then click `Scan`.
-
-Scan writes:
-
-- `capture_manifest.json`
-- `BoneStore.ini`
-- frozen `object_remaps`
-- detected last `vs == 200` shadow host
-
-By default, Scan does not modify Blender meshes. If `Auto remap after Scan` is enabled, Scan also applies target remap and old same-bone merge logic. That checkbox is slower and should be used only when you intentionally want the one-click path.
-
-### 3. Mapping Preset
-
-Use `Save Preset` after a good Scan.
-
-Presets are mapping-only snapshots. They save the scan result and shadow host information, but they do not own runtime export output paths.
-
-Use `Load Preset` when you want to reuse an existing mapping without opening the old `FrameAnalysis` folder again.
-
-### 4. Apply Mapping
-
-Use `Legacy Target Remap` only when you want enabled target objects renamed from local numeric vertex groups to global bone groups.
-
-This is intentionally separate from Scan. The safer rhythm is:
-
-1. Scan or load preset.
-2. Apply mapping to selected/target objects only when needed.
-3. Then do seam matching or export.
-
-### 5. Seam Group Matcher
-
-`Seam Group Matcher` is independent. It is for the case where different IBs have different numeric vertex group names but the seam proves they are actually the same bone.
-
-Workflow:
-
-1. Select mesh objects that should participate.
-2. Click `+` in `Seam Group Matcher`.
-3. Click `Build Seam Mapping`.
-4. Inspect the pair summary and alias list.
-5. Click `Apply Seam Mapping`.
-
-Rules:
-
-- It only uses enabled mesh objects in the seam matcher list.
-- It only reads boundary/seam vertices.
-- It compares world-space nearest seam vertices and their visible numeric vertex group weights.
-- It does not read `vs-t0`, manifests, or FrameAnalysis files.
-- If several groups are judged the same bone, the smallest numeric group is canonical.
-- Applying the mapping only renames vertex groups and leaves an empty placeholder with the old name.
-- It does not move, add, or merge weights.
-- If the destination group already exists on the same object, it errors instead of guessing.
-- If matched objects already share the same group number, it errors and asks you to rename first.
-
-This tool is deliberately strict. If it refuses to apply, that is usually safer than silently corrupting a model.
-
-### 6. Prepare Export
-
-Use `3Dmigoto Export`.
-
-- `Export Source` is the collection you edit by hand.
-- Child collections under `Export Source` represent the runtime host chunk.
-- Child collection names should be `<ib_hash>-<match_index_count>-<chunk_index>`, for example `fe47dc61-7014-0`.
-- Target object names do not need to contain `match_index_count`; Scan reads the actual count from FrameAnalysis and the export collection uses that scanned value.
-- `Export Build` is disposable and regenerated by `Prepare Export`.
-
-`Prepare Export` rebuilds:
-
-- `Buffer/*-Palette.buf`
-- `export_manifest.json`
-- `BoneStore.ini`
-
-Only build copies are localized to `0..n-1`. Do not edit `Export Build` as your source of truth.
-
-Important: the exported `Blend.buf` and `Palette.buf` must come from the same build generation. If you change vertex groups, rerun `Prepare Export` and re-export the mesh buffers.
-
-### 7. Modify Main INI
-
-`Modify Main INI` is optional. It moves `vs == 200` shadow payloads to the final shadow host.
-
-It always uses the current `Export Manifest` shown in the panel. There is no separate manifest picker for this step.
-
-Shadow host source order:
-
-1. Loaded mapping preset or latest Scan.
-2. Current `FrameAnalysis` auto-detection.
-3. Manual override fields.
-
-`vs == 201` is not treated as shadow.
-
-## Runtime Protocol
-
-`BoneStore.ini` keeps each captured IB in the same basic structure:
-
-```ini
-[TextureOverride_IB_<hash>_merge]
-hash = <hash>
-match_index_count = <count>
-match_priority = -500
-if vs == 200
-  run = CustomShader_ExtractCB1
-  x100 = <capture_record_index>
-  run = CustomShader_RecordBones
-endif
-run = CustomShader_ExtractCB1
-x101 = <local_bone_count>
-cs-t2 = ResourceLocalPalette_<chunk>
-run = CustomShader_GatherBones
-vs-t0 = ResourceLocalFakeT0_SRV
-run = CustomShader_RedirectCB1
-vs-cb1 = ResourceFakeCB1
-```
-
-`Palette.buf` maps:
-
-`localBone -> globalBone`
-
-The final draw still uses local `BLENDINDICES`, while `GatherBones` fills the local fake `vs-t0` from the global captured buffer.
-
-## Safety Limits
-
-- A single final draw chunk must stay within the game's local bone-index format. In the current workflow, keep each chunk at `<= 256` local bones.
-- Global captured bones can exceed 256 because they are stored in the large BoneStore buffer.
-- If a chunk needs bones captured by a later draw, drawing it too early can still twist. Use a later host, split the mesh, or move shadow drawing to the final shadow host.
-
-## Troubleshooting
-
-### The model is twisted
-
-Check these first:
-
-- `Blend.buf` and `Palette.buf` were generated from the same `Export Build`.
-- You reran `Prepare Export` after changing vertex groups.
-- The source object was not already a localized build copy.
-- The chunk host draw happens after all required bones have been captured.
-- The final chunk uses `<= 256` local bones.
-- `BoneStore.ini` in the mod folder is the newest generated one.
-
-### Seam mapping produced no aliases
-
-Common causes:
-
-- The selected meshes do not share boundary vertices closely enough.
-- Vertex group weights differ more than the tolerance.
-- Vertex groups are not numeric.
-- The seam is not open/boundary geometry from Blender's point of view.
-
-### Addon update did not appear in Blender
-
-Close Blender, copy the addon folder again, reopen Blender, then disable/enable the addon once.
+- Only exported region IBs are skipped.
+- `vs == 200` shadow draws for exported regions are delayed to the final compatible shadow host.
+- Visible replay lives under `if vs != 200`.
+- LOD replay uses LOD texture overrides but replays the canonical exported geometry and part maps.
+- Export blocks if an actually used palette bone is unmatched by LOD until the user applies or accepts LOD fallback repair.
 
 ## Git Notes
 
@@ -204,7 +43,4 @@ Do not commit runtime caches:
 - `*.pyc`
 - `Buffer/`
 - `Meshes/`
-- `presets/`
 - `export_manifest.json`
-
-Those are ignored by `.gitignore` for new files. If pycache files were already tracked in older commits, remove them from the repository index before publishing.

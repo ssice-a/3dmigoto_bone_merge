@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 
 from ..constants import (
     BI4_MAX_BONE_COUNT,
@@ -18,8 +17,7 @@ from .io import ensure_directory, read_json, write_json
 from .models import LocalPaletteRecord
 from .export_buffers import write_part_geometry_buffers
 from .export_package import build_export_plan, write_part_palette_files
-
-_NUMERIC_GROUP_RE = re.compile(r"^\d+$")
+from .vertex_groups import collect_weighted_numeric_vertex_groups
 
 
 def prepare_export_collection(
@@ -119,40 +117,10 @@ def _read_capture_manifest_for_export(output_dir: str, capture_manifest_path: st
 
 
 def _collect_used_numeric_vertex_groups(mesh_obj) -> set[int]:
-    used_groups = {global_group for global_group, _vertex_index, _weight in _iter_weighted_global_assignments(mesh_obj)}
+    used_groups = collect_weighted_numeric_vertex_groups(mesh_obj)
     if not used_groups:
         raise ValueError(f"{mesh_obj.name}: no weighted numeric vertex groups found")
     return used_groups
-
-
-def _iter_weighted_global_assignments(mesh_obj):
-    group_index_to_global = _build_group_index_to_global_map(mesh_obj)
-    for vertex in mesh_obj.data.vertices:
-        for group_element in vertex.groups:
-            global_group = group_index_to_global.get(int(group_element.group))
-            if global_group is None:
-                continue
-            weight = float(group_element.weight)
-            if weight <= 0.0:
-                continue
-            yield global_group, vertex.index, weight
-
-
-def _build_group_index_to_global_map(mesh_obj) -> dict[int, int]:
-    group_index_to_global = {}
-    for vertex_group in mesh_obj.vertex_groups:
-        numeric_group = _parse_numeric_group(vertex_group.name)
-        if numeric_group is None:
-            continue
-        group_index_to_global[vertex_group.index] = numeric_group
-    return group_index_to_global
-
-
-def _parse_numeric_group(group_name: str) -> int | None:
-    raw_name = str(group_name).strip()
-    if not _NUMERIC_GROUP_RE.match(raw_name):
-        return None
-    return int(raw_name)
 
 
 def regenerate_bonestore_runtime_files(

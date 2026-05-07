@@ -33,17 +33,21 @@ def register():
         properties.BMC_CandidateItem,
         properties.BMC_LodMappingItem,
         properties.BMC_LodFallbackItem,
+        properties.BMC_TextureMarkItem,
     )
     RUNTIME_CLASSES = (
         panel.BMC_UL_candidate_items,
         panel.BMC_UL_lod_mapping_items,
         panel.BMC_UL_lod_fallback_items,
+        panel.BMC_UL_texture_mark_items,
         operators.BMC_OT_create_export_collection,
         operators.BMC_OT_add_selected_export_objects,
         operators.BMC_OT_apply_export_collection_global_names,
         operators.BMC_OT_apply_global_names_by_object_hash,
         operators.BMC_OT_revert_global_names_by_object_hash,
         operators.BMC_OT_merge_selected_seam_groups,
+        operators.BMC_OT_mark_texture_semantic,
+        operators.BMC_OT_apply_texture_marks_to_models,
         operators.BMC_OT_prepare_export_collection,
         operators.BMC_OT_analyze_main_frameanalysis,
         operators.BMC_OT_candidate_add_hash,
@@ -56,6 +60,7 @@ def register():
         operators.BMC_OT_preview_lod_fallbacks,
         operators.BMC_OT_apply_lod_fallbacks,
         panel.VIEW3D_PT_bone_merge_capture,
+        panel.VIEW3D_PT_bone_merge_texture_tools,
         panel.VIEW3D_PT_bone_merge_hash_tools,
         panel.VIEW3D_PT_bone_merge_lod_repair,
     )
@@ -75,6 +80,12 @@ def unregister():
 
     if _PROPERTIES_MODULE is not None:
         _PROPERTIES_MODULE.unregister_addon_properties()
+    try:
+        from . import panel
+
+        panel.unregister_preview_cache()
+    except Exception:
+        pass
     for blender_class in reversed(REGISTERED_CLASSES):
         bpy.utils.unregister_class(blender_class)
 

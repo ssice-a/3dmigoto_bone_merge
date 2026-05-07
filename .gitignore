@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.bmc_cache/
 
 # Local runtime/export caches generated while testing the addon.
 Buffer/

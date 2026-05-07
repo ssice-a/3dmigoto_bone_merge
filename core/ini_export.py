@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import re
 import struct
+from pathlib import Path
 
 from ..constants import BONESTORE_INI_FILE_NAME, BUFFER_EXPORT_DIR_NAME
 from .io import ensure_directory, write_uint32_buffer
 from .models import LocalPaletteRecord
+from .texture_converter import write_game_texture
+from .texture_marks import marked_texture_bindings, validate_texture_hash
 
 
 _SAFE_SUFFIX_RE = re.compile(r"[^0-9A-Za-z_]+")
@@ -33,6 +36,7 @@ def materialize_bonestore_runtime(
     capture_manifest: dict,
     local_palette_records: list[LocalPaletteRecord],
     geometry_records: list[dict] | None = None,
+    texture_mark_payload: dict | None = None,
 ) -> dict:
     """Write static runtime buffers and return the normalized runtime plan."""
 
@@ -44,6 +48,7 @@ def materialize_bonestore_runtime(
     palette_records = _normalize_palette_records(normalized_output_dir, local_palette_records)
     geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
     _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
+    texture_records, texture_warnings = _materialize_texture_records(normalized_output_dir, texture_mark_payload or {})
     lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
     lod_key_annotations = _build_lod_key_annotations(capture_manifest, geometry_payloads)
     shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
@@ -88,6 +93,8 @@ def materialize_bonestore_runtime(
         "lod_key_annotations": lod_key_annotations,
         "palettes": palette_records,
         "geometry": geometry_payloads,
+        "textures": texture_records,
+        "texture_warnings": texture_warnings,
         "shadow_stage": _normalize_shadow_stage(capture_manifest),
         "shadow_replay_plan": shadow_replay_plan,
         "lod_shadow_replay_plan": lod_shadow_replay_plan,
@@ -130,7 +137,14 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
     lines.extend(_geometry_resource_sections(runtime_plan))
     if runtime_plan.get("geometry"):
         lines.append("")
+    lines.extend(_texture_resource_sections(runtime_plan))
+    if runtime_plan.get("textures"):
+        lines.append("")
     lines.extend(_texture_override_sections(runtime_plan))
+    if runtime_plan.get("textures"):
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.extend(_texture_hash_override_sections(runtime_plan))
     if lines and lines[-1] != "":
         lines.append("")
     lines.extend(_frame_lifecycle_sections())
@@ -306,6 +320,105 @@ def _normalize_geometry_records(output_directory: str, geometry_records: list[di
             }
         )
     return normalized_records
+
+
+def _materialize_texture_records(output_directory: str, texture_mark_payload: dict) -> tuple[list[dict], list[str]]:
+    """Copy/convert marked textures and return one hash-style replacement record per texture hash."""
+
+    records_by_hash: dict[str, dict] = {}
+    warnings: list[str] = []
+
+    for binding in marked_texture_bindings(texture_mark_payload):
+        texture_hash = str(binding.get("hash", "") or "").strip().lower()
+        if not validate_texture_hash(texture_hash):
+            warnings.append(f"Skipped texture candidate with invalid hash: {texture_hash or '<empty>'}")
+            continue
+
+        source_path = str(binding.get("source_path", "") or "").strip()
+        if not source_path:
+            warnings.append(f"Skipped texture {texture_hash}: missing source path")
+            continue
+        source = Path(source_path)
+        if not source.is_file():
+            warnings.append(f"Skipped texture {texture_hash}: source file not found: {source_path}")
+            continue
+
+        source_key = os.path.normcase(os.path.abspath(str(source)))
+        slot = str(binding.get("slot", "") or "").strip().lower()
+        semantic = str(binding.get("semantic", "") or "").strip().lower()
+        semantic_index = int(binding.get("semantic_index", 0) or 0)
+
+        existing = records_by_hash.get(texture_hash)
+        if existing is not None:
+            if existing["_source_key"] != source_key:
+                raise ValueError(
+                    f"Texture hash {texture_hash} has conflicting replacement sources: "
+                    f"{existing.get('source_path')} and {source_path}"
+                )
+            _append_unique(existing["slots"], slot)
+            _append_unique(existing["semantics"], _texture_semantic_label(semantic, semantic_index))
+            _append_unique(existing["region_keys"], str(binding.get("region_key", "") or ""))
+            _append_unique(existing["draw_keys"], str(binding.get("draw_key", "") or ""))
+            continue
+
+        semantic_slug = _texture_semantic_slug(semantic, semantic_index, slot)
+        file_name = f"{texture_hash}_{semantic_slug}.dds"
+        relative_filename = f"Texture/{file_name}"
+        destination_path = os.path.join(output_directory, relative_filename)
+        written_path = write_game_texture(
+            source,
+            destination_path,
+            slot=slot,
+            semantic=semantic,
+        )
+        records_by_hash[texture_hash] = {
+            "_source_key": source_key,
+            "hash": texture_hash,
+            "resource_name": f"ResourceBMCTexture_{texture_hash}",
+            "filename": _resource_filename(str(written_path), output_directory),
+            "file_path": str(written_path),
+            "source_path": source_path,
+            "slot": slot,
+            "semantic": semantic,
+            "semantic_index": semantic_index,
+            "slots": [slot] if slot else [],
+            "semantics": [_texture_semantic_label(semantic, semantic_index)],
+            "region_keys": [str(binding.get("region_key", "") or "")],
+            "draw_keys": [str(binding.get("draw_key", "") or "")],
+        }
+
+    records = []
+    for texture_hash in sorted(records_by_hash):
+        record = dict(records_by_hash[texture_hash])
+        record.pop("_source_key", None)
+        record["slots"] = [value for value in record.get("slots", []) if value]
+        record["semantics"] = [value for value in record.get("semantics", []) if value]
+        record["region_keys"] = [value for value in record.get("region_keys", []) if value]
+        record["draw_keys"] = [value for value in record.get("draw_keys", []) if value]
+        records.append(record)
+    return records, warnings
+
+
+def _append_unique(values: list, value) -> None:
+    if value in (None, "") or value in values:
+        return
+    values.append(value)
+
+
+def _texture_semantic_label(semantic: str, semantic_index: int) -> str:
+    normalized = str(semantic or "").strip().lower()
+    if not normalized:
+        return ""
+    if normalized in {"material", "effect"}:
+        return f"{normalized}{int(semantic_index)}"
+    return normalized
+
+
+def _texture_semantic_slug(semantic: str, semantic_index: int, slot: str) -> str:
+    label = _texture_semantic_label(semantic, semantic_index)
+    if label:
+        return _safe_suffix(label)
+    return _safe_suffix(str(slot or "texture").replace("-", "_"))
 
 
 def _normalize_object_names(record: dict) -> list[str]:
@@ -925,6 +1038,53 @@ def _geometry_resource_sections(runtime_plan: dict) -> list[str]:
                 "type = Buffer",
                 "format = R32_UINT",
                 f"filename = {record.get('index_filename')}",
+                "",
+            ]
+        )
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _texture_resource_sections(runtime_plan: dict) -> list[str]:
+    texture_records = list(runtime_plan.get("textures", []) or [])
+    if not texture_records:
+        return []
+    lines = [
+        "; -------------------------------------------------",
+        "; Hash-replaced textures",
+        "; -------------------------------------------------",
+    ]
+    for record in texture_records:
+        lines.extend(
+            [
+                f"[{record.get('resource_name')}]",
+                f"filename = {record.get('filename')}",
+                "",
+            ]
+        )
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _texture_hash_override_sections(runtime_plan: dict) -> list[str]:
+    texture_records = list(runtime_plan.get("textures", []) or [])
+    if not texture_records:
+        return []
+    lines = [
+        "; -------------------------------------------------",
+        "; Texture hash replacements",
+        "; -------------------------------------------------",
+    ]
+    for record in texture_records:
+        texture_hash = str(record.get("hash", "") or "").lower()
+        suffix = _safe_suffix(f"{texture_hash}_{record.get('semantic', '')}_{record.get('slot', '')}")
+        lines.extend(
+            [
+                f"[TextureOverride_BMCTexture_{suffix}]",
+                f"hash = {texture_hash}",
+                f"this = {record.get('resource_name')}",
                 "",
             ]
         )

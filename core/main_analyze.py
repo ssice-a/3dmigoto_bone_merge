@@ -223,7 +223,7 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
         for candidate in candidates
         if (str(candidate["ib_hash"]), int(candidate["match_first_index"]), int(candidate["match_index_count"])) in key_index
     }
-    texture_candidates = _build_texture_candidates(files_by_draw, included_key_index)
+    texture_candidates = _build_texture_candidates(files_by_draw, draw_states, included_key_index)
     vertex_layout_table = _build_vertex_layout_table(normalized_frameanalysis_dir, candidates)
     bone_pool_order = build_bone_pool_order(candidates)
     payload = {
@@ -1802,6 +1802,7 @@ def _read_max_blend_index(
 
 def _build_texture_candidates(
     files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
     all_hits_by_key: dict[tuple[str, int, int], list[DumpFile]],
 ) -> list[dict]:
     candidates: list[dict] = []
@@ -1830,7 +1831,7 @@ def _build_texture_candidates(
                     "region_key": region_key,
                     "draw_index": int(draw_index),
                     "ps_hash": dump_file.ps_hash,
-                    "rt_count": -1,
+                    "rt_count": int(draw_states.get(draw_index).rt_count if draw_states.get(draw_index) else -1),
                     "slot": dump_file.slot,
                     "hash": texture_hash,
                     "source_path": dump_file.path,

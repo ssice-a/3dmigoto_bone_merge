@@ -13,6 +13,7 @@ from .constants import (
     BMC_GLOBAL_POOL_GENERATION_PROP,
     BMC_GLOBAL_REMAP_PROP,
     BMC_GLOBAL_SOURCE_KEY_PROP,
+    BMC_TEXTURE_SLOTS_PROP,
     BMC_VERTEX_GROUP_STATE_PROP,
 )
 from .core.blender_ops import (
@@ -34,6 +35,14 @@ from .core.lod_analyze import analyze_lod_for_manifest, review_lod_global_pool_c
 from .core.lod_fallback import apply_lod_fallbacks_to_manifest, preview_lod_fallbacks_for_export
 from .core.main_analyze import build_bone_pool_order, write_main_analysis_manifest
 from .core.seam_matcher import build_and_apply_seam_mapping
+from .core.texture_marks import (
+    dump_texture_mark_payload,
+    marked_texture_bindings,
+    slot_sort_key,
+    texture_candidates_for_draw,
+    validate_texture_hash,
+)
+from .core.texture_materials import apply_material_from_texture_bindings
 from .core.vertex_groups import collect_weighted_numeric_vertex_groups
 
 DEFAULT_EXPORT_COLLECTION_NAME = "BMC Export Sources"
@@ -1091,6 +1100,141 @@ def _update_scene_mapping_payload(scene, manifest_path: str | None = None) -> di
     return payload
 
 
+def _texture_payload_from_scene(scene) -> dict:
+    from . import properties as addon_properties
+
+    return addon_properties.texture_mark_payload_from_scene(scene)
+
+
+def _store_texture_payload_on_scene(scene, payload: dict) -> None:
+    from . import properties as addon_properties
+
+    addon_properties.store_texture_mark_payload_on_scene(scene, payload)
+
+
+def _sync_texture_mark_items(scene) -> None:
+    from . import properties as addon_properties
+
+    addon_properties.sync_texture_mark_items(scene)
+
+
+def _refresh_texture_payload_after_analyze(scene) -> None:
+    payload = _texture_payload_from_scene(scene)
+    _select_default_texture_region(scene, payload)
+    _sync_texture_mark_items(scene)
+
+
+def _select_default_texture_region(scene, payload: dict) -> None:
+    candidates = payload.get("candidates", {})
+    if not isinstance(candidates, dict) or not candidates:
+        return
+    current_region = str(getattr(scene, "bmc_texture_region", "") or "")
+    region_key = current_region if current_region in candidates else next(iter(sorted(candidates)))
+    try:
+        scene.bmc_texture_region = region_key
+    except TypeError:
+        return
+    default_draws = payload.get("default_draws", {})
+    draw_key = str(default_draws.get(region_key, "") or "") if isinstance(default_draws, dict) else ""
+    if draw_key:
+        try:
+            scene.bmc_texture_draw = draw_key
+        except TypeError:
+            pass
+
+
+def _remove_unique_region_texture_semantic(region_marks: dict[str, object], semantic: str, *, keep_draw_key: str, keep_slot: str) -> None:
+    if semantic not in {"base_color", "normal"}:
+        return
+    for draw_key, slot_marks in list(region_marks.items()):
+        if not isinstance(slot_marks, dict):
+            continue
+        for slot, mark in list(slot_marks.items()):
+            if str(draw_key) == str(keep_draw_key) and str(slot) == str(keep_slot):
+                continue
+            if isinstance(mark, dict) and str(mark.get("semantic", "") or "") == semantic:
+                slot_marks.pop(slot, None)
+
+
+def _used_region_semantic_indices(region_marks: dict[str, object], semantic: str, *, skip_draw_key: str, skip_slot: str) -> set[int]:
+    used: set[int] = set()
+    for draw_key, slot_marks in region_marks.items():
+        if not isinstance(slot_marks, dict):
+            continue
+        for slot, mark in slot_marks.items():
+            if str(draw_key) == str(skip_draw_key) and str(slot) == str(skip_slot):
+                continue
+            if isinstance(mark, dict) and str(mark.get("semantic", "") or "") == semantic:
+                used.add(int(mark.get("semantic_index", 0) or 0))
+    return used
+
+
+def _texture_bindings_for_region(payload: dict, region_key: str) -> dict[str, dict[str, object]]:
+    bindings: dict[str, dict[str, object]] = {}
+    for binding in marked_texture_bindings(payload):
+        if str(binding.get("region_key", "") or "") != str(region_key):
+            continue
+        slot = str(binding.get("slot", "") or "").strip().lower()
+        if slot:
+            bindings[slot] = dict(binding)
+    return dict(sorted(bindings.items(), key=lambda item: slot_sort_key(item[0])))
+
+
+def _region_key_from_object(mesh_obj) -> str:
+    identity = _object_candidate_identity(mesh_obj)
+    if identity is None:
+        return ""
+    ib_hash, first_index, index_count = identity
+    if not ib_hash or int(index_count) <= 0:
+        return ""
+    return f"{ib_hash}-{int(index_count)}-{int(first_index)}"
+
+
+def _apply_texture_payload_to_object(mesh_obj, payload: dict, *, region_key: str = "") -> bool:
+    target_region = str(region_key or _region_key_from_object(mesh_obj) or "")
+    if not target_region:
+        return False
+    bindings = _texture_bindings_for_region(payload, target_region)
+    if not bindings:
+        return False
+    mesh_obj[BMC_TEXTURE_SLOTS_PROP] = dump_texture_mark_payload(bindings)
+    return apply_material_from_texture_bindings(mesh_obj, bindings, clear_existing=True)
+
+
+def _selected_mesh_objects(context) -> list[object]:
+    return [obj for obj in context.selected_objects if getattr(obj, "type", "") == "MESH"]
+
+
+def _apply_texture_marks_to_mesh_scope(context, payload: dict) -> tuple[int, int]:
+    objects = _selected_mesh_objects(context)
+    if not objects:
+        export_collection = context.scene.bmc_export_collection
+        if export_collection is not None:
+            seen: set[str] = set()
+            objects = []
+            for mesh_obj in _iter_collection_objects_recursive(export_collection):
+                if getattr(mesh_obj, "type", "") != "MESH" or mesh_obj.name in seen:
+                    continue
+                seen.add(mesh_obj.name)
+                objects.append(mesh_obj)
+
+    matched_count = 0
+    applied_count = 0
+    fallback_region = str(getattr(context.scene, "bmc_texture_region", "") or "")
+    if fallback_region == "__none__":
+        fallback_region = ""
+    for mesh_obj in objects:
+        region_key = _region_key_from_object(mesh_obj)
+        if not region_key and fallback_region:
+            region_key = fallback_region
+        if not region_key or not _texture_bindings_for_region(payload, region_key):
+            continue
+        matched_count += 1
+        if _apply_texture_payload_to_object(mesh_obj, payload, region_key=region_key):
+            applied_count += 1
+    return matched_count, applied_count
+
+
 
 
 
@@ -1340,6 +1484,131 @@ class BMC_OT_merge_selected_seam_groups(bpy.types.Operator):
         self.report({"INFO"}, message)
         if result.skipped_messages:
             self.report({"WARNING"}, " | ".join(result.skipped_messages[:3]))
+        return {"FINISHED"}
+
+
+class BMC_OT_mark_texture_semantic(bpy.types.Operator):
+    bl_idname = "object.bmc_mark_texture_semantic"
+    bl_label = "Mark Texture"
+    bl_description = "Mark the selected texture candidate; export uses hash-style TextureOverride replacement"
+    bl_options = {"REGISTER", "UNDO"}
+
+    slot: bpy.props.StringProperty(name="PS Slot", default="")
+    semantic: bpy.props.EnumProperty(
+        name="Semantic",
+        items=(
+            ("base_color", "Base Color", "Base color texture"),
+            ("normal", "Normal", "Normal map texture"),
+            ("material", "Material", "Material/ORM/detail texture"),
+            ("effect", "Effect", "Effect/emission/special texture"),
+            ("clear", "Clear", "Remove manual mark"),
+        ),
+        default="base_color",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and getattr(scene, "bmc_manifest_path", ""))
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            payload = _texture_payload_from_scene(scene)
+            region_key = str(getattr(scene, "bmc_texture_region", "") or "").strip()
+            draw_key = str(getattr(scene, "bmc_texture_draw", "") or "").strip()
+            slot = str(self.slot or "").strip().lower()
+            if not region_key or region_key == "__none__":
+                raise ValueError("Select a texture region first")
+            if not draw_key or draw_key == "__none__":
+                raise ValueError("Select a texture draw first")
+            draw_candidates, _draw_marks = texture_candidates_for_draw(payload, region_key, draw_key)
+            if slot not in draw_candidates:
+                raise ValueError(f"Texture candidate not found: {region_key} draw {draw_key} {slot}")
+            candidate_hash = str(draw_candidates[slot].get("hash", "") or "")
+            if not validate_texture_hash(candidate_hash):
+                raise ValueError(f"{slot}: texture hash is not a valid 8-hex TextureOverride hash: {candidate_hash}")
+
+            marks = payload.setdefault("marks", {})
+            if not isinstance(marks, dict):
+                marks = {}
+                payload["marks"] = marks
+            region_marks = marks.setdefault(region_key, {})
+            if not isinstance(region_marks, dict):
+                region_marks = {}
+                marks[region_key] = region_marks
+            draw_marks = region_marks.setdefault(draw_key, {})
+            if not isinstance(draw_marks, dict):
+                draw_marks = {}
+                region_marks[draw_key] = draw_marks
+
+            if self.semantic == "clear":
+                draw_marks.pop(slot, None)
+            else:
+                existing = draw_marks.get(slot, {})
+                _remove_unique_region_texture_semantic(
+                    region_marks,
+                    self.semantic,
+                    keep_draw_key=draw_key,
+                    keep_slot=slot,
+                )
+                if isinstance(existing, dict) and existing.get("semantic") == self.semantic:
+                    semantic_index = int(existing.get("semantic_index", 0) or 0)
+                elif self.semantic in {"base_color", "normal"}:
+                    semantic_index = 0
+                else:
+                    used_indices = _used_region_semantic_indices(
+                        region_marks,
+                        self.semantic,
+                        skip_draw_key=draw_key,
+                        skip_slot=slot,
+                    )
+                    semantic_index = 0
+                    while semantic_index in used_indices:
+                        semantic_index += 1
+                draw_marks[slot] = {"semantic": self.semantic, "semantic_index": semantic_index}
+
+            _store_texture_payload_on_scene(scene, payload)
+            _sync_texture_mark_items(scene)
+            matched_count, applied_count = _apply_texture_marks_to_mesh_scope(context, payload)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Mark Texture failed: {exc}")
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            f"Texture mark updated: {slot} -> {self.semantic}; applied materials {applied_count}/{matched_count}",
+        )
+        return {"FINISHED"}
+
+
+class BMC_OT_apply_texture_marks_to_models(bpy.types.Operator):
+    bl_idname = "object.bmc_apply_texture_marks_to_models"
+    bl_label = "Apply Texture Marks To Models"
+    bl_description = "Create/update Blender materials on selected meshes or the export root from current texture marks"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return bool(scene and getattr(scene, "bmc_manifest_path", ""))
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            payload = _texture_payload_from_scene(scene)
+            if not marked_texture_bindings(payload):
+                raise ValueError("No marked textures. Mark at least one texture first.")
+            matched_count, applied_count = _apply_texture_marks_to_mesh_scope(context, payload)
+            _sync_texture_mark_items(scene)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Apply Texture Marks failed: {exc}")
+            return {"CANCELLED"}
+
+        if matched_count <= 0:
+            self.report({"WARNING"}, "No matching mesh objects found for current texture marks")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Applied texture marks to {applied_count}/{matched_count} mesh object(s)")
         return {"FINISHED"}
 
 
@@ -1861,6 +2130,7 @@ class BMC_OT_analyze_main_frameanalysis(bpy.types.Operator):
         shadow_vs_hashes = list(shadow_stage.get("shadow_vs_hashes", []) or [])
         scene.bmc_shadow_host_vs_hash = shadow_vs_hashes[-1] if shadow_vs_hashes else ""
         _replace_candidate_items_from_manifest(scene, payload)
+        _refresh_texture_payload_after_analyze(scene)
 
         warning_count = sum(1 for item in payload.get("validation", []) if item.get("severity") == "warning")
         message = (

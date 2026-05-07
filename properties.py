@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import os
+
 import bpy
 
-from .constants import BMC_GLOBAL_POOL_GENERATION_PROP, BMC_GLOBAL_SOURCE_KEY_PROP
+from .constants import BMC_GLOBAL_POOL_GENERATION_PROP, BMC_GLOBAL_SOURCE_KEY_PROP, BMC_TEXTURE_MARKS_PROP
+from .core.io import read_json
+from .core.texture_marks import (
+    build_texture_mark_payload,
+    dump_texture_mark_payload,
+    load_texture_mark_payload,
+    region_label,
+    slot_sort_key,
+    texture_candidates_for_draw,
+)
 
 
 EXPORT_MODE_ITEMS = (
@@ -55,6 +66,18 @@ class BMC_LodFallbackItem(bpy.types.PropertyGroup):
     note: bpy.props.StringProperty(name="Note", default="")
 
 
+class BMC_TextureMarkItem(bpy.types.PropertyGroup):
+    slot: bpy.props.StringProperty(name="Slot", default="")
+    hash_value: bpy.props.StringProperty(name="Hash", default="")
+    source_path: bpy.props.StringProperty(name="Source", default="", subtype="FILE_PATH")
+    filename: bpy.props.StringProperty(name="Filename", default="")
+    semantic: bpy.props.StringProperty(name="Semantic", default="")
+    semantic_index: bpy.props.IntProperty(name="Semantic Index", default=0, min=0)
+    draw_index: bpy.props.IntProperty(name="Draw", default=0, min=0)
+    ps_hash: bpy.props.StringProperty(name="PS Hash", default="")
+    rt_count: bpy.props.IntProperty(name="RT Count", default=-1, min=-1)
+
+
 REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Object, "merge_ib_hash"),
     (bpy.types.Object, "merge_match_index_count"),
@@ -89,7 +112,126 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_lod_mapping_index"),
     (bpy.types.Scene, "bmc_lod_fallback_items"),
     (bpy.types.Scene, "bmc_lod_fallback_index"),
+    (bpy.types.Scene, "bmc_texture_marks_json"),
+    (bpy.types.Scene, "bmc_texture_region"),
+    (bpy.types.Scene, "bmc_texture_draw"),
+    (bpy.types.Scene, "bmc_texture_mark_items"),
+    (bpy.types.Scene, "bmc_texture_mark_index"),
 )
+
+
+def _read_manifest_payload(scene) -> dict:
+    manifest_path = bpy.path.abspath(str(getattr(scene, "bmc_manifest_path", "") or ""))
+    if not manifest_path or not os.path.exists(manifest_path):
+        return {}
+    try:
+        manifest = read_json(manifest_path)
+    except Exception:
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def _store_texture_mark_payload_on_scene(scene, payload: dict) -> None:
+    serialized = dump_texture_mark_payload(payload)
+    scene.bmc_texture_marks_json = serialized
+    if getattr(scene, "bmc_export_collection", None) is not None:
+        scene.bmc_export_collection[BMC_TEXTURE_MARKS_PROP] = serialized
+
+
+def texture_mark_payload_from_scene(scene) -> dict:
+    stored = str(getattr(scene, "bmc_texture_marks_json", "") or "").strip()
+    if not stored and getattr(scene, "bmc_export_collection", None) is not None:
+        stored = str(scene.bmc_export_collection.get(BMC_TEXTURE_MARKS_PROP, "") or "")
+    existing = load_texture_mark_payload(stored)
+    manifest = _read_manifest_payload(scene)
+    if manifest.get("texture_candidates"):
+        payload = build_texture_mark_payload(manifest, existing)
+    else:
+        payload = existing
+    if payload and dump_texture_mark_payload(payload) != stored:
+        _store_texture_mark_payload_on_scene(scene, payload)
+    return payload
+
+
+def store_texture_mark_payload_on_scene(scene, payload: dict) -> None:
+    _store_texture_mark_payload_on_scene(scene, payload)
+
+
+def _texture_region_items(self, context):  # pylint: disable=unused-argument
+    payload = texture_mark_payload_from_scene(context.scene)
+    candidates = payload.get("candidates", {})
+    if not isinstance(candidates, dict) or not candidates:
+        return [("__none__", "No texture candidates", "Run Analyze Main first")]
+    return [
+        (str(region_key), region_label(str(region_key)), "Texture candidate region")
+        for region_key in sorted(candidates)
+    ]
+
+
+def _texture_draw_items(self, context):  # pylint: disable=unused-argument
+    scene = context.scene
+    payload = texture_mark_payload_from_scene(scene)
+    region_key = str(getattr(scene, "bmc_texture_region", "") or "")
+    candidates = payload.get("candidates", {})
+    region_candidates = candidates.get(region_key, {}) if isinstance(candidates, dict) else {}
+    if not isinstance(region_candidates, dict) or not region_candidates:
+        return [("__none__", "No draw candidates", "Select another texture region")]
+    draws = payload.get("draws", {}).get(region_key, {}) if isinstance(payload.get("draws", {}), dict) else {}
+    items = []
+    for draw_key in sorted(region_candidates, key=lambda value: int(value) if str(value).isdigit() else 0):
+        meta = draws.get(str(draw_key), {}) if isinstance(draws, dict) else {}
+        slot_count = len(region_candidates.get(draw_key, {}) or {})
+        rt_count = int(meta.get("rt_count", -1) or -1) if isinstance(meta, dict) else -1
+        ps_hash = str(meta.get("ps_hash", "") or "") if isinstance(meta, dict) else ""
+        label = f"{int(draw_key):06d}  textures={slot_count}  RT={rt_count}"
+        if ps_hash:
+            label += f"  ps={ps_hash[:8]}"
+        items.append((str(draw_key), label, "Draw texture candidates"))
+    return items or [("__none__", "No draw candidates", "Select another texture region")]
+
+
+def sync_texture_mark_items(scene):
+    if not hasattr(scene, "bmc_texture_mark_items"):
+        return
+    payload = texture_mark_payload_from_scene(scene)
+    region_key = str(getattr(scene, "bmc_texture_region", "") or "")
+    draw_key = str(getattr(scene, "bmc_texture_draw", "") or "")
+    draw_candidates, draw_marks = texture_candidates_for_draw(payload, region_key, draw_key)
+    scene.bmc_texture_mark_items.clear()
+    for slot, binding in sorted(draw_candidates.items(), key=lambda item: slot_sort_key(item[0])):
+        item = scene.bmc_texture_mark_items.add()
+        item.slot = str(slot)
+        item.hash_value = str(binding.get("hash", "") or "")
+        item.source_path = str(binding.get("source_path", "") or "")
+        item.filename = os.path.basename(item.source_path)
+        item.draw_index = int(binding.get("draw_index", 0) or 0)
+        item.ps_hash = str(binding.get("ps_hash", "") or "")
+        item.rt_count = int(binding.get("rt_count", -1) or -1)
+        mark = draw_marks.get(slot, {})
+        if isinstance(mark, dict):
+            item.semantic = str(mark.get("semantic", "") or "")
+            item.semantic_index = int(mark.get("semantic_index", 0) or 0)
+    if scene.bmc_texture_mark_index >= len(scene.bmc_texture_mark_items):
+        scene.bmc_texture_mark_index = max(0, len(scene.bmc_texture_mark_items) - 1)
+
+
+def _update_texture_draw(self, context):  # pylint: disable=unused-argument
+    sync_texture_mark_items(context.scene)
+
+
+def _update_texture_region(self, context):  # pylint: disable=unused-argument
+    scene = context.scene
+    payload = texture_mark_payload_from_scene(scene)
+    default_draws = payload.get("default_draws", {})
+    region_key = str(getattr(scene, "bmc_texture_region", "") or "")
+    draw_key = str(default_draws.get(region_key, "") or "") if isinstance(default_draws, dict) else ""
+    if draw_key:
+        try:
+            scene.bmc_texture_draw = draw_key
+        except TypeError:
+            sync_texture_mark_items(scene)
+    else:
+        sync_texture_mark_items(scene)
 
 
 def register_addon_properties():
@@ -255,6 +397,26 @@ def register_addon_properties():
     bpy.types.Scene.bmc_lod_mapping_index = bpy.props.IntProperty(name="LOD Mapping Index", default=0, min=0)
     bpy.types.Scene.bmc_lod_fallback_items = bpy.props.CollectionProperty(type=BMC_LodFallbackItem)
     bpy.types.Scene.bmc_lod_fallback_index = bpy.props.IntProperty(name="LOD Fallback Index", default=0, min=0)
+    bpy.types.Scene.bmc_texture_marks_json = bpy.props.StringProperty(
+        name="Texture Marks JSON",
+        default="",
+        options={"HIDDEN"},
+        description="Hash-style texture replacement marks cached from the latest Analyze Main run.",
+    )
+    bpy.types.Scene.bmc_texture_region = bpy.props.EnumProperty(
+        name="Texture Region",
+        items=_texture_region_items,
+        update=_update_texture_region,
+        description="IB region whose texture candidates are shown.",
+    )
+    bpy.types.Scene.bmc_texture_draw = bpy.props.EnumProperty(
+        name="Texture Draw",
+        items=_texture_draw_items,
+        update=_update_texture_draw,
+        description="Draw whose PS texture candidates are shown.",
+    )
+    bpy.types.Scene.bmc_texture_mark_items = bpy.props.CollectionProperty(type=BMC_TextureMarkItem)
+    bpy.types.Scene.bmc_texture_mark_index = bpy.props.IntProperty(name="Texture Mark Index", default=0, min=0)
 
 def unregister_addon_properties():
     for owner, attribute_name in REGISTERED_PROPERTY_PATHS:

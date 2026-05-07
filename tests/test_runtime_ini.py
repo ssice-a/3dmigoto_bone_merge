@@ -620,6 +620,54 @@ class RuntimeIniTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "capture-unavailable"):
                 ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette])
 
+    def test_texture_marks_export_hash_style_overrides(self):
+        manifest = {"shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]}, "bone_pool_order": []}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_texture = Path(tmpdir) / "source_abcd1234.dds"
+            source_texture.write_bytes(b"DDS fake-test-texture")
+            texture_payload = {
+                "version": 1,
+                "binding_mode": "texture_hash_override",
+                "candidates": {
+                    "12345678-42-0": {
+                        "99": {
+                            "ps-t7": {
+                                "slot": "ps-t7",
+                                "hash": "abcd1234",
+                                "source_path": str(source_texture),
+                                "draw_index": 99,
+                                "ps_hash": "1111222233334444",
+                                "rt_count": 4,
+                            }
+                        }
+                    }
+                },
+                "marks": {
+                    "12345678-42-0": {
+                        "99": {
+                            "ps-t7": {"semantic": "base_color", "semantic_index": 0}
+                        }
+                    }
+                },
+            }
+
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [],
+                texture_mark_payload=texture_payload,
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+            self.assertEqual(1, len(runtime["textures"]))
+            self.assertTrue((Path(tmpdir) / "Texture" / "abcd1234_base_color.dds").is_file())
+            self.assertIn("[ResourceBMCTexture_abcd1234]", ini_text)
+            self.assertIn("filename = Texture/abcd1234_base_color.dds", ini_text)
+            self.assertIn("[TextureOverride_BMCTexture_abcd1234_base_color_ps_t7]", ini_text)
+            self.assertIn("hash = abcd1234", ini_text)
+            self.assertIn("this = ResourceBMCTexture_abcd1234", ini_text)
+            self.assertNotIn("ps-t7 = ResourceBMCTexture_abcd1234", ini_text)
+
 
 def _read_uints(path: str) -> tuple[int, ...]:
     with open(path, "rb") as handle:

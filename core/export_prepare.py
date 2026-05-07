@@ -10,6 +10,7 @@ from ..constants import (
     BUFFER_EXPORT_DIR_NAME,
     CAPTURE_MANIFEST_FILE_NAME,
     EXPORT_MANIFEST_FILE_NAME,
+    BMC_TEXTURE_MARKS_PROP,
 )
 from .hlsl_assets import export_required_hlsl
 from .ini_export import materialize_bonestore_runtime, write_bonestore_ini
@@ -17,6 +18,7 @@ from .io import ensure_directory, read_json, write_json
 from .models import LocalPaletteRecord
 from .export_buffers import write_part_geometry_buffers
 from .export_package import build_export_plan, write_part_palette_files
+from .texture_marks import load_texture_mark_payload
 from .vertex_groups import collect_weighted_numeric_vertex_groups
 
 
@@ -50,6 +52,7 @@ def prepare_export_collection(
         dict(capture_manifest.get("vertex_layout_table", {}) or {}),
     )
     local_palette_records = [_local_palette_record_from_export_record(record) for record in palette_records]
+    texture_mark_payload = _read_texture_marks_for_export(context, source_collection)
     object_records = []
     for part in export_plan.parts:
         for usage in part.object_usages:
@@ -75,6 +78,7 @@ def prepare_export_collection(
         "bonestore_namespace": "",
         "palettes": palette_records,
         "geometry_buffers": geometry_records,
+        "texture_marks": texture_mark_payload,
         "objects": object_records,
         "warnings": list(export_plan.warnings),
         "note": (
@@ -154,7 +158,8 @@ def regenerate_bonestore_runtime_files(
         export_manifest = read_json(normalized_export_manifest_path)
     geometry_records = list(export_manifest.get("geometry_buffers", []) or []) if isinstance(export_manifest, dict) else []
     _attach_object_names_to_geometry_records(geometry_records, list(export_manifest.get("objects", []) or []))
-    runtime_plan = materialize_bonestore_runtime(output_dir, manifest, palette_records, geometry_records)
+    texture_mark_payload = dict(export_manifest.get("texture_marks", {}) or {}) if isinstance(export_manifest, dict) else {}
+    runtime_plan = materialize_bonestore_runtime(output_dir, manifest, palette_records, geometry_records, texture_mark_payload)
     ini_path = write_bonestore_ini(output_dir, runtime_plan) if write_ini else ""
 
     if normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
@@ -168,6 +173,7 @@ def regenerate_bonestore_runtime_files(
             "lod_replay_links": list(runtime_plan.get("lod_replay_links", []) or []),
             "lod_key_annotations": list(runtime_plan.get("lod_key_annotations", []) or []),
             "geometry": list(runtime_plan.get("geometry", []) or []),
+            "textures": list(runtime_plan.get("textures", []) or []),
             "shadow_stage": dict(runtime_plan.get("shadow_stage", {}) or {}),
             "shadow_replay_plan": dict(runtime_plan.get("shadow_replay_plan", {}) or {}),
             "lod_shadow_replay_plan": dict(runtime_plan.get("lod_shadow_replay_plan", {}) or {}),
@@ -175,6 +181,17 @@ def regenerate_bonestore_runtime_files(
         }
         write_json(normalized_export_manifest_path, export_manifest)
     return ini_path
+
+
+def _read_texture_marks_for_export(context, source_collection) -> dict:
+    raw_payload = ""
+    collection_get = getattr(source_collection, "get", None)
+    if source_collection is not None and callable(collection_get):
+        raw_payload = str(collection_get(BMC_TEXTURE_MARKS_PROP, "") or "")
+    if not raw_payload and getattr(context.scene, "bmc_texture_marks_json", ""):
+        raw_payload = str(context.scene.bmc_texture_marks_json or "")
+    payload = load_texture_mark_payload(raw_payload)
+    return payload if payload.get("marks") else {}
 
 
 def _attach_object_names_to_geometry_records(geometry_records: list[dict], object_records: list[dict]) -> None:

@@ -1,6 +1,76 @@
 """Sidebar panel for the Bone Merge Capture plugin."""
 
+import hashlib
+from pathlib import Path
+
 import bpy
+
+from .core.texture_converter import TextureConversionError, convert_dds_to_png_preview, load_image_for_blender
+
+_PREVIEW_COLLECTION = None
+
+
+def unregister_preview_cache():
+    global _PREVIEW_COLLECTION  # pylint: disable=global-statement
+    if _PREVIEW_COLLECTION is None:
+        return
+    import bpy.utils.previews
+
+    bpy.utils.previews.remove(_PREVIEW_COLLECTION)
+    _PREVIEW_COLLECTION = None
+
+
+def _preview_collection():
+    global _PREVIEW_COLLECTION  # pylint: disable=global-statement
+    if _PREVIEW_COLLECTION is None:
+        import bpy.utils.previews
+
+        _PREVIEW_COLLECTION = bpy.utils.previews.new()
+    return _PREVIEW_COLLECTION
+
+
+def _image_preview_icon(source_path: str) -> int | None:
+    path = Path(str(source_path or ""))
+    if not path.is_file():
+        return None
+    preview_path = path
+    if path.suffix.lower() == ".dds":
+        try:
+            preview_path = convert_dds_to_png_preview(path)
+        except (FileNotFoundError, TextureConversionError):
+            preview_path = path
+
+    try:
+        stat = preview_path.stat()
+        key_payload = f"{preview_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", errors="ignore")
+        preview_key = hashlib.sha1(key_payload).hexdigest()
+        previews = _preview_collection()
+        if preview_key in previews:
+            return int(previews[preview_key].icon_id)
+        thumbnail = previews.load(preview_key, str(preview_path), "IMAGE")
+        return int(thumbnail.icon_id)
+    except Exception:
+        pass
+
+    try:
+        image = load_image_for_blender(path)
+        preview = image.preview_ensure()
+        return int(preview.icon_id)
+    except Exception:
+        return None
+
+
+def _semantic_label(semantic: str, semantic_index: int = 0) -> str:
+    labels = {
+        "base_color": "Base",
+        "normal": "Normal",
+        "material": "Material",
+        "effect": "Effect",
+    }
+    label = labels.get(str(semantic or ""), "Unmarked")
+    if semantic in {"material", "effect"}:
+        label += f" {int(semantic_index)}"
+    return label
 
 
 def _has_scene_props(scene, *names: str) -> bool:
@@ -51,6 +121,22 @@ class BMC_UL_lod_fallback_items(bpy.types.UIList):
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text=str(item.canonical_global_bone))
+
+
+class BMC_UL_texture_mark_items(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            icon_id = _image_preview_icon(item.source_path)
+            if icon_id is not None:
+                row.label(text="", icon_value=icon_id)
+            else:
+                row.label(text="", icon="TEXTURE")
+            row.label(text=f"{item.slot}  {item.hash_value[:8]}  {_semantic_label(item.semantic, item.semantic_index)}")
+            row.label(text=item.filename or "(missing)")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=item.hash_value[:8] or "?")
 
 
 class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
@@ -141,6 +227,64 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         export_box.operator("object.bmc_add_selected_export_objects", icon="ADD", text="Add Selected")
         export_box.prop(scene, "bmc_export_mode", text="")
         export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT", text="Export")
+
+
+class VIEW3D_PT_bone_merge_texture_tools(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Bone Merge Capture"
+    bl_label = "Texture Tools"
+    bl_parent_id = "VIEW3D_PT_bone_merge_capture"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        if not _has_scene_props(scene, "bmc_texture_region", "bmc_texture_draw", "bmc_texture_mark_items"):
+            layout.label(text="Texture properties are not registered.", icon="ERROR")
+            return
+        layout.prop(scene, "bmc_texture_region", text="Region")
+        layout.prop(scene, "bmc_texture_draw", text="Draw")
+        row = layout.row()
+        row.template_list(
+            "BMC_UL_texture_mark_items",
+            "",
+            scene,
+            "bmc_texture_mark_items",
+            scene,
+            "bmc_texture_mark_index",
+            rows=5,
+        )
+        if scene.bmc_texture_mark_items and 0 <= scene.bmc_texture_mark_index < len(scene.bmc_texture_mark_items):
+            item = scene.bmc_texture_mark_items[scene.bmc_texture_mark_index]
+            detail = layout.box()
+            row = detail.row(align=True)
+            icon_id = _image_preview_icon(item.source_path)
+            if icon_id is not None:
+                row.template_icon(icon_value=icon_id, scale=6.0)
+            else:
+                row.label(text="", icon="TEXTURE")
+            info = row.column(align=True)
+            info.label(text=f"{item.slot}  {item.hash_value[:8]}  {_semantic_label(item.semantic, item.semantic_index)}")
+            info.label(text=item.filename or "(missing)")
+            buttons = detail.row(align=True)
+            for semantic, label in (
+                ("base_color", "Base"),
+                ("normal", "Normal"),
+                ("material", "Material"),
+                ("effect", "Effect"),
+            ):
+                op = buttons.operator(
+                    "object.bmc_mark_texture_semantic",
+                    text=label,
+                    depress=item.semantic == semantic,
+                )
+                op.slot = item.slot
+                op.semantic = semantic
+            op = buttons.operator("object.bmc_mark_texture_semantic", text="Clear")
+            op.slot = item.slot
+            op.semantic = "clear"
+        layout.operator("object.bmc_apply_texture_marks_to_models", icon="MATERIAL", text="Apply To Models")
 
 
 class VIEW3D_PT_bone_merge_hash_tools(bpy.types.Panel):

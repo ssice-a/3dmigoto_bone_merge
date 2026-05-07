@@ -342,6 +342,67 @@ class ExportPackageTests(unittest.TestCase):
                 12,
             )
 
+    def test_prepare_export_names_ini_after_export_root_collection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = FakeCollection(
+                "LXi Final Export",
+                children=[
+                    FakeCollection(
+                        "640d1c0e-3-0",
+                        objects=[
+                            FakeObject(
+                                "body",
+                                [0],
+                                positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+                                triangles=[(0, 1, 2)],
+                            )
+                        ],
+                    )
+                ],
+            )
+            capture_manifest_path = Path(tmpdir) / "capture_manifest.json"
+            capture_manifest_path.write_text(
+                json.dumps(
+                    {
+                        "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
+                        "bone_pool_order": [
+                            {
+                                "ib_hash": "640d1c0e",
+                                "match_first_index": 0,
+                                "match_index_count": 3,
+                                "global_bone_base": 0,
+                                "local_bone_count": 1,
+                                "used_local_bone_indices": [0],
+                                "bone_capture_available": True,
+                            }
+                        ],
+                        "vertex_layout_table": {
+                            "640d1c0e-3-0": {
+                                "buffers": {
+                                    "vb0": {"slot": "vb0", "stride": 16, "elements": []},
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = export_prepare.prepare_export_collection(
+                context=FakeContext(tmpdir),
+                source_collection=root,
+                output_dir=tmpdir,
+                capture_manifest_path=str(capture_manifest_path),
+                generate_ini=True,
+            )
+
+            self.assertEqual(Path(result["bonestore_ini_path"]).name, "LXi Final Export.ini")
+            self.assertTrue((Path(tmpdir) / "LXi Final Export.ini").exists())
+            self.assertFalse((Path(tmpdir) / "BoneStore.ini").exists())
+            export_manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(export_manifest["ini_file_name"], "LXi Final Export.ini")
+            self.assertEqual(export_manifest["runtime"]["ini_file_name"], "LXi Final Export.ini")
+
 
 if __name__ == "__main__":
     unittest.main()

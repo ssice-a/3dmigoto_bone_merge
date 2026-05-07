@@ -5,6 +5,7 @@ from pathlib import Path
 
 import bpy
 
+from .core.export_names import ini_filename_from_collection_name
 from .core.texture_converter import TextureConversionError, convert_dds_to_png_preview, load_image_for_blender
 
 _PREVIEW_COLLECTION = None
@@ -71,6 +72,11 @@ def _semantic_label(semantic: str, semantic_index: int = 0) -> str:
     if semantic in {"material", "effect"}:
         label += f" {int(semantic_index)}"
     return label
+
+
+def _export_ini_filename_label(collection) -> str:
+    collection_name = str(getattr(collection, "name", "") or "")
+    return ini_filename_from_collection_name(collection_name)
 
 
 def _has_scene_props(scene, *names: str) -> bool:
@@ -223,7 +229,9 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         export_box = layout.box()
         export_box.label(text="3Dmigoto Export", icon="EXPORT")
         export_box.prop(scene, "bmc_output_dir", text="Output Dir")
-        export_box.prop(scene, "bmc_export_collection", text="Export Root")
+        export_box.label(text="Big Export Collection", icon="OUTLINER_COLLECTION")
+        export_box.prop(scene, "bmc_export_collection", text="Collection")
+        export_box.label(text=f"INI: {_export_ini_filename_label(scene.bmc_export_collection)}", icon="TEXT")
         export_box.operator("object.bmc_add_selected_export_objects", icon="ADD", text="Add Selected")
         export_box.prop(scene, "bmc_export_mode", text="")
         export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT", text="Export")

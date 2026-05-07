@@ -8,6 +8,7 @@ import struct
 from pathlib import Path
 
 from ..constants import BONESTORE_INI_FILE_NAME, BUFFER_EXPORT_DIR_NAME
+from .export_names import ini_filename_from_collection_name
 from .io import ensure_directory, write_uint32_buffer
 from .models import LocalPaletteRecord
 from .texture_converter import write_game_texture
@@ -102,9 +103,10 @@ def materialize_bonestore_runtime(
     }
 
 
-def write_bonestore_ini(output_directory: str, runtime_plan: dict) -> str:
+def write_bonestore_ini(output_directory: str, runtime_plan: dict, ini_file_name: str | None = None) -> str:
     os.makedirs(output_directory, exist_ok=True)
-    ini_path = os.path.join(output_directory, BONESTORE_INI_FILE_NAME)
+    file_name = ini_filename_from_collection_name(ini_file_name or runtime_plan.get("ini_file_name", "") or BONESTORE_INI_FILE_NAME)
+    ini_path = os.path.join(output_directory, file_name)
     with open(ini_path, "w", encoding="utf-8", newline="\n") as file_handle:
         file_handle.write(build_bonestore_ini_content(runtime_plan))
     return ini_path

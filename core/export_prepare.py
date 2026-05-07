@@ -12,6 +12,7 @@ from ..constants import (
     EXPORT_MANIFEST_FILE_NAME,
     BMC_TEXTURE_MARKS_PROP,
 )
+from .export_names import ini_filename_from_collection_name
 from .hlsl_assets import export_required_hlsl
 from .ini_export import materialize_bonestore_runtime, write_bonestore_ini
 from .io import ensure_directory, read_json, write_json
@@ -74,6 +75,7 @@ def prepare_export_collection(
     manifest = {
         "export_source_collection": source_collection.name,
         "export_collection": source_collection.name,
+        "ini_file_name": ini_filename_from_collection_name(source_collection.name),
         "buffer_dir": buffer_dir,
         "bonestore_namespace": "",
         "palettes": palette_records,
@@ -160,13 +162,16 @@ def regenerate_bonestore_runtime_files(
     _attach_object_names_to_geometry_records(geometry_records, list(export_manifest.get("objects", []) or []))
     texture_mark_payload = dict(export_manifest.get("texture_marks", {}) or {}) if isinstance(export_manifest, dict) else {}
     runtime_plan = materialize_bonestore_runtime(output_dir, manifest, palette_records, geometry_records, texture_mark_payload)
-    ini_path = write_bonestore_ini(output_dir, runtime_plan) if write_ini else ""
+    ini_file_name = _ini_file_name_from_export_manifest(export_manifest)
+    runtime_plan["ini_file_name"] = ini_file_name
+    ini_path = write_bonestore_ini(output_dir, runtime_plan, ini_file_name=ini_file_name) if write_ini else ""
 
     if normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
         export_manifest = read_json(normalized_export_manifest_path)
         export_manifest["runtime"] = {
             "schema_version": int(runtime_plan.get("schema_version", 2)),
             "namespace": str(runtime_plan.get("namespace", "")),
+            "ini_file_name": ini_file_name,
             "global_bone_count": int(runtime_plan.get("global_bone_count", 0) or 0),
             "capture_records": list(runtime_plan.get("capture_records", []) or []),
             "lod_capture_records": list(runtime_plan.get("lod_capture_records", []) or []),
@@ -181,6 +186,20 @@ def regenerate_bonestore_runtime_files(
         }
         write_json(normalized_export_manifest_path, export_manifest)
     return ini_path
+
+
+def _ini_file_name_from_export_manifest(export_manifest: dict) -> str:
+    if not isinstance(export_manifest, dict):
+        return BONESTORE_INI_FILE_NAME
+    explicit_name = str(export_manifest.get("ini_file_name", "") or "").strip()
+    if explicit_name:
+        return ini_filename_from_collection_name(explicit_name)
+    collection_name = str(
+        export_manifest.get("export_source_collection", "")
+        or export_manifest.get("export_collection", "")
+        or ""
+    )
+    return ini_filename_from_collection_name(collection_name)
 
 
 def _read_texture_marks_for_export(context, source_collection) -> dict:

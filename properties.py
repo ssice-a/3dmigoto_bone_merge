@@ -307,9 +307,9 @@ def register_addon_properties():
         description="Generated BoneStore.ini path from the latest Export run.",
     )
     bpy.types.Scene.bmc_export_collection = bpy.props.PointerProperty(
-        name="Export Root Collection",
+        name="Big Export Collection",
         type=bpy.types.Collection,
-        description="Single editable root collection containing final IB region and part collections for export.",
+        description="Single editable big collection containing final IB region and part collections. The generated INI uses this collection name.",
     )
     bpy.types.Scene.bmc_export_mode = bpy.props.EnumProperty(
         name="Export Mode",

@@ -149,6 +149,26 @@ class ExportPackageTests(unittest.TestCase):
         self.assertEqual(plan.parts[1].palette_values, (1, 6))
         self.assertEqual(plan.parts[1].region.match_first_index, 5)
 
+    def test_explicit_parts_accept_blender_unique_name_suffixes(self):
+        root = FakeCollection(
+            "ExportRoot",
+            children=[
+                FakeCollection(
+                    "aaaaaaaa-10-5",
+                    children=[
+                        FakeCollection("part00.001", objects=[FakeObject("a", [5, 6])]),
+                        FakeCollection("part01.001", objects=[FakeObject("b", [1, 6])]),
+                    ],
+                )
+            ],
+        )
+
+        plan = export_package.build_export_plan(root, collect_groups)
+
+        self.assertEqual([part.part_name for part in plan.parts], ["part00", "part01"])
+        self.assertEqual(plan.parts[0].palette_values, (5, 6))
+        self.assertEqual(plan.parts[1].palette_values, (1, 6))
+
     def test_direct_meshes_with_explicit_parts_are_planned_as_part00_with_warning(self):
         root = FakeCollection(
             "ExportRoot",

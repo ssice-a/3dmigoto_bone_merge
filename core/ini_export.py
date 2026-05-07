@@ -21,6 +21,11 @@ _CAPTURE_BONE_RECORD_STRIDE = 4
 _CAPTURE_BONE_PAIR_STRIDE = 2
 _CAPTURE_FLAG_MAIN = 0
 _CAPTURE_FLAG_LOD = 1
+_MAX_INSTANCE_SLOTS = 4
+_GLOBAL_BONE_POOL_ROWS_PER_SLOT = 200000
+_LOCAL_BONE_POOL_ROWS_PER_SLOT = 2048
+_CB1_ROWS = 4096
+_RUNTIME_STATE_ROWS = 64
 
 
 def build_bonestore_namespace(output_directory: str) -> str:
@@ -35,6 +40,7 @@ def materialize_bonestore_runtime(
     output_directory: str,
     capture_manifest: dict,
     local_palette_records: list[LocalPaletteRecord],
+    geometry_records: list[dict] | None = None,
 ) -> dict:
     """Write static runtime buffers and return the normalized runtime plan."""
 
@@ -44,6 +50,8 @@ def materialize_bonestore_runtime(
     capture_records, main_capture_bone_map = _build_main_capture_bone_map(capture_manifest)
     lod_records, lod_capture_bone_map = _build_lod_capture_bone_map(capture_manifest)
     palette_records = _normalize_palette_records(normalized_output_dir, local_palette_records)
+    geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
+    _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
     _validate_palette_globals(capture_manifest, palette_records)
 
     main_capture_bone_map_path = write_uint32_buffer(
@@ -79,6 +87,7 @@ def materialize_bonestore_runtime(
         "capture_records": capture_records,
         "lod_capture_records": lod_records,
         "palettes": palette_records,
+        "geometry": geometry_payloads,
         "buffers": buffers,
     }
 
@@ -104,7 +113,8 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
             "; Runtime schema v2:",
             ";   main capture: record index -> MainCaptureBoneMap",
             ";   LOD capture:  record index -> LodCaptureBoneMap",
-            ";   consume:      exported part local bone -> canonical global BoneStore pool",
+            ";   consume:      part local bone -> canonical global BoneStore pool",
+            ";   runtime:      one INI, inline TextureOverride flow, shared HLSL algorithms",
             "",
         ]
     )
@@ -118,7 +128,13 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
     lines.extend(_local_palette_sections(runtime_plan))
     if runtime_plan.get("palettes"):
         lines.append("")
-    lines.extend(_capture_override_sections(runtime_plan))
+    lines.extend(_geometry_resource_sections(runtime_plan))
+    if runtime_plan.get("geometry"):
+        lines.append("")
+    lines.extend(_texture_override_sections(runtime_plan))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_frame_lifecycle_sections())
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -243,6 +259,74 @@ def _normalize_palette_records(output_directory: str, local_palette_records: lis
     return normalized_records
 
 
+def _normalize_geometry_records(output_directory: str, geometry_records: list[dict]) -> list[dict]:
+    normalized_records: list[dict] = []
+    seen_suffixes: set[str] = set()
+    for record in geometry_records:
+        ib_hash = str(record.get("ib_hash", "") or "").lower()
+        match_index_count = int(record.get("match_index_count", 0) or 0)
+        match_first_index = int(record.get("match_first_index", 0) or 0)
+        part_index = int(record.get("part_index", 0) or 0)
+        suffix = _safe_suffix(f"{ib_hash}_{match_index_count}_{match_first_index}_part{part_index:02d}")
+        if suffix in seen_suffixes:
+            continue
+        seen_suffixes.add(suffix)
+
+        index_buffer = dict(record.get("index_buffer", {}) or {})
+        vertex_buffers = {}
+        for slot_name, vertex_buffer in sorted(dict(record.get("vertex_buffers", {}) or {}).items()):
+            slot = str(slot_name or "").lower()
+            role = str(vertex_buffer.get("role", _slot_resource_role(slot)) or _slot_resource_role(slot))
+            file_path = str(vertex_buffer.get("file_path", "") or "")
+            vertex_buffers[slot] = {
+                "slot": slot,
+                "role": role,
+                "resource_name": f"ResourcePart_{suffix}_{role}",
+                "file_name": str(vertex_buffer.get("file_name", "") or os.path.basename(file_path)),
+                "file_path": file_path,
+                "filename": _resource_filename(file_path, output_directory) if file_path else str(vertex_buffer.get("file_name", "") or ""),
+                "stride": int(vertex_buffer.get("stride", 0) or 0),
+                "vertex_count": int(vertex_buffer.get("vertex_count", 0) or 0),
+            }
+
+        index_file_path = str(index_buffer.get("file_path", "") or "")
+        normalized_records.append(
+            {
+                "region_collection": str(record.get("region_collection", "") or ""),
+                "part_name": str(record.get("part_name", f"part{part_index:02d}") or f"part{part_index:02d}"),
+                "ib_hash": ib_hash,
+                "match_first_index": match_first_index,
+                "match_index_count": match_index_count,
+                "part_index": part_index,
+                "resource_suffix": suffix,
+                "index_count": int(index_buffer.get("index_count", 0) or 0),
+                "index_resource_name": f"ResourcePart_{suffix}_Index",
+                "index_filename": _resource_filename(index_file_path, output_directory) if index_file_path else str(index_buffer.get("file_name", "") or ""),
+                "vertex_buffers": vertex_buffers,
+            }
+        )
+    return normalized_records
+
+
+def _attach_palette_metadata_to_geometry(geometry_records: list[dict], palette_records: list[dict]) -> None:
+    local_counts = {
+        str(record.get("resource_suffix", "") or ""): int(record.get("local_bone_count", 0) or 0)
+        for record in palette_records
+    }
+    missing_suffixes: list[str] = []
+    for record in geometry_records:
+        suffix = str(record.get("resource_suffix", "") or "")
+        if suffix not in local_counts:
+            missing_suffixes.append(suffix)
+            continue
+        record["local_bone_count"] = local_counts[suffix]
+    if missing_suffixes:
+        raise ValueError(
+            "Geometry buffer(s) are missing matching PartLocalToGlobalBoneMap palette record(s): "
+            + ", ".join(missing_suffixes[:8])
+        )
+
+
 def _validate_palette_globals(capture_manifest: dict, palette_records: list[dict]) -> None:
     unavailable = _capture_unavailable_global_bones(capture_manifest)
     if not unavailable:
@@ -298,6 +382,8 @@ def _shader_override_sections(runtime_plan: dict) -> list[str]:
 
 def _resource_sections(runtime_plan: dict) -> list[str]:
     buffers = dict(runtime_plan.get("buffers", {}) or {})
+    global_pool_rows = _GLOBAL_BONE_POOL_ROWS_PER_SLOT * _MAX_INSTANCE_SLOTS
+    local_pool_rows = _LOCAL_BONE_POOL_ROWS_PER_SLOT * _MAX_INSTANCE_SLOTS
     lines = [
         "; -------------------------------------------------",
         "; Static capture tables",
@@ -314,56 +400,62 @@ def _resource_sections(runtime_plan: dict) -> list[str]:
     lines.extend(
         [
             "",
-        "; -------------------------------------------------",
-        "; Shared runtime buffers",
-        "; -------------------------------------------------",
-        "[ResourceDumpedCB1_UAV]",
-        "type = RWStructuredBuffer",
-        "stride = 16",
-        "array = 4096",
-        "",
-        "[ResourceDumpedCB1_SRV]",
-        "type = Buffer",
-        "stride = 16",
-        "array = 4096",
-        "",
-        "[ResourceFakeCB1_UAV]",
-        "type = RWStructuredBuffer",
-        "stride = 16",
-        "array = 4096",
-        "",
-        "[ResourceFakeCB1]",
-        "type = Buffer",
-        "stride = 16",
-        "format = R32G32B32A32_UINT",
-        "array = 4096",
-        "",
-        "[ResourceFakeT0_UAV]",
-        "type = RWStructuredBuffer",
-        "stride = 16",
-        "array = 200000",
-        "",
-        "[ResourceFakeT0_SRV]",
-        "type = StructuredBuffer",
-        "stride = 16",
-        "array = 200000",
-        "",
-        "[ResourceLocalFakeT0_UAV]",
-        "type = RWStructuredBuffer",
-        "stride = 16",
-        "array = 4096",
-        "",
-        "[ResourceLocalFakeT0_SRV]",
-        "type = StructuredBuffer",
-        "stride = 16",
-        "array = 4096",
+            "; -------------------------------------------------",
+            "; Shared runtime buffers",
+            "; -------------------------------------------------",
+            "[ResourceDumpedCB1_UAV]",
+            "type = RWStructuredBuffer",
+            "stride = 16",
+            f"array = {_CB1_ROWS}",
+            "",
+            "[ResourceDumpedCB1_SRV]",
+            "type = Buffer",
+            "stride = 16",
+            f"array = {_CB1_ROWS}",
+            "",
+            "[ResourceFakeCB1_UAV]",
+            "type = RWStructuredBuffer",
+            "stride = 16",
+            f"array = {_CB1_ROWS}",
+            "",
+            "[ResourceFakeCB1]",
+            "type = Buffer",
+            "stride = 16",
+            "format = R32G32B32A32_UINT",
+            f"array = {_CB1_ROWS}",
+            "",
+            "[ResourceGlobalBonePool_UAV]",
+            "type = RWStructuredBuffer",
+            "stride = 16",
+            f"array = {global_pool_rows}",
+            "",
+            "[ResourceGlobalBonePool_SRV]",
+            "type = StructuredBuffer",
+            "stride = 16",
+            f"array = {global_pool_rows}",
+            "",
+            "[ResourceLocalBonePool_UAV]",
+            "type = RWStructuredBuffer",
+            "stride = 16",
+            f"array = {local_pool_rows}",
+            "",
+            "[ResourceLocalBonePool_SRV]",
+            "type = StructuredBuffer",
+            "stride = 16",
+            f"array = {local_pool_rows}",
+            "",
+            "[ResourceRuntimeState_UAV]",
+            "type = RWStructuredBuffer",
+            "stride = 16",
+            f"array = {_RUNTIME_STATE_ROWS}",
         ]
     )
     return lines
 
 
 def _custom_shader_sections(runtime_plan: dict) -> list[str]:
-    lines = [
+    _ = runtime_plan
+    return [
         "; -------------------------------------------------",
         "; Shaders",
         "; -------------------------------------------------",
@@ -380,58 +472,48 @@ def _custom_shader_sections(runtime_plan: dict) -> list[str]:
         "ResourceDumpedCB1_SRV = copy ResourceDumpedCB1_UAV",
         "",
         "[CustomShader_RecordBones]",
-        "cs = hlsl\\record_bones_dynamic_cs.hlsl",
+        "cs = hlsl\\record_bones_cs.hlsl",
         "cs-t0 = vs-t0",
         "cs-t1 = ResourceDumpedCB1_SRV",
-        "cs-t2 = ResourceMainCaptureBoneMap",
-        "cs-u1 = ResourceFakeT0_UAV",
-        "dispatch = 64, 1, 1",
+        "cs-u1 = ResourceGlobalBonePool_UAV",
+        "cs-u2 = ResourceRuntimeState_UAV",
+        "dispatch = 1, 1, 1",
         "cs-u1 = null",
+        "cs-u2 = null",
         "cs-t0 = null",
         "cs-t1 = null",
         "cs-t2 = null",
+        "ResourceGlobalBonePool_SRV = copy ResourceGlobalBonePool_UAV",
         "",
-    ]
-    if runtime_plan.get("lod_capture_records"):
-        lines.extend(
-            [
-        "[CustomShader_RecordBonesScatter]",
-        "cs = hlsl\\record_bones_scatter_cs.hlsl",
-        "cs-t0 = vs-t0",
-        "cs-t1 = ResourceDumpedCB1_SRV",
-        "cs-t2 = ResourceLodCaptureBoneMap",
-        "cs-u1 = ResourceFakeT0_UAV",
-        "dispatch = 64, 1, 1",
+        "[CustomShader_GatherLocalBones]",
+        "cs = hlsl\\gather_local_bones_cs.hlsl",
+        "cs-t0 = ResourceGlobalBonePool_SRV",
+        "cs-u1 = ResourceLocalBonePool_UAV",
+        "cs-u2 = ResourceRuntimeState_UAV",
+        "dispatch = 1, 1, 1",
         "cs-u1 = null",
-        "cs-t0 = null",
-        "cs-t1 = null",
-        "cs-t2 = null",
-        "",
-            ]
-        )
-    lines.extend(
-        [
-        "[CustomShader_GatherBones]",
-        "cs = hlsl\\gather_bones_cs.hlsl",
-        "cs-t0 = ResourceFakeT0_SRV",
-        "cs-u1 = ResourceLocalFakeT0_UAV",
-        "dispatch = 64, 1, 1",
-        "cs-u1 = null",
+        "cs-u2 = null",
         "cs-t0 = null",
         "cs-t2 = null",
-        "ResourceLocalFakeT0_SRV = copy ResourceLocalFakeT0_UAV",
+        "ResourceLocalBonePool_SRV = copy ResourceLocalBonePool_UAV",
         "",
         "[CustomShader_RedirectCB1]",
         "cs = hlsl\\redirect_cb1_cs.hlsl",
         "cs-t0 = ResourceDumpedCB1_SRV",
         "cs-u0 = ResourceFakeCB1_UAV",
-        "dispatch = 4, 1, 1",
+        "cs-u2 = ResourceRuntimeState_UAV",
+        "dispatch = 1, 1, 1",
         "cs-u0 = null",
+        "cs-u2 = null",
         "cs-t0 = null",
         "ResourceFakeCB1 = copy ResourceFakeCB1_UAV",
-        ]
-    )
-    return lines
+        "",
+        "[CustomShader_ResetRuntimeState]",
+        "cs = hlsl\\reset_runtime_state_cs.hlsl",
+        "cs-u2 = ResourceRuntimeState_UAV",
+        "dispatch = 1, 1, 1",
+        "cs-u2 = null",
+    ]
 
 
 def _local_palette_sections(runtime_plan: dict) -> list[str]:
@@ -441,7 +523,7 @@ def _local_palette_sections(runtime_plan: dict) -> list[str]:
 
     lines: list[str] = [
         "; -------------------------------------------------",
-        "; Export part local-to-global bone maps and consume command lists",
+        "; Export part local-to-global bone maps",
         "; -------------------------------------------------",
     ]
     for record in palette_records:
@@ -453,15 +535,46 @@ def _local_palette_sections(runtime_plan: dict) -> list[str]:
                 "format = R32_UINT",
                 f"filename = {record.get('filename')}",
                 "",
-                f"[CommandList_BuildLocalBoneBuffer_{suffix}]",
-                "; Call this before drawing the exported part that owns this local-to-global bone map.",
-                "run = CustomShader_ExtractCB1",
-                f"x101 = {int(record.get('local_bone_count', 0) or 0)}",
-                f"cs-t2 = ResourcePartLocalToGlobalBoneMap_{suffix}",
-                "run = CustomShader_GatherBones",
-                "vs-t0 = ResourceLocalFakeT0_SRV",
-                "run = CustomShader_RedirectCB1",
-                "vs-cb1 = ResourceFakeCB1",
+            ]
+        )
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _geometry_resource_sections(runtime_plan: dict) -> list[str]:
+    geometry_records = list(runtime_plan.get("geometry", []) or [])
+    if not geometry_records:
+        return []
+
+    lines: list[str] = [
+        "; -------------------------------------------------",
+        "; Export geometry buffers",
+        "; -------------------------------------------------",
+    ]
+    for record in geometry_records:
+        for slot, vertex_buffer in sorted(dict(record.get("vertex_buffers", {}) or {}).items()):
+            stride = int(vertex_buffer.get("stride", 0) or 0)
+            if stride <= 0:
+                continue
+            lines.extend(
+                [
+                    f"[{vertex_buffer.get('resource_name')}]",
+                    "type = Buffer",
+                    f"stride = {stride}",
+                    f"filename = {vertex_buffer.get('filename')}",
+                    "",
+                ]
+            )
+            if slot == "vb0":
+                # vb3 aliases vb0 in the game layout; no extra resource is needed.
+                pass
+        lines.extend(
+            [
+                f"[{record.get('index_resource_name')}]",
+                "type = Buffer",
+                "format = R32_UINT",
+                f"filename = {record.get('index_filename')}",
                 "",
             ]
         )
@@ -470,7 +583,7 @@ def _local_palette_sections(runtime_plan: dict) -> list[str]:
     return lines
 
 
-def _capture_override_sections(runtime_plan: dict) -> list[str]:
+def _texture_override_sections(runtime_plan: dict) -> list[str]:
     capture_by_key: dict[tuple[str, int, int], dict[str, list[int]]] = {}
     for record in runtime_plan.get("capture_records", []) or []:
         key = _override_key(record)
@@ -479,52 +592,126 @@ def _capture_override_sections(runtime_plan: dict) -> list[str]:
         key = _override_key(record)
         capture_by_key.setdefault(key, {"main": [], "lod": []})["lod"].append(int(record["record_index"]))
 
-    if not capture_by_key:
+    geometry_by_key: dict[tuple[str, int, int], list[dict]] = {}
+    for record in runtime_plan.get("geometry", []) or []:
+        geometry_by_key.setdefault(_override_key(record), []).append(record)
+
+    all_keys = sorted(set(capture_by_key).union(geometry_by_key))
+    if not all_keys:
         return []
 
     lines: list[str] = [
         "; -------------------------------------------------",
-        "; Capture TextureOverrides",
+        "; TextureOverrides",
         "; -------------------------------------------------",
     ]
-    for key, grouped_records in sorted(capture_by_key.items(), key=lambda item: item[0]):
+    for key in all_keys:
+        grouped_records = capture_by_key.get(key, {"main": [], "lod": []})
+        geometry_records = sorted(
+            geometry_by_key.get(key, []),
+            key=lambda item: int(item.get("part_index", 0) or 0),
+        )
         ib_hash, match_first_index, match_index_count = key
         suffix = _safe_suffix(f"{ib_hash}_{match_index_count}_{match_first_index}")
         lines.extend(
             [
-                f"[TextureOverride_BMC_Capture_{suffix}]",
+                f"[TextureOverride_BMC_{suffix}]",
                 f"hash = {ib_hash}",
                 f"match_first_index = {match_first_index}",
                 f"match_index_count = {match_index_count}",
                 "match_priority = -500",
-                "if vs == 200",
-                "  run = CustomShader_ExtractCB1",
             ]
         )
-        for record_index in grouped_records.get("main", []):
+        if grouped_records.get("main") or grouped_records.get("lod"):
             lines.extend(
                 [
-                    f"  x100 = {record_index}",
-                    "  run = CustomShader_RecordBones",
+                    "if vs == 200",
+                    "  run = CustomShader_ExtractCB1",
                 ]
             )
-        for record_index in grouped_records.get("lod", []):
+            for record_index in grouped_records.get("main", []):
+                lines.extend(
+                    [
+                        f"  x100 = {record_index}",
+                        "  x102 = 0",
+                        "  cs-t2 = ResourceMainCaptureBoneMap",
+                        "  run = CustomShader_RecordBones",
+                    ]
+                )
+            for record_index in grouped_records.get("lod", []):
+                lines.extend(
+                    [
+                        f"  x100 = {record_index}",
+                        "  x102 = 0",
+                        "  cs-t2 = ResourceLodCaptureBoneMap",
+                        "  run = CustomShader_RecordBones",
+                    ]
+                )
             lines.extend(
                 [
-                    f"  x100 = {record_index}",
-                    "  run = CustomShader_RecordBonesScatter",
+                    "endif",
                 ]
             )
-        lines.extend(
-            [
-                "  ResourceFakeT0_SRV = copy ResourceFakeT0_UAV",
-                "endif",
-                "",
-            ]
-        )
+        if geometry_records:
+            if grouped_records.get("main") or grouped_records.get("lod"):
+                lines.append("")
+            lines.extend(_visible_replay_lines(geometry_records))
+        lines.append("")
     if lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+def _visible_replay_lines(geometry_records: list[dict]) -> list[str]:
+    lines = [
+        "if vs != 200",
+        "  handling = skip",
+        "  run = CustomShader_ExtractCB1",
+    ]
+    for record in geometry_records:
+        suffix = str(record.get("resource_suffix", "") or "")
+        local_bone_count = _local_bone_count_for_resource_suffix(record)
+        lines.extend(
+            [
+                f"  ; replay {suffix}",
+                f"  x101 = {local_bone_count}",
+                f"  cs-t2 = ResourcePartLocalToGlobalBoneMap_{suffix}",
+                "  run = CustomShader_GatherLocalBones",
+                "  vs-t0 = ResourceLocalBonePool_SRV",
+                "  run = CustomShader_RedirectCB1",
+                "  vs-cb1 = ResourceFakeCB1",
+                f"  ib = {record.get('index_resource_name')}",
+            ]
+        )
+        vertex_buffers = dict(record.get("vertex_buffers", {}) or {})
+        for slot_name in ("vb0", "vb1", "vb2"):
+            vertex_buffer = vertex_buffers.get(slot_name)
+            if vertex_buffer:
+                lines.append(f"  {slot_name} = {vertex_buffer.get('resource_name')}")
+        vb0 = vertex_buffers.get("vb0")
+        if vb0:
+            lines.append(f"  vb3 = {vb0.get('resource_name')}")
+        index_count = int(record.get("index_count", 0) or 0)
+        lines.append(f"  drawindexedinstanced = {index_count},INSTANCE_COUNT,0,0,FIRST_INSTANCE")
+    lines.append("endif")
+    return lines
+
+
+def _local_bone_count_for_resource_suffix(record: dict) -> int:
+    return int(record.get("local_bone_count", 0) or 0)
+
+
+def _frame_lifecycle_sections() -> list[str]:
+    return [
+        "; -------------------------------------------------",
+        "; Frame lifecycle",
+        "; -------------------------------------------------",
+        "[Present]",
+        "run = CommandList_BMC_FrameEndReset",
+        "",
+        "[CommandList_BMC_FrameEndReset]",
+        "run = CustomShader_ResetRuntimeState",
+    ]
 
 
 def _buffer_resource(name: str, payload: dict) -> list[str]:
@@ -596,6 +783,19 @@ def _override_key(record: dict) -> tuple[str, int, int]:
         int(record.get("match_first_index", 0) or 0),
         int(record.get("match_index_count", 0) or 0),
     )
+
+
+def _slot_resource_role(slot_name: str) -> str:
+    normalized = str(slot_name or "").lower()
+    if normalized == "vb0":
+        return "Position"
+    if normalized == "vb1":
+        return "Texcoord"
+    if normalized == "vb2":
+        return "Blend"
+    if normalized.startswith("vb") and normalized[2:].isdigit():
+        return f"VB{int(normalized[2:])}"
+    return normalized or "Vertex"
 
 
 def _safe_suffix(value: str) -> str:

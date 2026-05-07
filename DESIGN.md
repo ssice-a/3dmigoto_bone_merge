@@ -11,6 +11,15 @@ The runtime model is split into two phases:
 
 The plugin should optimize for runtime performance first. Reuse and cleanliness matter, but no abstraction should add extra draw-time CS work without a clear need.
 
+The current INI/HLSL runtime constraints and multi-instance investigation notes
+are maintained in `docs/RUNTIME_INI_HLSL_CONSTRAINTS.md`. That document is the
+working contract for the next runtime rewrite.
+
+Generated runtime output uses one `BoneStore.ini`. HLSL may be split into
+reusable shader files, but generated INI control flow should stay mostly inline;
+`CommandList` is reserved for frame lifecycle hooks or logic shared by multiple
+branches/stages.
+
 ## Render Facts Observed
 
 The game stores many character parts in shared large IB/VB buffers. FrameAnalysis dump filenames expose per-part IB hashes even when the bound `IASetIndexBuffer` resource hash is only the shared backing buffer.
@@ -46,14 +55,16 @@ Shader hash and pass identity are useful for classification and diagnostics, but
 
 `cb1[5].x/y` are both offline validation fields and runtime capture inputs. They are native bone-window offsets into the currently bound game `vs-t0` store. They must not be assumed to be `0/1024` during capture.
 
-When the consume path binds `ResourceLocalFakeT0_SRV` as `vs-t0`, the draw no longer points at the game's native large bone store. The draw's shader-visible `cb1[5].x/y` must therefore be redirected to the local fake layout:
+When the consume path binds `ResourceLocalBonePool_SRV` as `vs-t0`, the draw no longer points at the game's native large bone store. The draw's shader-visible bone-window rows must therefore be redirected to the local pool layout:
 
 ```text
-cb1[5].x = 0
-cb1[5].y = LOCAL_PREVIOUS_ROW_OFFSET
+cb1[slot * 16 + 5].x = slot * LOCAL_SLOT_ROW_STRIDE
+cb1[slot * 16 + 5].y = slot * LOCAL_SLOT_ROW_STRIDE + LOCAL_PREVIOUS_ROW_OFFSET
 ```
 
 For the default local fake store, `LOCAL_PREVIOUS_ROW_OFFSET = 1024`.
+
+The detailed runtime contract, including frame reset and slot validity, lives in `docs/RUNTIME_INI_HLSL_CONSTRAINTS.md`.
 
 The final consume identity is:
 
@@ -67,7 +78,7 @@ local_palette
 
 `local_palette` maps final local bone index to capture-store bone index.
 
-First implementation scope: multi-instance characters are not supported. The analyzer assumes the selected character appears once in the relevant FrameAnalysis capture, and the runtime plan assumes the matching IB/draw sequence belongs to that one character instance. If the same character/source identity appears multiple times in one frame with overlapping draw sequences, Analyze should stop with a `multi_instance_unsupported` diagnostic instead of generating tables that may capture matrices from the wrong instance.
+Multi-instance support is now part of the runtime rewrite. The analyzer must bind early shadow capture sequences to replay instance slots before generating multi-instance tables. If that binding is ambiguous, Analyze should stop with a diagnostic instead of generating tables that may capture matrices from the wrong instance.
 
 ## Stable Global Bone Construction
 
@@ -390,20 +401,20 @@ Consume pass:
 run = CustomShader_ExtractCB1
 x101 = <local_bone_count>
 cs-t2 = ResourcePartLocalToGlobalBoneMap_<part>
-run = CustomShader_GatherBones
-vs-t0 = ResourceLocalFakeT0_SRV
+run = CustomShader_GatherLocalBones
+vs-t0 = ResourceLocalBonePool_SRV
 run = CustomShader_RedirectCB1
 vs-cb1 = ResourceFakeCB1
 ```
 
-`RedirectCB1` is part of the default consume path. Once `ResourceLocalFakeT0_SRV` is bound as `vs-t0`, the original native `cb1[5].x/y` would point outside the local fake store. `RedirectCB1` must preserve all current `cb1` values except shader-visible `cb1[5].x/y`, which are rewritten to the local fake palette bases:
+`RedirectCB1` is part of the default consume path. Once `ResourceLocalBonePool_SRV` is bound as `vs-t0`, the original native bone-window rows would point outside the local pool. `RedirectCB1` must preserve all current `cb1` values except shader-visible `cb1[slot * 16 + 5].x/y`, which are rewritten to the local palette bases:
 
 ```text
-cb1[5].x = 0
-cb1[5].y = LOCAL_PREVIOUS_ROW_OFFSET
+cb1[slot * 16 + 5].x = slot * LOCAL_SLOT_ROW_STRIDE
+cb1[slot * 16 + 5].y = slot * LOCAL_SLOT_ROW_STRIDE + LOCAL_PREVIOUS_ROW_OFFSET
 ```
 
-If a future design binds the full global capture store directly as `vs-t0`, then `cb1[5].x/y` must instead be redirected to that part's global current/previous offsets. Under the current small-buffer consume design, the correct redirect target is always `0/1024`.
+If a future design binds the full global capture store directly as `vs-t0`, then the cb1 bone-window rows must instead be redirected to that part's global current/previous offsets. Under the current small-buffer consume design, the correct redirect target is always the per-slot local pool window.
 
 ## Performance Direction
 
@@ -670,6 +681,14 @@ implicit part exceeds 256 bones, Prepare Export should auto-split into multiple 
 
 The splitter must optimize for correctness before minimal part count. A stiff or slightly less
 optimal split is acceptable; a part that writes a local index over 255 is not.
+
+Prepare Export must use actual weighted numeric vertex groups, not empty vertex groups, when
+deciding whether an IB region exceeds the 256-bone part limit. If a region's used global-bone
+union exceeds the limit, the addon should materialize visible `partNN` child collections and move
+the affected mesh objects into the generated parts before writing buffers. This keeps the Blender
+collection tree aligned with the real export plan. If one mesh object alone uses more than 256
+weighted global bones, object-level splitting is insufficient and export must stop until
+triangle-level splitting is implemented.
 
 ### Part Buffer Output
 
@@ -1147,7 +1166,7 @@ The global bone index and capture-store index have the same meaning in HLSL. Exp
 
 #### lod_capture_records
 
-`lod_capture_records` are runtime scatter capture records. They tell `RecordBonesScatter` how a LOD local palette fills the canonical high-detail global pool.
+`lod_capture_records` are runtime capture records. They use the same `RecordBones` shader as main capture; only the bound `LodCaptureBoneMap` differs. The map can scatter one LOD local bone to multiple canonical high-detail global bones.
 
 ```json
 {
@@ -1797,7 +1816,7 @@ TextureOverride LOD capture:
   if vs == expected_lod_capture_vs:
       bind LodCaptureBoneMap
       bind native vs-t0
-      dispatch RecordBonesScatter
+      dispatch RecordBones
 ```
 
 For replacement drawing at LOD distance:

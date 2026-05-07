@@ -175,13 +175,17 @@ def regenerate_bonestore_runtime_files(
         return os.path.join(output_dir, BONESTORE_INI_FILE_NAME) if write_ini else ""
     palette_records = list(local_palette_records or [])
     normalized_export_manifest_path = os.path.abspath(export_manifest_path or "") if export_manifest_path else ""
+    export_manifest = {}
     if not palette_records and normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
         export_manifest = read_json(normalized_export_manifest_path)
         palette_records = [
             _local_palette_record_from_export_record(record)
             for record in export_manifest.get("palettes", [])
         ]
-    runtime_plan = materialize_bonestore_runtime(output_dir, manifest, palette_records)
+    elif normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
+        export_manifest = read_json(normalized_export_manifest_path)
+    geometry_records = list(export_manifest.get("geometry_buffers", []) or []) if isinstance(export_manifest, dict) else []
+    runtime_plan = materialize_bonestore_runtime(output_dir, manifest, palette_records, geometry_records)
     ini_path = write_bonestore_ini(output_dir, runtime_plan) if write_ini else ""
 
     if normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
@@ -192,6 +196,7 @@ def regenerate_bonestore_runtime_files(
             "global_bone_count": int(runtime_plan.get("global_bone_count", 0) or 0),
             "capture_records": list(runtime_plan.get("capture_records", []) or []),
             "lod_capture_records": list(runtime_plan.get("lod_capture_records", []) or []),
+            "geometry": list(runtime_plan.get("geometry", []) or []),
             "buffers": dict(runtime_plan.get("buffers", {}) or {}),
         }
         write_json(normalized_export_manifest_path, export_manifest)

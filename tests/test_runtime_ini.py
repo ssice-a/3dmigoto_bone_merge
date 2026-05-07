@@ -58,7 +58,8 @@ class RuntimeIniTests(unittest.TestCase):
             self.assertIn("ResourceMainCaptureBoneMap", ini_text)
             self.assertNotIn("ResourceMainCaptureSourceLocalBones", ini_text)
             self.assertIn("x100 = 0", ini_text)
-            self.assertIn("x101 = 3", ini_text)
+            self.assertIn("ResourcePartLocalToGlobalBoneMap_12345678_42_0", ini_text)
+            self.assertNotIn("CommandList_BuildLocalBoneBuffer", ini_text)
 
     def test_lod_scatter_pairs_are_materialized(self):
         manifest = {
@@ -100,9 +101,125 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text = ini_export.build_bonestore_ini_content(runtime)
             self.assertIn("hash = 87654321", ini_text)
             self.assertIn("match_first_index = 5", ini_text)
-            self.assertIn("run = CustomShader_RecordBonesScatter", ini_text)
+            self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", ini_text)
+            self.assertIn("run = CustomShader_RecordBones", ini_text)
+            self.assertNotIn("CustomShader_RecordBonesScatter", ini_text)
             self.assertIn("ResourceLodCaptureBoneMap", ini_text)
             self.assertIn("hash = bbbbbbbbbbbbbbbb", ini_text)
+
+    def test_generated_ini_uses_single_lifecycle_commandlist_only(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "12345678",
+                    "match_first_index": 0,
+                    "match_index_count": 42,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="chunk",
+            ib_hash="12345678",
+            match_index_count=42,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="12345678-42-0-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="12345678_42_0",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette])
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertIn("[Present]", ini_text)
+        self.assertIn("[CommandList_BMC_FrameEndReset]", ini_text)
+        self.assertEqual(ini_text.count("[CommandList_"), 1)
+        self.assertIn("ResourceGlobalBonePool_UAV", ini_text)
+        self.assertIn("ResourceLocalBonePool_UAV", ini_text)
+        self.assertIn("ResourceRuntimeState_UAV", ini_text)
+        self.assertNotIn("ResourceFakeT0", ini_text)
+        self.assertNotIn("ResourceLocalFakeT0", ini_text)
+
+    def test_visible_replay_is_inlined_with_export_geometry(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "12345678",
+                    "match_first_index": 0,
+                    "match_index_count": 42,
+                    "global_bone_base": 0,
+                    "local_bone_count": 2,
+                    "used_local_bone_indices": [0, 1],
+                    "bone_capture_available": True,
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="chunk",
+            ib_hash="12345678",
+            match_index_count=42,
+            chunk_index=0,
+            local_bone_count=2,
+            palette_values=(0, 1),
+            file_name="12345678-42-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="12345678_42_0_part00",
+        )
+        geometry = [
+            {
+                "ib_hash": "12345678",
+                "match_first_index": 0,
+                "match_index_count": 42,
+                "part_index": 0,
+                "index_buffer": {
+                    "file_name": "12345678-42-0_part00-Index.buf",
+                    "file_path": "Buffer/12345678-42-0_part00-Index.buf",
+                    "index_count": 6,
+                },
+                "vertex_buffers": {
+                    "vb0": {
+                        "role": "Position",
+                        "file_name": "12345678-42-0_part00-Position.buf",
+                        "file_path": "Buffer/12345678-42-0_part00-Position.buf",
+                        "stride": 16,
+                    },
+                    "vb1": {
+                        "role": "Texcoord",
+                        "file_name": "12345678-42-0_part00-Texcoord.buf",
+                        "file_path": "Buffer/12345678-42-0_part00-Texcoord.buf",
+                        "stride": 20,
+                    },
+                    "vb2": {
+                        "role": "Blend",
+                        "file_name": "12345678-42-0_part00-Blend.buf",
+                        "file_path": "Buffer/12345678-42-0_part00-Blend.buf",
+                        "stride": 12,
+                    },
+                },
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette], geometry)
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertIn("[ResourcePart_12345678_42_0_part00_Position]", ini_text)
+        self.assertIn("[ResourcePart_12345678_42_0_part00_Index]", ini_text)
+        self.assertIn("if vs != 200", ini_text)
+        self.assertIn("  handling = skip", ini_text)
+        self.assertIn("  x101 = 2", ini_text)
+        self.assertIn("  run = CustomShader_GatherLocalBones", ini_text)
+        self.assertIn("  vs-t0 = ResourceLocalBonePool_SRV", ini_text)
+        self.assertIn("  vb3 = ResourcePart_12345678_42_0_part00_Position", ini_text)
+        self.assertIn("  drawindexedinstanced = 6,INSTANCE_COUNT,0,0,FIRST_INSTANCE", ini_text)
 
     def test_export_rejects_capture_unavailable_global_groups(self):
         manifest = {

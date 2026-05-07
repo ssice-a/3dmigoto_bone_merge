@@ -19,7 +19,7 @@ from .io import write_uint32_buffer
 _REGION_COLLECTION_RE = re.compile(
     r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)[-_](?P<first>\d+)"
 )
-_PART_COLLECTION_RE = re.compile(r"^part(?P<index>\d+)$", re.IGNORECASE)
+_PART_COLLECTION_RE = re.compile(r"^part(?P<index>\d+)(?:\D.*)?$", re.IGNORECASE)
 
 
 class ExportPlanError(ValueError):

@@ -35,6 +35,7 @@ from .core.mapping_payload import (
 )
 from .core.presets import delete_preset, load_preset, save_preset
 from .core.export_prepare import prepare_export_collection, regenerate_bonestore_runtime_files
+from .core.export_package import build_export_plan
 from .core.frameanalysis import infer_mesh_identity_from_name
 from .core.io import read_json, write_json
 from .core.import_candidates import import_selected_candidates
@@ -200,6 +201,112 @@ def _link_object_to_collection(mesh_obj, collection) -> None:
     if any(obj.name == mesh_obj.name for obj in collection.objects):
         return
     collection.objects.link(mesh_obj)
+
+
+def _materialize_auto_export_part_collections(export_collection) -> dict[str, object]:
+    plan = build_export_plan(
+        export_collection,
+        _collect_weighted_numeric_vertex_groups_for_export,
+        max_bones_per_part=BI4_MAX_BONE_COUNT,
+    )
+    generated_region_keys = {part.region.key for part in plan.parts if bool(part.generated)}
+    if not generated_region_keys:
+        return {"created": 0, "linked": 0, "unlinked": 0, "regions": 0, "parts": 0, "warnings": []}
+
+    region_collections = {
+        identity: child
+        for child in export_collection.children
+        if (identity := _resolve_export_region_collection_identity(child)) is not None
+    }
+    created_count = 0
+    linked_count = 0
+    unlinked_count = 0
+    materialized_parts = 0
+
+    for part in plan.parts:
+        if part.region.key not in generated_region_keys:
+            continue
+        region_collection = region_collections.get(
+            (part.region.ib_hash, int(part.region.match_index_count), int(part.region.match_first_index))
+        )
+        if region_collection is None:
+            continue
+        part_collection, created = _ensure_export_part_collection(region_collection, part.part_name)
+        if created:
+            created_count += 1
+        materialized_parts += 1
+        for mesh_obj in part.mesh_objects:
+            if _link_object_to_collection_counted(mesh_obj, part_collection):
+                linked_count += 1
+            unlinked_count += _unlink_object_from_other_region_part_locations(region_collection, mesh_obj, part_collection)
+
+    return {
+        "created": created_count,
+        "linked": linked_count,
+        "unlinked": unlinked_count,
+        "regions": len(generated_region_keys),
+        "parts": materialized_parts,
+        "warnings": list(plan.warnings),
+    }
+
+
+def _collect_weighted_numeric_vertex_groups_for_export(mesh_obj) -> set[int]:
+    group_index_to_global = {}
+    for vertex_group in getattr(mesh_obj, "vertex_groups", []) or []:
+        raw_name = str(getattr(vertex_group, "name", "") or "").strip()
+        if not raw_name.isdigit():
+            continue
+        group_index_to_global[int(vertex_group.index)] = int(raw_name)
+
+    used_groups: set[int] = set()
+    for vertex in getattr(getattr(mesh_obj, "data", None), "vertices", []) or []:
+        for group_element in getattr(vertex, "groups", []) or []:
+            global_group = group_index_to_global.get(int(getattr(group_element, "group", -1)))
+            if global_group is None:
+                continue
+            if float(getattr(group_element, "weight", 0.0)) <= 0.0:
+                continue
+            used_groups.add(int(global_group))
+    return used_groups
+
+
+def _ensure_export_part_collection(region_collection, part_name: str):
+    requested_name = str(part_name or "part00")
+    requested_index = _parse_export_part_index(requested_name)
+    for child in region_collection.children:
+        if _parse_export_part_index(child.name) == requested_index:
+            return child, False
+    collection = bpy.data.collections.new(requested_name)
+    region_collection.children.link(collection)
+    return collection, True
+
+
+def _parse_export_part_index(collection_name: str) -> int | None:
+    match = re.match(r"^part(?P<index>\d+)(?:\D.*)?$", str(collection_name or ""), re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group("index"))
+
+
+def _link_object_to_collection_counted(mesh_obj, collection) -> bool:
+    if any(obj.name == mesh_obj.name for obj in collection.objects):
+        return False
+    collection.objects.link(mesh_obj)
+    return True
+
+
+def _unlink_object_from_other_region_part_locations(region_collection, mesh_obj, target_part_collection) -> int:
+    region_subtree_ids = {collection.as_pointer() for collection in _iter_collection_subtree(region_collection)}
+    removed = 0
+    for collection in tuple(getattr(mesh_obj, "users_collection", []) or []):
+        if collection == target_part_collection:
+            continue
+        if collection.as_pointer() not in region_subtree_ids:
+            continue
+        if any(obj.name == mesh_obj.name for obj in collection.objects):
+            collection.objects.unlink(mesh_obj)
+            removed += 1
+    return removed
 
 
 def _resolve_target_match_index_count(scene, ib_hash: str, object_name: str = "", fallback: int = 0) -> int:
@@ -2177,6 +2284,7 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         scene = context.scene
         try:
             source_collection = _ensure_export_collection(context)
+            part_materialize_result = _materialize_auto_export_part_collections(source_collection)
             generate_ini = str(getattr(scene, "bmc_export_mode", "BUFFER_ONLY") or "BUFFER_ONLY") == "BUFFER_AND_INI"
             manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
             if manifest_path and os.path.exists(manifest_path):
@@ -2205,10 +2313,24 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         except Exception:
             pass
         mode_label = "buffers + INI" if generate_ini else "buffers"
-        self.report(
-            {"INFO"},
-            f"Exported {mode_label}: {result['objects']} object(s), {result['palettes']} palette(s) to {result['output_dir']}",
-        )
+        message = f"Exported {mode_label}: {result['objects']} object(s), {result['palettes']} palette(s) to {result['output_dir']}"
+        if int(part_materialize_result.get("parts", 0) or 0) > 0:
+            message += (
+                f"; auto-parted {int(part_materialize_result.get('regions', 0) or 0)} region(s) "
+                f"into {int(part_materialize_result.get('parts', 0) or 0)} part collection(s)"
+            )
+        self.report({"INFO"}, message)
+        if int(part_materialize_result.get("parts", 0) or 0) > 0:
+            self.report(
+                {"WARNING"},
+                (
+                    "Weighted global bones exceeded 256 in at least one export region; "
+                    "partNN child collections were created from actual mesh weight usage."
+                ),
+            )
+        materialize_warnings = list(part_materialize_result.get("warnings", []) or [])
+        if materialize_warnings:
+            self.report({"WARNING"}, " | ".join(str(item) for item in materialize_warnings[:3]))
         return {"FINISHED"}
 
 

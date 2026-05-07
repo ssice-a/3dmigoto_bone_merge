@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import zlib
 
 from ..constants import BONESTORE_INI_FILE_NAME, BUFFER_EXPORT_DIR_NAME
@@ -16,6 +17,7 @@ _SAFE_SUFFIX_RE = re.compile(r"[^0-9A-Za-z_]+")
 
 _MAIN_CAPTURE_BONE_MAP_FILE = "MainCaptureBoneMap.buf"
 _LOD_CAPTURE_BONE_MAP_FILE = "LodCaptureBoneMap.buf"
+_WHITE_SHADOW_TEXTURE_FILE = "Texture/white.dds"
 _CAPTURE_BONE_MAP_HEADER_UINTS = 4
 _CAPTURE_BONE_RECORD_STRIDE = 4
 _CAPTURE_BONE_PAIR_STRIDE = 2
@@ -52,6 +54,11 @@ def materialize_bonestore_runtime(
     palette_records = _normalize_palette_records(normalized_output_dir, local_palette_records)
     geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
     _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
+    lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
+    shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
+    lod_shadow_replay_plan = _build_lod_shadow_replay_plan(capture_manifest, geometry_payloads, lod_replay_links)
+    if _shadow_plan_needs_white_texture(shadow_replay_plan) or _shadow_plan_needs_white_texture(lod_shadow_replay_plan):
+        _write_white_shadow_texture(os.path.join(normalized_output_dir, _WHITE_SHADOW_TEXTURE_FILE))
     _validate_palette_globals(capture_manifest, palette_records)
 
     main_capture_bone_map_path = write_uint32_buffer(
@@ -86,8 +93,12 @@ def materialize_bonestore_runtime(
         "shadow_vs_hashes": _runtime_shadow_vs_hashes(capture_manifest),
         "capture_records": capture_records,
         "lod_capture_records": lod_records,
+        "lod_replay_links": lod_replay_links,
         "palettes": palette_records,
         "geometry": geometry_payloads,
+        "shadow_stage": _normalize_shadow_stage(capture_manifest),
+        "shadow_replay_plan": shadow_replay_plan,
+        "lod_shadow_replay_plan": lod_shadow_replay_plan,
         "buffers": buffers,
     }
 
@@ -308,6 +319,293 @@ def _normalize_geometry_records(output_directory: str, geometry_records: list[di
     return normalized_records
 
 
+def _normalize_shadow_stage(capture_manifest: dict) -> dict:
+    stage = dict(capture_manifest.get("shadow_stage", {}) or {})
+    return {
+        "host_ib_hash": str(stage.get("host_ib_hash", "") or "").lower(),
+        "host_match_first_index": int(stage.get("host_match_first_index", 0) or 0),
+        "host_match_index_count": int(stage.get("host_match_index_count", 0) or 0),
+        "host_draw_index": int(stage.get("host_draw_index", -1) or -1),
+        "normal_vs_hash": str(stage.get("normal_vs_hash", "") or "").lower(),
+        "transparent_vs_hash": str(stage.get("transparent_vs_hash", "") or "").lower(),
+    }
+
+
+def _build_shadow_replay_plan(capture_manifest: dict, geometry_records: list[dict]) -> dict:
+    stage = _normalize_shadow_stage(capture_manifest)
+    host_key = (
+        stage["host_ib_hash"],
+        int(stage["host_match_first_index"]),
+        int(stage["host_match_index_count"]),
+    )
+    if not host_key[0] or host_key[2] <= 0 or not geometry_records:
+        return {"enabled": False, "reason": "missing_host_or_geometry"}
+
+    roles_by_key = _shadow_roles_by_key(capture_manifest)
+    transparent_parts: list[str] = []
+    normal_parts: list[str] = []
+    skipped_keys: set[tuple[str, int, int]] = set()
+
+    for record in geometry_records:
+        key = _override_key(record)
+        roles = roles_by_key.get(key, set())
+        if not roles.intersection({"transparent_shadow", "normal_shadow"}):
+            continue
+        skipped_keys.add(key)
+        suffix = str(record.get("resource_suffix", "") or "")
+        if "transparent_shadow" in roles:
+            transparent_parts.append(suffix)
+        if "normal_shadow" in roles:
+            normal_parts.append(suffix)
+
+    if not transparent_parts and not normal_parts:
+        return {"enabled": False, "reason": "no_exported_shadow_parts"}
+
+    return {
+        "enabled": True,
+        "host_key": _key_payload(host_key),
+        "host_draw_index": int(stage["host_draw_index"]),
+        "white_shadow_resource": "ResourceBMCWhiteShadow",
+        "transparent_parts": transparent_parts,
+        "normal_parts": normal_parts,
+        "skip_keys": [_key_payload(key) for key in sorted(skipped_keys)],
+    }
+
+
+def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]) -> list[dict]:
+    geometry_by_key = _geometry_records_by_key(geometry_records)
+    if not geometry_by_key:
+        return []
+
+    links_by_lod_key: dict[tuple[str, int, int], dict] = {}
+    for link in capture_manifest.get("lod_links", []) or []:
+        main_key = _main_key_from_lod_link(dict(link or {}))
+        main_geometry = geometry_by_key.get(main_key, [])
+        if not main_geometry:
+            continue
+        lod_key = _lod_replay_host_key_from_link(dict(link or {}))
+        if not _is_valid_override_key(lod_key):
+            continue
+
+        bucket = links_by_lod_key.setdefault(
+            lod_key,
+            {
+                "lod_key": _key_payload(lod_key),
+                "main_keys": [],
+                "geometry": [],
+                "geometry_suffixes": [],
+            },
+        )
+        main_payload = _key_payload(main_key)
+        _append_unique_payload(bucket["main_keys"], main_payload)
+        for geometry_record in sorted(main_geometry, key=lambda item: int(item.get("part_index", 0) or 0)):
+            suffix = str(geometry_record.get("resource_suffix", "") or "")
+            if not suffix:
+                continue
+            if suffix not in bucket["geometry_suffixes"]:
+                bucket["geometry_suffixes"].append(suffix)
+            _append_unique_payload(
+                bucket["geometry"],
+                {
+                    "resource_suffix": suffix,
+                    "main_key": main_payload,
+                },
+            )
+
+    return [
+        links_by_lod_key[key]
+        for key in sorted(links_by_lod_key)
+        if links_by_lod_key[key].get("geometry_suffixes")
+    ]
+
+
+def _build_lod_shadow_replay_plan(capture_manifest: dict, geometry_records: list[dict], lod_replay_links: list[dict]) -> dict:
+    lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
+    stage = _normalize_shadow_stage(lod_snapshot)
+    host_key = (
+        stage["host_ib_hash"],
+        int(stage["host_match_first_index"]),
+        int(stage["host_match_index_count"]),
+    )
+    if not _is_valid_override_key(host_key) or not geometry_records or not lod_replay_links:
+        return {"enabled": False, "reason": "missing_lod_host_or_geometry"}
+
+    roles_by_main_key = _shadow_roles_by_key(capture_manifest)
+    geometry_by_suffix = {
+        str(record.get("resource_suffix", "") or ""): record
+        for record in geometry_records
+    }
+    transparent_parts: list[str] = []
+    normal_parts: list[str] = []
+    skipped_keys: set[tuple[str, int, int]] = set()
+
+    for link in lod_replay_links:
+        lod_key = _key_from_payload(dict(link.get("lod_key", {}) or {}))
+        if not _is_valid_override_key(lod_key):
+            continue
+        any_shadow_part = False
+        for geometry_item in _lod_link_geometry_items(link):
+            suffix = str(geometry_item.get("resource_suffix", "") or "")
+            if suffix not in geometry_by_suffix:
+                continue
+            main_key = _key_from_payload(dict(geometry_item.get("main_key", {}) or {}))
+            main_roles = roles_by_main_key.get(main_key, set())
+            if not main_roles.intersection({"transparent_shadow", "normal_shadow"}):
+                continue
+            any_shadow_part = True
+            if "transparent_shadow" in main_roles and suffix not in transparent_parts:
+                transparent_parts.append(suffix)
+            if "normal_shadow" in main_roles and suffix not in normal_parts:
+                normal_parts.append(suffix)
+        if any_shadow_part:
+            skipped_keys.add(lod_key)
+
+    if not transparent_parts and not normal_parts:
+        return {"enabled": False, "reason": "no_lod_exported_shadow_parts"}
+
+    return {
+        "enabled": True,
+        "host_key": _key_payload(host_key),
+        "host_draw_index": int(stage["host_draw_index"]),
+        "white_shadow_resource": "ResourceBMCWhiteShadow",
+        "transparent_parts": transparent_parts,
+        "normal_parts": normal_parts,
+        "skip_keys": [_key_payload(key) for key in sorted(skipped_keys)],
+    }
+
+
+def _shadow_roles_by_key(capture_manifest: dict) -> dict[tuple[str, int, int], set[str]]:
+    roles_by_key: dict[tuple[str, int, int], set[str]] = {}
+    for hit in capture_manifest.get("draw_hits", []) or []:
+        role = str(hit.get("pass_role", "") or "")
+        if role not in {"transparent_shadow", "normal_shadow"}:
+            continue
+        key = (
+            str(hit.get("ib_hash", "") or "").lower(),
+            int(hit.get("first_index", 0) or 0),
+            int(hit.get("index_count", 0) or 0),
+        )
+        if not key[0] or key[2] <= 0:
+            continue
+        roles_by_key.setdefault(key, set()).add(role)
+    return roles_by_key
+
+
+def _geometry_records_by_key(geometry_records: list[dict]) -> dict[tuple[str, int, int], list[dict]]:
+    records_by_key: dict[tuple[str, int, int], list[dict]] = {}
+    for record in geometry_records:
+        records_by_key.setdefault(_override_key(record), []).append(record)
+    return records_by_key
+
+
+def _geometry_records_by_suffix(geometry_records: list[dict]) -> dict[str, dict]:
+    return {
+        str(record.get("resource_suffix", "") or ""): record
+        for record in geometry_records
+        if str(record.get("resource_suffix", "") or "")
+    }
+
+
+def _lod_geometry_records_by_key(runtime_plan: dict, geometry_by_suffix: dict[str, dict]) -> dict[tuple[str, int, int], list[dict]]:
+    records_by_key: dict[tuple[str, int, int], list[dict]] = {}
+    for link in runtime_plan.get("lod_replay_links", []) or []:
+        key = _key_from_payload(dict(link.get("lod_key", {}) or {}))
+        if not _is_valid_override_key(key):
+            continue
+        for suffix in link.get("geometry_suffixes", []) or []:
+            record = geometry_by_suffix.get(str(suffix or ""))
+            if record:
+                records_by_key.setdefault(key, []).append(record)
+    return records_by_key
+
+
+def _lod_link_geometry_items(link: dict) -> list[dict]:
+    items = [dict(item or {}) for item in link.get("geometry", []) or []]
+    if items:
+        return items
+    main_keys = [dict(item or {}) for item in link.get("main_keys", []) or []]
+    main_key = main_keys[0] if main_keys else {}
+    return [
+        {
+            "resource_suffix": str(suffix or ""),
+            "main_key": main_key,
+        }
+        for suffix in link.get("geometry_suffixes", []) or []
+    ]
+
+
+def _dedupe_geometry_records(geometry_records: list[dict]) -> list[dict]:
+    records: list[dict] = []
+    seen_suffixes: set[str] = set()
+    for record in sorted(geometry_records, key=lambda item: (int(item.get("part_index", 0) or 0), str(item.get("resource_suffix", "") or ""))):
+        suffix = str(record.get("resource_suffix", "") or "")
+        if not suffix or suffix in seen_suffixes:
+            continue
+        seen_suffixes.add(suffix)
+        records.append(record)
+    return records
+
+
+def _main_key_from_lod_link(link: dict) -> tuple[str, int, int]:
+    return (
+        str(link.get("ib_hash", link.get("main_ib_hash", "")) or "").lower(),
+        int(link.get("match_first_index", link.get("main_match_first_index", link.get("main_first_index", 0))) or 0),
+        int(link.get("match_index_count", link.get("main_match_index_count", 0)) or 0),
+    )
+
+
+def _lod_replay_host_key_from_link(link: dict) -> tuple[str, int, int]:
+    sources = [
+        dict(source or {})
+        for source in link.get("lod_sources", []) or []
+        if _is_valid_override_key(_lod_key_from_source(dict(source or {})))
+    ]
+    if sources:
+        sources.sort(
+            key=lambda source: (
+                -int(source.get("mapped_global_count", 0) or 0),
+                -float(source.get("score", 0.0) or 0.0),
+                -int(source.get("votes", 0) or 0),
+                str(source.get("lod_record_key", "") or ""),
+            )
+        )
+        return _lod_key_from_source(sources[0])
+    return _lod_key_from_source(link)
+
+
+def _lod_key_from_source(source: dict) -> tuple[str, int, int]:
+    return (
+        str(source.get("lod_ib_hash", "") or "").lower(),
+        int(source.get("lod_match_first_index", source.get("lod_first_index", 0)) or 0),
+        int(source.get("lod_match_index_count", 0) or 0),
+    )
+
+
+def _key_from_payload(payload: dict) -> tuple[str, int, int]:
+    return (
+        str(payload.get("ib_hash", "") or "").lower(),
+        int(payload.get("match_first_index", 0) or 0),
+        int(payload.get("match_index_count", 0) or 0),
+    )
+
+
+def _is_valid_override_key(key: tuple[str, int, int]) -> bool:
+    return bool(str(key[0] or "")) and int(key[2]) > 0
+
+
+def _append_unique_payload(items: list[dict], payload: dict) -> None:
+    if payload not in items:
+        items.append(payload)
+
+
+def _key_payload(key: tuple[str, int, int]) -> dict:
+    return {
+        "ib_hash": str(key[0]).lower(),
+        "match_first_index": int(key[1]),
+        "match_index_count": int(key[2]),
+    }
+
+
 def _attach_palette_metadata_to_geometry(geometry_records: list[dict], palette_records: list[dict]) -> None:
     local_counts = {
         str(record.get("resource_suffix", "") or ""): int(record.get("local_bone_count", 0) or 0)
@@ -384,6 +682,8 @@ def _resource_sections(runtime_plan: dict) -> list[str]:
     buffers = dict(runtime_plan.get("buffers", {}) or {})
     global_pool_rows = _GLOBAL_BONE_POOL_ROWS_PER_SLOT * _MAX_INSTANCE_SLOTS
     local_pool_rows = _LOCAL_BONE_POOL_ROWS_PER_SLOT * _MAX_INSTANCE_SLOTS
+    shadow_plan = dict(runtime_plan.get("shadow_replay_plan", {}) or {})
+    lod_shadow_plan = dict(runtime_plan.get("lod_shadow_replay_plan", {}) or {})
     lines = [
         "; -------------------------------------------------",
         "; Static capture tables",
@@ -450,6 +750,14 @@ def _resource_sections(runtime_plan: dict) -> list[str]:
             f"array = {_RUNTIME_STATE_ROWS}",
         ]
     )
+    if _shadow_plan_needs_white_texture(shadow_plan) or _shadow_plan_needs_white_texture(lod_shadow_plan):
+        lines.extend(
+            [
+                "",
+                "[ResourceBMCWhiteShadow]",
+                f"filename = {_WHITE_SHADOW_TEXTURE_FILE.replace(os.sep, '/')}",
+            ]
+        )
     return lines
 
 
@@ -592,11 +900,26 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
         key = _override_key(record)
         capture_by_key.setdefault(key, {"main": [], "lod": []})["lod"].append(int(record["record_index"]))
 
-    geometry_by_key: dict[tuple[str, int, int], list[dict]] = {}
-    for record in runtime_plan.get("geometry", []) or []:
-        geometry_by_key.setdefault(_override_key(record), []).append(record)
+    geometry_records_all = list(runtime_plan.get("geometry", []) or [])
+    geometry_by_key = _geometry_records_by_key(geometry_records_all)
+    geometry_by_suffix = _geometry_records_by_suffix(geometry_records_all)
+    lod_geometry_by_key = _lod_geometry_records_by_key(runtime_plan, geometry_by_suffix)
 
-    all_keys = sorted(set(capture_by_key).union(geometry_by_key))
+    shadow_plan = dict(runtime_plan.get("shadow_replay_plan", {}) or {})
+    lod_shadow_plan = dict(runtime_plan.get("lod_shadow_replay_plan", {}) or {})
+    shadow_plans = [plan for plan in (shadow_plan, lod_shadow_plan) if bool(plan.get("enabled", False))]
+    shadow_host_keys = [_shadow_plan_host_key(plan) for plan in shadow_plans]
+    shadow_skip_keys: set[tuple[str, int, int]] = set()
+    for plan in shadow_plans:
+        shadow_skip_keys.update(_shadow_plan_skip_keys(plan))
+    shadow_hosts_by_key: dict[tuple[str, int, int], list[dict]] = {}
+    for host_key, plan in zip(shadow_host_keys, shadow_plans):
+        if host_key is not None:
+            shadow_hosts_by_key.setdefault(host_key, []).append(plan)
+
+    all_keys_set = set(capture_by_key).union(geometry_by_key).union(lod_geometry_by_key)
+    all_keys_set.update(shadow_hosts_by_key)
+    all_keys = sorted(all_keys_set)
     if not all_keys:
         return []
 
@@ -607,9 +930,8 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
     ]
     for key in all_keys:
         grouped_records = capture_by_key.get(key, {"main": [], "lod": []})
-        geometry_records = sorted(
-            geometry_by_key.get(key, []),
-            key=lambda item: int(item.get("part_index", 0) or 0),
+        geometry_records = _dedupe_geometry_records(
+            [*geometry_by_key.get(key, []), *lod_geometry_by_key.get(key, [])]
         )
         ib_hash, match_first_index, match_index_count = key
         suffix = _safe_suffix(f"{ib_hash}_{match_index_count}_{match_first_index}")
@@ -647,11 +969,20 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
                         "  run = CustomShader_RecordBones",
                     ]
                 )
+            if key in shadow_skip_keys:
+                lines.append("  handling = skip")
+            for plan in shadow_hosts_by_key.get(key, []):
+                lines.extend(_shadow_host_replay_lines(plan, geometry_by_suffix, indent="  "))
+            lines.append("endif")
+        elif key in shadow_hosts_by_key:
             lines.extend(
                 [
-                    "endif",
+                    "if vs == 200",
                 ]
             )
+            for plan in shadow_hosts_by_key.get(key, []):
+                lines.extend(_shadow_host_replay_lines(plan, geometry_by_suffix, indent="  "))
+            lines.append("endif")
         if geometry_records:
             if grouped_records.get("main") or grouped_records.get("lod"):
                 lines.append("")
@@ -669,36 +1000,146 @@ def _visible_replay_lines(geometry_records: list[dict]) -> list[str]:
         "  run = CustomShader_ExtractCB1",
     ]
     for record in geometry_records:
-        suffix = str(record.get("resource_suffix", "") or "")
-        local_bone_count = _local_bone_count_for_resource_suffix(record)
-        lines.extend(
-            [
-                f"  ; replay {suffix}",
-                f"  x101 = {local_bone_count}",
-                f"  cs-t2 = ResourcePartLocalToGlobalBoneMap_{suffix}",
-                "  run = CustomShader_GatherLocalBones",
-                "  vs-t0 = ResourceLocalBonePool_SRV",
-                "  run = CustomShader_RedirectCB1",
-                "  vs-cb1 = ResourceFakeCB1",
-                f"  ib = {record.get('index_resource_name')}",
-            ]
-        )
-        vertex_buffers = dict(record.get("vertex_buffers", {}) or {})
-        for slot_name in ("vb0", "vb1", "vb2"):
-            vertex_buffer = vertex_buffers.get(slot_name)
-            if vertex_buffer:
-                lines.append(f"  {slot_name} = {vertex_buffer.get('resource_name')}")
-        vb0 = vertex_buffers.get("vb0")
-        if vb0:
-            lines.append(f"  vb3 = {vb0.get('resource_name')}")
-        index_count = int(record.get("index_count", 0) or 0)
-        lines.append(f"  drawindexedinstanced = {index_count},INSTANCE_COUNT,0,0,FIRST_INSTANCE")
+        lines.extend(_replay_part_lines(record, indent="  "))
     lines.append("endif")
+    return lines
+
+
+def _shadow_host_replay_lines(shadow_plan: dict, parts_by_suffix: dict[str, dict], *, indent: str) -> list[str]:
+    if not bool(shadow_plan.get("enabled", False)):
+        return []
+    lines: list[str] = []
+    transparent_parts = [
+        parts_by_suffix[suffix]
+        for suffix in shadow_plan.get("transparent_parts", []) or []
+        if suffix in parts_by_suffix
+    ]
+    normal_parts = [
+        parts_by_suffix[suffix]
+        for suffix in shadow_plan.get("normal_parts", []) or []
+        if suffix in parts_by_suffix
+    ]
+    if transparent_parts:
+        lines.append(f"{indent}; delayed transparent shadow replay")
+        for record in transparent_parts:
+            lines.extend(_replay_part_lines(record, indent=indent))
+    if normal_parts:
+        lines.append(f"{indent}ps-t0 = {shadow_plan.get('white_shadow_resource', 'ResourceBMCWhiteShadow')}")
+        lines.append(f"{indent}; delayed normal shadow replay")
+        for record in normal_parts:
+            lines.extend(_replay_part_lines(record, indent=indent))
+    return lines
+
+
+def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
+    suffix = str(record.get("resource_suffix", "") or "")
+    local_bone_count = _local_bone_count_for_resource_suffix(record)
+    lines = [
+        f"{indent}; replay {suffix}",
+        f"{indent}x101 = {local_bone_count}",
+        f"{indent}cs-t2 = ResourcePartLocalToGlobalBoneMap_{suffix}",
+        f"{indent}run = CustomShader_GatherLocalBones",
+        f"{indent}vs-t0 = ResourceLocalBonePool_SRV",
+        f"{indent}run = CustomShader_RedirectCB1",
+        f"{indent}vs-cb1 = ResourceFakeCB1",
+        f"{indent}ib = {record.get('index_resource_name')}",
+    ]
+    vertex_buffers = dict(record.get("vertex_buffers", {}) or {})
+    for slot_name in ("vb0", "vb1", "vb2"):
+        vertex_buffer = vertex_buffers.get(slot_name)
+        if vertex_buffer:
+            lines.append(f"{indent}{slot_name} = {vertex_buffer.get('resource_name')}")
+    vb0 = vertex_buffers.get("vb0")
+    if vb0:
+        lines.append(f"{indent}vb3 = {vb0.get('resource_name')}")
+    index_count = int(record.get("index_count", 0) or 0)
+    lines.append(f"{indent}drawindexedinstanced = {index_count},INSTANCE_COUNT,0,0,FIRST_INSTANCE")
     return lines
 
 
 def _local_bone_count_for_resource_suffix(record: dict) -> int:
     return int(record.get("local_bone_count", 0) or 0)
+
+
+def _shadow_plan_host_key(shadow_plan: dict) -> tuple[str, int, int] | None:
+    if not bool(shadow_plan.get("enabled", False)):
+        return None
+    host = dict(shadow_plan.get("host_key", {}) or {})
+    key = (
+        str(host.get("ib_hash", "") or "").lower(),
+        int(host.get("match_first_index", 0) or 0),
+        int(host.get("match_index_count", 0) or 0),
+    )
+    if not key[0] or key[2] <= 0:
+        return None
+    return key
+
+
+def _shadow_plan_skip_keys(shadow_plan: dict) -> set[tuple[str, int, int]]:
+    keys: set[tuple[str, int, int]] = set()
+    if not bool(shadow_plan.get("enabled", False)):
+        return keys
+    for payload in shadow_plan.get("skip_keys", []) or []:
+        item = dict(payload or {})
+        key = (
+            str(item.get("ib_hash", "") or "").lower(),
+            int(item.get("match_first_index", 0) or 0),
+            int(item.get("match_index_count", 0) or 0),
+        )
+        if key[0] and key[2] > 0:
+            keys.add(key)
+    return keys
+
+
+def _shadow_plan_needs_white_texture(shadow_plan: dict) -> bool:
+    return bool(shadow_plan.get("enabled", False)) and bool(shadow_plan.get("normal_parts", []) or [])
+
+
+def _write_white_shadow_texture(path: str) -> str:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    if os.path.exists(path):
+        return path
+
+    ddpf_alphapixels = 0x1
+    ddpf_rgb = 0x40
+    ddsd_caps = 0x1
+    ddsd_height = 0x2
+    ddsd_width = 0x4
+    ddsd_pitch = 0x8
+    ddsd_pixelformat = 0x1000
+    ddscaps_texture = 0x1000
+
+    header_values = [
+        124,
+        ddsd_caps | ddsd_height | ddsd_width | ddsd_pitch | ddsd_pixelformat,
+        1,
+        1,
+        4,
+        0,
+        0,
+        *([0] * 11),
+        32,
+        ddpf_alphapixels | ddpf_rgb,
+        0,
+        32,
+        0x00FF0000,
+        0x0000FF00,
+        0x000000FF,
+        0xFF000000,
+        ddscaps_texture,
+        0,
+        0,
+        0,
+        0,
+    ]
+    header = struct.pack("<" + "I" * len(header_values), *header_values)
+    with open(path, "wb") as file_handle:
+        file_handle.write(b"DDS ")
+        file_handle.write(header)
+        file_handle.write(b"\xff\xff\xff\xff")
+    return path
 
 
 def _frame_lifecycle_sections() -> list[str]:

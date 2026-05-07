@@ -368,6 +368,10 @@ Replay order:
 Transparent versus opaque membership is generated offline from the analyzed IB
 / collection / replay plan, not from separate `filter_index` values.
 
+If one exported IB has both transparent and normal shadow hits in the analyzed
+shadow stage, it belongs to both replay batches. Do not collapse it to only the
+latest pass role, because that can drop one of the native shadow passes.
+
 The final host can draw replacement parts from other IBs because the global
 bone pool is complete by that point.
 
@@ -547,6 +551,21 @@ lod source local bone  -> one or more canonical global bones
 
 After capture, replay is identical for main and LOD because exported parts only
 read canonical global bones through `PartLocalToGlobalBoneMap`.
+
+LOD and main IB hashes usually differ. Runtime generation must bridge them
+explicitly:
+
+```text
+LOD TextureOverride key -> canonical exported resource suffixes
+LOD capture key         -> LodCaptureBoneMap record
+canonical suffix        -> PartLocalToGlobalBoneMap + exported VB/IB buffers
+```
+
+The LOD override hosts replay with the LOD hash, but the draw resources stay the
+main high-detail exported resources. If a canonical main part maps to multiple
+LOD sources, only the strongest resolved LOD source hosts replay; the remaining
+LOD sources are capture-only. This prevents duplicate high-detail draws while
+still allowing all LOD scatter records to fill the shared global pool.
 
 Main and LOD capture maps should remain separate files for clarity:
 

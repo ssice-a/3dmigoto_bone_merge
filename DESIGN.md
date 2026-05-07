@@ -1807,6 +1807,24 @@ before replay.
 
 Generated INI must include `TextureOverride` sections for resolved LOD IB hashes and `match_index_count` values. The logic is the same shape as the main path, but the capture shader and metadata are LOD scatter-aware.
 
+Main and LOD IB hashes are expected to differ. Generated runtime must therefore not rely on the main/export IB hash to host LOD replay. `lod_links` is materialized into a compact `lod_replay_links` table:
+
+```json
+{
+  "lod_key": {"ib_hash": "lodhash00", "match_first_index": 0, "match_index_count": 12345},
+  "main_keys": [{"ib_hash": "640d1c0e", "match_first_index": 0, "match_index_count": 46845}],
+  "geometry": [
+    {
+      "resource_suffix": "640d1c0e_46845_0_part00",
+      "main_key": {"ib_hash": "640d1c0e", "match_first_index": 0, "match_index_count": 46845}
+    }
+  ],
+  "geometry_suffixes": ["640d1c0e_46845_0_part00"]
+}
+```
+
+The LOD `TextureOverride` uses the LOD key for matching and capture, but replay draws the canonical high-detail exported geometry and its existing `PartLocalToGlobalBoneMap`. If one main part maps to several LOD sources, the replay host is the strongest LOD source by mapped global count, score, and vote count; the other LOD sources remain capture-only.
+
 For each resolved LOD source IB:
 
 ```text

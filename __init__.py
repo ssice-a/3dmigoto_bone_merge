@@ -17,6 +17,8 @@ except ModuleNotFoundError:  # pragma: no cover - unavailable outside Blender
 
 
 REGISTERED_CLASSES = ()
+PROPERTY_GROUP_CLASSES = ()
+RUNTIME_CLASSES = ()
 _PROPERTIES_MODULE = None
 
 
@@ -26,8 +28,8 @@ def register():
 
     from . import operators, panel, properties
 
-    global REGISTERED_CLASSES, _PROPERTIES_MODULE
-    REGISTERED_CLASSES = (
+    global REGISTERED_CLASSES, PROPERTY_GROUP_CLASSES, RUNTIME_CLASSES, _PROPERTIES_MODULE
+    PROPERTY_GROUP_CLASSES = (
         properties.BMC_TargetItem,
         properties.BMC_CandidateItem,
         properties.BMC_AliasItem,
@@ -36,6 +38,8 @@ def register():
         properties.BMC_LodFallbackItem,
         properties.BMC_SeamMatchItem,
         properties.BMC_SeamAliasItem,
+    )
+    RUNTIME_CLASSES = (
         panel.BMC_UL_target_items,
         panel.BMC_UL_candidate_items,
         panel.BMC_UL_alias_items,
@@ -92,11 +96,14 @@ def register():
         panel.VIEW3D_PT_bone_merge_hash_tools,
         panel.VIEW3D_PT_bone_merge_lod_repair,
     )
+    REGISTERED_CLASSES = PROPERTY_GROUP_CLASSES + RUNTIME_CLASSES
     _PROPERTIES_MODULE = properties
 
-    for blender_class in REGISTERED_CLASSES:
+    for blender_class in PROPERTY_GROUP_CLASSES:
         bpy.utils.register_class(blender_class)
     properties.register_addon_properties()
+    for blender_class in RUNTIME_CLASSES:
+        bpy.utils.register_class(blender_class)
     operators.register_runtime_handlers()
 
 

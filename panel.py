@@ -3,6 +3,10 @@
 import bpy
 
 
+def _has_scene_props(scene, *names: str) -> bool:
+    return all(hasattr(scene, name) for name in names)
+
+
 class BMC_UL_target_items(bpy.types.UIList):
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
         object_label = item.object_ref.name if getattr(item, "object_ref", None) else item.object_name
@@ -119,11 +123,23 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        if not _has_scene_props(
+            scene,
+            "bmc_frameanalysis_dir",
+            "bmc_lod_frameanalysis_dir",
+            "bmc_mirror_flip",
+            "bmc_candidate_items",
+            "bmc_candidate_index",
+            "bmc_export_collection",
+            "bmc_export_mode",
+            "bmc_output_dir",
+        ):
+            layout.label(text="Bone Merge properties are not registered. Reload the addon.", icon="ERROR")
+            return
 
         scan_box = layout.box()
         scan_box.label(text="Main Analyze", icon="VIEWZOOM")
         scan_box.prop(scene, "bmc_frameanalysis_dir")
-        scan_box.prop(scene, "bmc_output_dir")
         scan_box.prop(scene, "bmc_mirror_flip")
         scan_actions = scan_box.row(align=True)
         scan_actions.operator("object.bmc_analyze_main_frameanalysis", icon="VIEWZOOM")
@@ -134,12 +150,14 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         lod_row = scan_box.row(align=True)
         lod_row.prop(scene, "bmc_lod_frameanalysis_dir", text="LOD")
         lod_row.operator("object.bmc_analyze_lod_frameanalysis", icon="MESH_GRID", text="Analyze LOD")
-        if scene.bmc_lod_match_summary:
-            icon = "CHECKMARK" if not scene.bmc_lod_match_warning else "ERROR"
-            scan_box.label(text=scene.bmc_lod_match_summary, icon=icon)
-        if scene.bmc_lod_match_warning:
-            scan_box.label(text=scene.bmc_lod_match_warning, icon="ERROR")
-        if scene.bmc_lod_mapping_items:
+        lod_match_summary = getattr(scene, "bmc_lod_match_summary", "")
+        lod_match_warning = getattr(scene, "bmc_lod_match_warning", "")
+        if lod_match_summary:
+            icon = "CHECKMARK" if not lod_match_warning else "ERROR"
+            scan_box.label(text=lod_match_summary, icon=icon)
+        if lod_match_warning:
+            scan_box.label(text=lod_match_warning, icon="ERROR")
+        if getattr(scene, "bmc_lod_mapping_items", None):
             row = scan_box.row()
             row.template_list(
                 "BMC_UL_lod_mapping_items",
@@ -179,14 +197,11 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
 
         export_box = layout.box()
         export_box.label(text="3Dmigoto Export", icon="EXPORT")
-        export_box.prop(scene, "bmc_output_dir", text="3Dmigoto Output Dir")
-        export_box.prop(scene, "bmc_export_collection", text="Export Source")
-        export_box.prop(scene, "bmc_export_build_collection", text="Export Build")
-        row = export_box.row(align=True)
-        row.operator("object.bmc_create_export_collection", icon="COLLECTION_NEW")
-        row.operator("object.bmc_add_selected_export_objects", icon="ADD")
-        export_box.operator("object.bmc_apply_export_collection_global_names", icon="GROUP_VERTEX")
-        export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT")
+        export_box.prop(scene, "bmc_output_dir", text="Output Dir")
+        export_box.prop(scene, "bmc_export_collection", text="Export Root")
+        export_box.operator("object.bmc_add_selected_export_objects", icon="ADD", text="Add Selected")
+        export_box.prop(scene, "bmc_export_mode", text="")
+        export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT", text="Export")
 
 
 class VIEW3D_PT_bone_merge_hash_tools(bpy.types.Panel):

@@ -48,9 +48,8 @@ from .core.models import TargetObjectSpec
 
 DEFAULT_TARGET_COLLECTION_NAME = "BMC Bone Palette Targets"
 DEFAULT_EXPORT_COLLECTION_NAME = "BMC Export Sources"
-DEFAULT_EXPORT_BUILD_COLLECTION_NAME = "BMC Export Build"
 _EXPORT_NORMALIZE_GUARD = False
-_EXPORT_CHUNK_NAME_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)(?:[-_](?P<chunk>\d+))?")
+_EXPORT_REGION_NAME_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)[-_](?P<first>\d+)")
 
 
 def _ensure_target_collection(context):
@@ -77,61 +76,49 @@ def _ensure_export_collection(context):
     return collection
 
 
-def _ensure_export_build_collection(context):
-    scene = context.scene
-    collection = scene.bmc_export_build_collection
-    if collection is None:
-        collection = bpy.data.collections.get(DEFAULT_EXPORT_BUILD_COLLECTION_NAME)
-    if collection is None:
-        collection = bpy.data.collections.new(DEFAULT_EXPORT_BUILD_COLLECTION_NAME)
-        scene.collection.children.link(collection)
-    scene.bmc_export_build_collection = collection
-    return collection
-
-
-def _export_chunk_collection_name(
+def _export_region_collection_name(
     ib_hash: str,
     match_index_count: int = 0,
-    chunk_index: int = 0,
+    match_first_index: int = 0,
     *,
     bone_capture_available: bool = True,
     lod_match_excluded: bool = False,
 ) -> str:
-    chunk_name = f"{ib_hash.lower()}-{int(match_index_count)}-{int(chunk_index)}"
+    region_name = f"{ib_hash.lower()}-{int(match_index_count)}-{int(match_first_index)}"
     if not bone_capture_available:
-        chunk_name += "-NO_CAPTURE_BONES"
+        region_name += "-NO_CAPTURE_BONES"
     if lod_match_excluded:
-        chunk_name += "-NO_LOD_DYNAMIC_VB0"
-    return chunk_name
+        region_name += "-NO_LOD_DYNAMIC_VB0"
+    return region_name
 
 
-def _ensure_export_chunk_collection(
+def _ensure_export_region_collection(
     parent_collection,
     ib_hash: str,
     match_index_count: int = 0,
-    chunk_index: int = 0,
+    match_first_index: int = 0,
     *,
     bone_capture_available: bool = True,
     lod_match_excluded: bool = False,
 ):
-    chunk_name = _export_chunk_collection_name(
+    region_name = _export_region_collection_name(
         ib_hash,
         match_index_count,
-        chunk_index,
+        match_first_index,
         bone_capture_available=bone_capture_available,
         lod_match_excluded=lod_match_excluded,
     )
     for child in parent_collection.children:
-        identity = _resolve_export_chunk_collection_identity(child)
-        if identity == (str(ib_hash or "").lower(), int(match_index_count), int(chunk_index)):
-            if child.name != chunk_name and bpy.data.collections.get(chunk_name) is None:
-                child.name = chunk_name
+        identity = _resolve_export_region_collection_identity(child)
+        if identity == (str(ib_hash or "").lower(), int(match_index_count), int(match_first_index)):
+            if child.name != region_name and bpy.data.collections.get(region_name) is None:
+                child.name = region_name
             child["bmc_bone_capture_available"] = bool(bone_capture_available)
             child["bmc_lod_match_excluded"] = bool(lod_match_excluded)
             return child
-    collection = bpy.data.collections.get(chunk_name)
+    collection = bpy.data.collections.get(region_name)
     if collection is None:
-        collection = bpy.data.collections.new(chunk_name)
+        collection = bpy.data.collections.new(region_name)
     if all(child.name != collection.name for child in parent_collection.children):
         parent_collection.children.link(collection)
     collection["bmc_bone_capture_available"] = bool(bone_capture_available)
@@ -139,7 +126,7 @@ def _ensure_export_chunk_collection(
     return collection
 
 
-def _ensure_export_chunk_collections_from_targets(context, parent_collection) -> int:
+def _ensure_export_region_collections_from_targets(context, parent_collection) -> int:
     created_count = 0
     seen_keys: set[tuple[str, int, int]] = set()
     scene = context.scene
@@ -154,7 +141,7 @@ def _ensure_export_chunk_collections_from_targets(context, parent_collection) ->
         if key in seen_keys:
             continue
         seen_keys.add(key)
-        if _ensure_export_chunk_collection_if_missing(parent_collection, key[0], key[1], key[2]):
+        if _ensure_export_region_collection_if_missing(parent_collection, key[0], key[1], key[2]):
             created_count += 1
 
     if seen_keys:
@@ -169,43 +156,44 @@ def _ensure_export_chunk_collections_from_targets(context, parent_collection) ->
         match_index_count = _resolve_target_match_index_count(scene, identity[0], mesh_obj.name, int(identity[1]))
         if match_index_count <= 0:
             continue
-        key = (identity[0].lower(), int(match_index_count), 0)
+        first_index = int(mesh_obj.get("bmc_match_first_index", 0) or 0)
+        key = (identity[0].lower(), int(match_index_count), first_index)
         if key in seen_keys:
             continue
         seen_keys.add(key)
-        if _ensure_export_chunk_collection_if_missing(parent_collection, key[0], key[1], key[2]):
+        if _ensure_export_region_collection_if_missing(parent_collection, key[0], key[1], key[2]):
             created_count += 1
 
     return created_count
 
 
-def _ensure_export_chunk_collection_if_missing(
+def _ensure_export_region_collection_if_missing(
     parent_collection,
     ib_hash: str,
     match_index_count: int,
-    chunk_index: int = 0,
+    match_first_index: int = 0,
     *,
     bone_capture_available: bool = True,
     lod_match_excluded: bool = False,
 ) -> bool:
-    identity = (str(ib_hash or "").lower(), int(match_index_count), int(chunk_index))
-    existed_under_parent = any(_resolve_export_chunk_collection_identity(child) == identity for child in parent_collection.children)
-    _ensure_export_chunk_collection(
+    identity = (str(ib_hash or "").lower(), int(match_index_count), int(match_first_index))
+    existed_under_parent = any(_resolve_export_region_collection_identity(child) == identity for child in parent_collection.children)
+    _ensure_export_region_collection(
         parent_collection,
         ib_hash,
         match_index_count,
-        chunk_index,
+        match_first_index,
         bone_capture_available=bone_capture_available,
         lod_match_excluded=lod_match_excluded,
     )
     return not existed_under_parent
 
 
-def _resolve_export_chunk_collection_identity(collection) -> tuple[str, int, int] | None:
-    match = _EXPORT_CHUNK_NAME_RE.search(str(getattr(collection, "name", "") or ""))
+def _resolve_export_region_collection_identity(collection) -> tuple[str, int, int] | None:
+    match = _EXPORT_REGION_NAME_RE.search(str(getattr(collection, "name", "") or ""))
     if not match:
         return None
-    return match.group("hash").lower(), int(match.group("count")), int(match.group("chunk") or 0)
+    return match.group("hash").lower(), int(match.group("count")), int(match.group("first"))
 
 
 def _link_object_to_collection(mesh_obj, collection) -> None:
@@ -364,7 +352,7 @@ def _normalize_export_collection_membership(scene) -> dict[str, int]:
 
     subtree_collections = tuple(_iter_collection_subtree(export_collection))
     subtree_ids = {collection.as_pointer() for collection in subtree_collections}
-    existing_chunk_names = {child.name for child in export_collection.children}
+    existing_region_names = {child.name for child in export_collection.children}
     moved_count = 0
     skipped_count = 0
     created_count = 0
@@ -379,19 +367,20 @@ def _normalize_export_collection_membership(scene) -> dict[str, int]:
         if match_index_count <= 0:
             skipped_count += 1
             continue
-        chunk_name = f"{identity[0].lower()}-{int(match_index_count)}-0"
-        if chunk_name not in existing_chunk_names:
+        first_index = int(mesh_obj.get("bmc_match_first_index", 0) or 0)
+        region_name = f"{identity[0].lower()}-{int(match_index_count)}-{first_index}"
+        if region_name not in existing_region_names:
             created_count += 1
-            existing_chunk_names.add(chunk_name)
-        chunk_collection = _ensure_export_chunk_collection(export_collection, identity[0], match_index_count, 0)
+            existing_region_names.add(region_name)
+        region_collection = _ensure_export_region_collection(export_collection, identity[0], match_index_count, first_index)
 
         moved_here = False
-        if all(obj.name != mesh_obj.name for obj in chunk_collection.objects):
-            chunk_collection.objects.link(mesh_obj)
+        if all(obj.name != mesh_obj.name for obj in region_collection.objects):
+            region_collection.objects.link(mesh_obj)
             moved_here = True
 
         for collection in tuple(mesh_obj.users_collection):
-            if collection.as_pointer() not in subtree_ids or collection == chunk_collection:
+            if collection.as_pointer() not in subtree_ids or collection == region_collection:
                 continue
             if any(obj.name == mesh_obj.name for obj in collection.objects):
                 collection.objects.unlink(mesh_obj)
@@ -745,7 +734,7 @@ def _enabled_target_specs(context) -> list[TargetObjectSpec]:
         if local_bone_count > BI4_MAX_BONE_COUNT:
             raise ValueError(
                 f"{display_name}: local bone count {local_bone_count} exceeds BI4 limit {BI4_MAX_BONE_COUNT}; "
-                "this workflow requires each final object/draw chunk to stay within 256 bones"
+                "this workflow requires each final export part to stay within 256 bones"
             )
         target_specs.append(
             TargetObjectSpec(
@@ -1253,14 +1242,20 @@ def _hash_rename_target_meshes(context) -> list[object]:
     return [obj for obj in context.scene.objects if getattr(obj, "type", "") == "MESH"]
 
 
-def _resolve_remap_for_chunk_identity(manifest: dict, ib_hash: str, match_index_count: int) -> tuple[dict | None, str]:
+def _resolve_remap_for_region_identity(
+    manifest: dict,
+    ib_hash: str,
+    match_index_count: int,
+    match_first_index: int,
+) -> tuple[dict | None, str]:
     matches = [
         remap
         for remap in _remap_entries_for_hash(manifest, ib_hash)
         if int(remap.get("match_index_count", 0) or 0) == int(match_index_count)
+        and int(remap.get("match_first_index", 0) or 0) == int(match_first_index)
     ]
     if not matches:
-        return None, f"{ib_hash}-{match_index_count}: no global-pool mapping"
+        return None, f"{ib_hash}-{match_index_count}-{match_first_index}: no global-pool mapping"
     source_keys = {
         str(remap.get("source_key", "") or _source_key_from_values(
             str(remap.get("ib_hash", "") or ""),
@@ -1270,7 +1265,7 @@ def _resolve_remap_for_chunk_identity(manifest: dict, ib_hash: str, match_index_
         for remap in matches
     }
     if len(source_keys) > 1:
-        return None, f"{ib_hash}-{match_index_count}: ambiguous_source_hash"
+        return None, f"{ib_hash}-{match_index_count}-{match_first_index}: ambiguous_source_hash"
     return dict(matches[0]), ""
 
 
@@ -1376,12 +1371,12 @@ def _merge_selected_seam_groups(context):
     return build_and_apply_seam_mapping(mesh_objects)
 
 
-def _export_chunk_collections_by_hash(export_collection) -> dict[str, list[object]]:
+def _export_region_collections_by_hash(export_collection) -> dict[str, list[object]]:
     by_hash: dict[str, list[object]] = {}
     if export_collection is None:
         return by_hash
     for child in export_collection.children:
-        identity = _resolve_export_chunk_collection_identity(child)
+        identity = _resolve_export_region_collection_identity(child)
         if identity is None:
             continue
         by_hash.setdefault(identity[0], []).append(child)
@@ -1392,11 +1387,11 @@ def _child_collection_contains_object(collection, mesh_obj) -> bool:
     return any(obj.name == mesh_obj.name for obj in collection.objects)
 
 
-def _unlink_object_from_export_sibling_chunks(export_collection, mesh_obj, keep_collection) -> None:
+def _unlink_object_from_export_sibling_regions(export_collection, mesh_obj, keep_collection) -> None:
     for child in export_collection.children:
         if child == keep_collection:
             continue
-        if _resolve_export_chunk_collection_identity(child) is None:
+        if _resolve_export_region_collection_identity(child) is None:
             continue
         if _child_collection_contains_object(child, mesh_obj):
             child.objects.unlink(mesh_obj)
@@ -1412,10 +1407,10 @@ def _apply_global_names_in_export_collection(context, manifest: dict) -> tuple[i
     conflict_names: set[str] = set()
 
     for child in export_collection.children:
-        identity = _resolve_export_chunk_collection_identity(child)
+        identity = _resolve_export_region_collection_identity(child)
         if identity is None:
             continue
-        remap, error = _resolve_remap_for_chunk_identity(manifest, identity[0], identity[1])
+        remap, error = _resolve_remap_for_region_identity(manifest, identity[0], identity[1], identity[2])
         if remap is None:
             skipped.append(error)
             continue
@@ -1427,7 +1422,7 @@ def _apply_global_names_in_export_collection(context, manifest: dict) -> tuple[i
                 continue
             previous = objects_by_name.get(mesh_obj.name)
             if previous is not None and previous[2] != child.name:
-                skipped.append(f"{mesh_obj.name}: multiple export chunks")
+                skipped.append(f"{mesh_obj.name}: multiple export regions")
                 objects_by_name.pop(mesh_obj.name, None)
                 conflict_names.add(mesh_obj.name)
                 continue
@@ -1874,7 +1869,7 @@ class BMC_OT_sync_targets_from_collection(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_target_collection)
+        return bool(context.scene and getattr(context.scene, "bmc_target_collection", None))
 
     def execute(self, context):
         scene = context.scene
@@ -1909,7 +1904,9 @@ class BMC_OT_refresh_target_identity(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_target_items and 0 <= scene.bmc_target_index < len(scene.bmc_target_items))
+        target_items = getattr(scene, "bmc_target_items", None)
+        target_index = int(getattr(scene, "bmc_target_index", -1))
+        return bool(scene and target_items and 0 <= target_index < len(target_items))
 
     def execute(self, context):
         scene = context.scene
@@ -1951,9 +1948,7 @@ class BMC_OT_create_export_collection(bpy.types.Operator):
 
     def execute(self, context):
         source_collection = _ensure_export_collection(context)
-        build_collection = _ensure_export_build_collection(context)
-        message = f"Export source: {source_collection.name}; build: {build_collection.name}"
-        message += "; build global pool to create chunk collections"
+        message = f"Export root: {source_collection.name}; build global pool to create IB region collections"
         self.report({"INFO"}, message)
         return {"FINISHED"}
 
@@ -1973,7 +1968,7 @@ class BMC_OT_add_selected_export_objects(bpy.types.Operator):
         moved_count = 0
         skipped_messages: list[str] = []
         collection = _ensure_export_collection(context)
-        chunks_by_hash = _export_chunk_collections_by_hash(collection)
+        regions_by_hash = _export_region_collections_by_hash(collection)
 
         for mesh_obj in context.selected_objects:
             if mesh_obj.type != "MESH":
@@ -1982,18 +1977,18 @@ class BMC_OT_add_selected_export_objects(bpy.types.Operator):
             if not ib_hash:
                 skipped_messages.append(f"{mesh_obj.name}: no source hash")
                 continue
-            matching_collections = chunks_by_hash.get(ib_hash, [])
+            matching_collections = regions_by_hash.get(ib_hash, [])
             if not matching_collections:
                 skipped_messages.append(f"{mesh_obj.name}: no export child for {ib_hash}")
                 continue
             if len(matching_collections) > 1:
                 skipped_messages.append(f"{mesh_obj.name}: ambiguous_source_hash {ib_hash}")
                 continue
-            chunk_collection = matching_collections[0]
-            already_in_chunk = _child_collection_contains_object(chunk_collection, mesh_obj)
-            _link_object_to_collection(mesh_obj, chunk_collection)
-            _unlink_object_from_export_sibling_chunks(collection, mesh_obj, chunk_collection)
-            if already_in_chunk:
+            region_collection = matching_collections[0]
+            already_in_region = _child_collection_contains_object(region_collection, mesh_obj)
+            _link_object_to_collection(mesh_obj, region_collection)
+            _unlink_object_from_export_sibling_regions(collection, mesh_obj, region_collection)
+            if already_in_region:
                 moved_count += 1
             else:
                 added_count += 1
@@ -2023,7 +2018,8 @@ class BMC_OT_apply_export_collection_global_names(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_manifest_path and context.scene.bmc_export_collection)
+        scene = context.scene
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and getattr(scene, "bmc_export_collection", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2061,7 +2057,7 @@ class BMC_OT_apply_global_names_by_object_hash(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_manifest_path)
+        return bool(context.scene and getattr(context.scene, "bmc_manifest_path", ""))
 
     def execute(self, context):
         scene = context.scene
@@ -2098,7 +2094,7 @@ class BMC_OT_revert_global_names_by_object_hash(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_manifest_path)
+        return bool(context.scene and getattr(context.scene, "bmc_manifest_path", ""))
 
     def execute(self, context):
         scene = context.scene
@@ -2157,32 +2153,33 @@ class BMC_OT_merge_selected_seam_groups(bpy.types.Operator):
 
 class BMC_OT_prepare_export_collection(bpy.types.Operator):
     bl_idname = "object.bmc_prepare_export_collection"
-    bl_label = "Prepare Export / Palette"
-    bl_description = "Rebuild Export Build from Export Source, localize only the build copies, and write Palette.buf / export_manifest.json"
+    bl_label = "Export"
+    bl_description = "Scan the export root, build per-part palettes, and write buffers according to the selected export mode"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_export_collection)
+        return bool(context.scene)
 
     def execute(self, context):
         scene = context.scene
         try:
             source_collection = _ensure_export_collection(context)
-            build_collection = _ensure_export_build_collection(context)
+            generate_ini = str(getattr(scene, "bmc_export_mode", "BUFFER_ONLY") or "BUFFER_ONLY") == "BUFFER_AND_INI"
             manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
             if manifest_path and os.path.exists(manifest_path):
                 _raise_if_lod_unmatched_used_by_export(scene, read_json(manifest_path))
             result = prepare_export_collection(
                 context=context,
                 source_collection=source_collection,
-                build_collection=build_collection,
+                build_collection=None,
                 output_dir=scene.bmc_output_dir,
                 internal_manifest_dir=None,
                 capture_manifest_path=scene.bmc_manifest_path,
+                generate_ini=generate_ini,
             )
         except Exception as exc:
-            self.report({"ERROR"}, f"Prepare export failed: {exc}")
+            self.report({"ERROR"}, f"Export failed: {exc}")
             return {"CANCELLED"}
 
         scene.bmc_export_manifest_path = result["manifest_path"]
@@ -2195,9 +2192,10 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
             store_mapping_payload_on_scene(scene, payload)
         except Exception:
             pass
+        mode_label = "buffers + INI" if generate_ini else "buffers"
         self.report(
             {"INFO"},
-            f"Prepared {result['objects']} object(s), {result['palettes']} palette(s); wrote 3Dmigoto files to {result['output_dir']}",
+            f"Exported {mode_label}: {result['objects']} object(s), {result['palettes']} palette(s) to {result['output_dir']}",
         )
         return {"FINISHED"}
 
@@ -2274,7 +2272,7 @@ class BMC_OT_remove_lod_target(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_lod_target_items)
+        return bool(context.scene and getattr(context.scene, "bmc_lod_target_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2291,7 +2289,7 @@ class BMC_OT_clear_lod_targets(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_lod_target_items)
+        return bool(context.scene and getattr(context.scene, "bmc_lod_target_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2389,7 +2387,7 @@ class BMC_OT_apply_lod_vertex_group_remap(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_lod_target_items)
+        return bool(context.scene and getattr(context.scene, "bmc_lod_target_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2497,7 +2495,7 @@ class BMC_OT_generate_lod_runtime_map(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_manifest_path and scene.bmc_ini_path)
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and getattr(scene, "bmc_ini_path", ""))
 
     def execute(self, context):
         scene = context.scene
@@ -2572,7 +2570,7 @@ class BMC_OT_seam_remove_object(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_seam_match_items)
+        return bool(context.scene and getattr(context.scene, "bmc_seam_match_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2589,7 +2587,7 @@ class BMC_OT_seam_clear_objects(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_seam_match_items)
+        return bool(context.scene and getattr(context.scene, "bmc_seam_match_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2635,7 +2633,7 @@ class BMC_OT_seam_apply_mapping(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(context.scene and context.scene.bmc_seam_alias_items)
+        return bool(context.scene and getattr(context.scene, "bmc_seam_alias_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2719,7 +2717,7 @@ class BMC_OT_candidate_remove(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_candidate_items)
+        return bool(scene and getattr(scene, "bmc_candidate_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2781,7 +2779,7 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_manifest_path and scene.bmc_candidate_items)
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and getattr(scene, "bmc_candidate_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -2825,11 +2823,11 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
                     unavailable_count += 1
                 if lod_match_excluded:
                     lod_excluded_count += 1
-                if _ensure_export_chunk_collection_if_missing(
+                if _ensure_export_region_collection_if_missing(
                     export_collection,
                     str(record.get("ib_hash", "") or ""),
                     int(record.get("match_index_count", 0) or 0),
-                    0,
+                    int(record.get("match_first_index", 0) or 0),
                     bone_capture_available=capture_available,
                     lod_match_excluded=lod_match_excluded,
                 ):
@@ -2862,7 +2860,7 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_manifest_path)
+        return bool(scene and getattr(scene, "bmc_manifest_path", ""))
 
     def execute(self, context):
         scene = context.scene
@@ -2915,7 +2913,7 @@ class BMC_OT_analyze_lod_frameanalysis(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_manifest_path and scene.bmc_lod_frameanalysis_dir)
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and getattr(scene, "bmc_lod_frameanalysis_dir", ""))
 
     def execute(self, context):
         scene = context.scene
@@ -2998,7 +2996,7 @@ class BMC_OT_preview_lod_fallbacks(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_manifest_path and scene.bmc_export_collection)
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and getattr(scene, "bmc_export_collection", None))
 
     def execute(self, context):
         scene = context.scene
@@ -3034,7 +3032,7 @@ class BMC_OT_apply_lod_fallbacks(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_manifest_path and scene.bmc_export_collection)
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and getattr(scene, "bmc_export_collection", None))
 
     def execute(self, context):
         scene = context.scene
@@ -3083,7 +3081,7 @@ class BMC_OT_analyze_main_frameanalysis(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_frameanalysis_dir)
+        return bool(scene and getattr(scene, "bmc_frameanalysis_dir", ""))
 
     def execute(self, context):
         scene = context.scene
@@ -3124,7 +3122,7 @@ class BMC_OT_import_selected_candidates(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_manifest_path and scene.bmc_candidate_items)
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and getattr(scene, "bmc_candidate_items", None))
 
     def execute(self, context):
         scene = context.scene
@@ -3302,7 +3300,7 @@ class BMC_OT_analyze_duplicate_bones(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and scene.bmc_manifest_path and _enabled_target_names(scene))
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and _enabled_target_names(scene))
 
     def execute(self, context):
         scene = context.scene

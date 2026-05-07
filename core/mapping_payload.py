@@ -177,7 +177,6 @@ def build_mapping_payload(scene, manifest_payload: dict | None = None, base_payl
             "output_dir": str(scene.bmc_output_dir or base_payload.get("workspace", {}).get("output_dir", "") or ""),
             "target_collection_name": scene.bmc_target_collection.name if scene.bmc_target_collection else str(base_payload.get("workspace", {}).get("target_collection_name", "") or ""),
             "export_collection_name": scene.bmc_export_collection.name if scene.bmc_export_collection else str(base_payload.get("workspace", {}).get("export_collection_name", "") or ""),
-            "export_build_collection_name": scene.bmc_export_build_collection.name if scene.bmc_export_build_collection else str(base_payload.get("workspace", {}).get("export_build_collection_name", "") or ""),
         },
         "targets": target_payload,
         "lod_targets": lod_target_payload,
@@ -239,12 +238,6 @@ def apply_mapping_payload_to_scene(scene, payload: dict, preset_name: str = "") 
             export_collection = bpy.data.collections.get(export_collection_name)
             if export_collection is not None:
                 scene.bmc_export_collection = export_collection
-
-        export_build_collection_name = str(workspace.get("export_build_collection_name", "") or "").strip()
-        if export_build_collection_name:
-            export_build_collection = bpy.data.collections.get(export_build_collection_name)
-            if export_build_collection is not None:
-                scene.bmc_export_build_collection = export_build_collection
 
     scene.bmc_shadow_host_hash = str(normalized_payload.get("shadow_host_hash", "") or "")
     scene.bmc_shadow_host_match_index_count = int(normalized_payload.get("shadow_host_match_index_count", -1))

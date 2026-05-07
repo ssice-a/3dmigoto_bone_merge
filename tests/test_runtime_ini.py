@@ -39,7 +39,7 @@ class RuntimeIniTests(unittest.TestCase):
             chunk_index=0,
             local_bone_count=3,
             palette_values=(10, 11, 12),
-            file_name="12345678-42-0-Palette.buf",
+            file_name="12345678-42-0-LocalToGlobalBoneMap.buf",
             file_path="",
             resource_suffix="12345678_42_0",
         )
@@ -54,8 +54,8 @@ class RuntimeIniTests(unittest.TestCase):
 
             ini_text = ini_export.build_bonestore_ini_content(runtime)
             self.assertNotIn("ResourceBoneMeta", ini_text)
-            self.assertIn("ResourceCaptureMeta", ini_text)
-            self.assertIn("ResourceCaptureLocalIndices", ini_text)
+            self.assertIn("ResourceMainCaptureRecords", ini_text)
+            self.assertIn("ResourceMainCaptureSourceLocalBones", ini_text)
             self.assertIn("x100 = 0", ini_text)
             self.assertIn("x101 = 3", ini_text)
 
@@ -120,7 +120,7 @@ class RuntimeIniTests(unittest.TestCase):
             chunk_index=0,
             local_bone_count=1,
             palette_values=(1,),
-            file_name="bad-Palette.buf",
+            file_name="bad-LocalToGlobalBoneMap.buf",
             file_path="",
             resource_suffix="bad",
         )

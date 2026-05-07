@@ -707,7 +707,7 @@ def _effective_canonical_palettes(
                 chunk_index=0,
                 local_bone_count=len(palette_values),
                 palette_values=palette_values,
-                file_name=f"{str(part_record.ib_hash).lower()}-{int(part_record.match_index_count)}-0-Palette.buf",
+                file_name=f"{str(part_record.ib_hash).lower()}-{int(part_record.match_index_count)}-0-LocalToGlobalBoneMap.buf",
                 file_path="",
                 resource_suffix=f"{str(part_record.ib_hash).lower()}_{int(part_record.match_index_count)}_0",
             )
@@ -742,7 +742,7 @@ def _build_lod_capture_resource_suffix(variant_id: str, part: LodPartRecord) -> 
 def _build_lod_native_palette_file_name(variant_id: str, part: LodPartRecord) -> str:
     return (
         f"{str(part.ib_hash).lower()}-{int(part.match_index_count)}-{int(part.draw_index)}-"
-        f"{str(variant_id).lower()}-NativePalette.buf"
+        f"{str(variant_id).lower()}-LodLocalToCaptureStoreBoneMap.buf"
     )
 
 
@@ -753,5 +753,5 @@ def _build_lod_palette_resource_suffix(variant_id: str, palette_record: LocalPal
 def _build_lod_palette_file_name(variant_id: str, palette_record: LocalPaletteRecord) -> str:
     return (
         f"{str(palette_record.ib_hash).lower()}-{int(palette_record.match_index_count)}-"
-        f"{int(palette_record.chunk_index)}-{str(variant_id).lower()}-Palette.buf"
+        f"{int(palette_record.chunk_index)}-{str(variant_id).lower()}-PartLocalToLodCaptureStoreBoneMap.buf"
     )

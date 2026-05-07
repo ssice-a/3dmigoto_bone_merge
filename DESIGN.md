@@ -58,9 +58,10 @@ For the default local fake store, `LOCAL_PREVIOUS_ROW_OFFSET = 1024`.
 The final consume identity is:
 
 ```text
-final_chunk_ib_hash
+final_region_ib_hash
 match_index_count
-chunk_index
+match_first_index
+part_index
 local_palette
 ```
 
@@ -85,24 +86,25 @@ w = reserved
 
 `source_index_count` stays in the offline manifest as a validation and ordering field. It must not be passed to runtime shaders unless a future shader genuinely needs it.
 
-Do not generate one INI `ResourceBoneMeta_*` section per IB. Per-IB INI resources make the runtime config noisy and were a failed older design. Capture metadata should be materialized into one static buffer file, for example:
+Do not generate one INI `ResourceBoneMeta_*` section per IB. Per-IB INI resources make the runtime config noisy and were a failed older design. Capture metadata should be materialized into compact static buffer files:
 
 ```text
-Buffer/CaptureMeta.buf
+Buffer/MainCaptureRecords.buf
+Buffer/MainCaptureSourceLocalBones.buf
 ```
 
-The static record format should be:
+The static main capture record format should be:
 
 ```text
-uint4 CaptureMeta[N]
+uint4 MainCaptureRecords[N]
 
 x = capture_store_base
 y = source_local_bone_count
-z = reserved
+z = source_local_bone_base in MainCaptureSourceLocalBones
 w = reserved
 ```
 
-At runtime, the `TextureOverride` hash and `if vs == ...` filter already select the capture draw. The INI does not need to pass a dynamic record index into HLSL. The generated INI should bind the matching capture meta record for that override directly, using the simplest 3Dmigoto resource binding available for a one-record view/slice of the unified static buffer.
+At runtime, the `TextureOverride` hash and `if vs == ...` filter select the capture draw, and `x100` selects the compact capture record inside the static table.
 
 A capture record should be accepted only after matching several independent signals:
 
@@ -237,9 +239,10 @@ The other fields are offline validation, sorting, diagnostics, and INI matching 
   "max_local_bone_count": 256,
   "global_previous_row_offset": 100000,
   "local_previous_row_offset": 1024,
-  "capture_meta_path": "Buffer/CaptureMeta.buf",
-  "palette_meta_path": "Buffer/PaletteMeta.buf",
-  "palette_table_path": "Buffer/PaletteTable.buf",
+  "main_capture_records_path": "Buffer/MainCaptureRecords.buf",
+  "main_capture_source_local_bones_path": "Buffer/MainCaptureSourceLocalBones.buf",
+  "lod_capture_records_path": "Buffer/LodCaptureRecords.buf",
+  "lod_capture_scatter_pairs_path": "Buffer/LodCaptureScatterPairs.buf",
   "global_bone_store_rows": 101263,
   "local_bone_store_rows": 1795
 }
@@ -268,7 +271,7 @@ Only modified/exported source IBs are skipped at their original shadow draw. Unm
 
 ### shadow_replay_plan
 
-The replay host is a late compatible shadow draw used to replay all delayed modified shadow chunks after the global bone store is complete.
+The replay host is a late compatible shadow draw used to replay all delayed modified shadow parts after the global bone store is complete.
 
 ```json
 {
@@ -280,24 +283,24 @@ The replay host is a late compatible shadow draw used to replay all delayed modi
     {
       "name": "transparent_shadow",
       "set_white_ps_t0": false,
-      "chunks": []
+      "parts": []
     },
     {
       "name": "normal_shadow",
       "set_white_ps_t0": true,
-      "chunks": []
+      "parts": []
     }
   ]
 }
 ```
 
-Each chunk entry should include the exported mesh resources, draw calls, and palette record:
+Each part entry should include the exported mesh resources, draw calls, and palette record:
 
 ```json
 {
   "source_ib_hash": "2e5d9294",
   "match_index_count": 23220,
-  "chunk_index": 0,
+  "part_index": 0,
   "palette_meta_index": 0,
   "mesh_resources": {
     "ib": "Resource_2e5d9294_23220_0_Index",
@@ -338,7 +341,8 @@ Capture pass:
 ```ini
 if vs == <capture_filter>
   run = CustomShader_ExtractCB1
-  cs-t2 = ResourceCaptureMeta_<record_view>
+  cs-t2 = ResourceMainCaptureRecords
+  cs-t3 = ResourceMainCaptureSourceLocalBones
   run = CustomShader_RecordBones
 endif
 ```
@@ -378,7 +382,7 @@ Consume pass:
 ```ini
 run = CustomShader_ExtractCB1
 x101 = <local_bone_count>
-cs-t2 = ResourceLocalPalette_<chunk>
+cs-t2 = ResourceLocalToGlobalBoneMap_<part>
 run = CustomShader_GatherBones
 vs-t0 = ResourceLocalFakeT0_SRV
 run = CustomShader_RedirectCB1
@@ -392,13 +396,13 @@ cb1[5].x = 0
 cb1[5].y = LOCAL_PREVIOUS_ROW_OFFSET
 ```
 
-If a future design binds the full global capture store directly as `vs-t0`, then `cb1[5].x/y` must instead be redirected to that chunk's global current/previous offsets. Under the current small-buffer consume design, the correct redirect target is always `0/1024`.
+If a future design binds the full global capture store directly as `vs-t0`, then `cb1[5].x/y` must instead be redirected to that part's global current/previous offsets. Under the current small-buffer consume design, the correct redirect target is always `0/1024`.
 
 ## Performance Direction
 
 Avoid per-pass duplicate capture. If multiple passes share the same native palette identity, capture once where possible and let later consume passes reuse the same global store rows.
 
-The scanner should choose a capture draw that appears before all consuming draws that need it. If that cannot be guaranteed, the integration layer should move the consuming draw to a later host or split the affected chunk.
+The scanner should choose a capture draw that appears before all consuming draws that need it. If that cannot be guaranteed, the integration layer should move the consuming draw to a later host or split the affected part.
 
 Future optimization should target reducing draw-time CS count:
 
@@ -412,42 +416,41 @@ Future optimization should target reducing draw-time CS count:
 
 Runtime data should be table-driven and generated offline.
 
-### CaptureMeta
+### MainCaptureRecords
 
 ```text
-Buffer/CaptureMeta.buf
-uint4 CaptureMeta[N]
+Buffer/MainCaptureRecords.buf
+uint4 MainCaptureRecords[N]
 
 x = capture_store_base
 y = source_local_bone_count
-z = reserved
+z = source_local_bone_base in MainCaptureSourceLocalBones
 w = reserved
 ```
 
-Each capture `TextureOverride` binds the corresponding one-record view/slice as `cs-t2`. The shader reads only record zero from that bound view.
+`x100` selects the record. `cs-t2` binds `ResourceMainCaptureRecords`.
 
-### PaletteMeta
-
-```text
-Buffer/PaletteMeta.buf
-uint4 PaletteMeta[M]
-
-x = palette_table_base
-y = local_bone_count
-z = reserved
-w = reserved
-```
-
-### PaletteTable
+### MainCaptureSourceLocalBones
 
 ```text
-Buffer/PaletteTable.buf
-uint PaletteTable[K]
+Buffer/MainCaptureSourceLocalBones.buf
+uint MainCaptureSourceLocalBones[K]
 
-PaletteTable[palette_table_base + localBone] = capture_store_index
+MainCaptureSourceLocalBones[base + i] = source_local_bone_index
 ```
 
-Each consume `TextureOverride` binds the corresponding one-record `PaletteMeta` view/slice plus the unified `PaletteTable`. `GatherBones` uses those two buffers to copy from the global capture store into the local fake `vs-t0`.
+`cs-t3` binds this source-local bone index table. It exists because the source IB's useful local bones can be sparse.
+
+### LocalToGlobalBoneMap
+
+```text
+Buffer/<region>_partNN-LocalToGlobalBoneMap.buf
+uint LocalToGlobalBoneMap[local_bone_count]
+
+LocalToGlobalBoneMap[part_local_bone] = canonical_global_bone
+```
+
+Each consume command list binds the part's local-to-global map as `cs-t2`. `GatherBones` uses it to copy from the global capture store into the local fake `vs-t0`.
 
 ## Blender Interaction Layer
 
@@ -547,7 +550,7 @@ Status summary should be compact:
 capture records: N
 global bones: N
 modified shadow skips: N
-replay chunks: N
+replay parts: N
 validation: pass/fail
 ```
 
@@ -569,42 +572,56 @@ LOD automation is an optional phase after the main analyze/import/global-pool pa
 
 There is exactly one user-facing root collection. Import and export both use this same collection. Do not create separate import and export roots.
 
-This root collection is a large working collection containing imported source objects and export hash subcollections. Export recursively walks mesh objects under valid hash subcollections in this root and writes buffers/INI from that structure.
+This root collection is a large working collection containing imported source objects and export
+IB region subcollections. Export recursively walks mesh objects under valid region/part
+subcollections in this root and writes buffers/INI from that structure.
 
-Rules:
+The root contains IB region collections. Each region collection can export either one implicit
+part or multiple explicit parts. This mirrors the `mod_importer` rule while keeping BoneMerge's
+single-root workflow:
 
 ```text
 ExportRoot
-  <ib_hash>-<match_index_count>
-    mesh objects...
-  <ib_hash>-<match_index_count>-<chunk_index>
-    mesh objects...
+  <ib_hash>-<match_index_count>-<first_index>
+    mesh objects...            ; implicit part00
+  <ib_hash>-<match_index_count>-<first_index>
+    part00
+      mesh objects...
+    part01
+      mesh objects...
 ```
 
-The hash collection controls the output IB identity and match range. Mesh object names are free-form during export. Object names must not be used as the source bone mapping identity.
+The region collection controls the output IB identity and match range. Part collections control
+local palette boundaries and draw parts. Mesh object names are free-form during export. Object
+names must not be used as the source bone mapping identity.
 
 ### Hash Collection Identity
 
-Each export hash collection name must clearly contain the output IB hash and `match_index_count`. The recommended names are:
+Each export region collection name must clearly contain the output IB hash, `match_index_count`,
+and `first_index`. The recommended name is:
 
 ```text
-<ib_hash>-<match_index_count>
-<ib_hash>-<match_index_count>-<chunk_index>
+<ib_hash>-<match_index_count>-<first_index>
 ```
 
 Examples:
 
 ```text
-2e5d9294-23220
 2e5d9294-23220-0
-2e5d9294-23220-1
 ```
 
-`match_index_count` is intentionally visible in the collection name so the exported draw identity is clear in Blender. The scanner still verifies it against the current FrameAnalysis.
+`match_index_count` is intentionally visible in the collection name so the exported draw identity
+is clear in Blender. The scanner still verifies it against the current FrameAnalysis and the
+latest capture manifest. Part collections are named `part00`, `part01`, etc. If an IB region uses
+direct mesh objects, they are treated as one implicit `part00`. If a region mixes direct mesh
+objects and explicit part collections, Prepare Export should either migrate direct meshes into
+`part00` or stop with a clear diagnostic; the preferred UI behavior is automatic migration because
+it preserves the user's visible result.
 
 ### Bone Localization
 
-Before export, the addon may clean empty vertex groups. Then it builds the final chunk palette from the vertex groups already present on objects inside each hash collection.
+Before export, the addon may clean empty vertex groups. Then it builds the final part palette from
+the numeric vertex groups actually used by visible objects inside each part.
 
 The export-time assumption follows `mod_importer`:
 
@@ -612,21 +629,63 @@ The export-time assumption follows `mod_importer`:
 Blender vertex groups use global bone-number semantics before localization.
 ```
 
-Export localizes per hash collection/chunk:
+Export localizes per part:
 
 ```text
-global bone -> chunk local bone
+global bone -> part local bone
 ```
 
-The exported `Blend.buf` uses compact chunk local bone indices starting at zero. `PaletteTable.buf` maps those chunk local indices back to global capture-store bone indices.
+The exported blend/index buffer uses compact part-local bone indices starting at zero. The part
+palette file maps those local indices back to canonical global capture-store bone indices. Vertex
+group names are sorted numerically before palette assignment, so the mapping is stable and easy to
+review:
+
+```text
+visible vertex groups in part: 0, 4, 9, 31
+Blend indices written:         0, 1, 2, 3
+Palette file written:          0, 4, 9, 31
+```
 
 Hard limit:
 
 ```text
-chunk local bone count <= 256
+part local bone count <= 256
 ```
 
-This limit applies per hash collection/chunk after recursive object gathering and bone localization.
+This limit applies after recursive visible-object gathering and bone localization. If a region's
+implicit part exceeds 256 bones, Prepare Export should auto-split into multiple parts:
+
+```text
+1. Try object-level splitting first, preserving whole objects when possible.
+2. If one object exceeds 256 used bones, split that object by triangles and duplicate vertices as needed.
+3. Every generated part receives its own palette and draw call.
+```
+
+The splitter must optimize for correctness before minimal part count. A stiff or slightly less
+optimal split is acceptable; a part that writes a local index over 255 is not.
+
+### Part Buffer Output
+
+Every exported part writes a complete set of resources based on the region's `vertex_layout_key`:
+
+```text
+<region>_partNN-Position.buf
+<region>_partNN-Texcoord.buf
+<region>_partNN-Blend.buf
+<region>_partNN-Index.buf
+<region>_partNN-LocalToGlobalBoneMap.buf
+```
+
+The IB format is always:
+
+```text
+DXGI_FORMAT_R32_UINT
+```
+
+This avoids vertex-count limits and simplifies object/triangle splitting. The VB writers must use
+the actual `vertex_layout_table` fields for the target region. The region collection decides the
+export layout; individual mesh object metadata is not allowed to override or veto that layout. Do
+not use one fixed layout template for all IBs.
 
 ### Import Into Root
 
@@ -680,7 +739,7 @@ Build Global Bone Pool creates:
 ```text
 used source local bone -> compact global bone
 capture records sorted by capture availability, then match_index_count descending
-CaptureMeta / global pool manifest entries
+MainCaptureRecords / global pool manifest entries
 the single export root collection, if missing
 empty export child collections for accepted candidates, with unavailable markers for no-shadow mappings
 ```
@@ -746,7 +805,7 @@ Final Blender contract before Prepare Export:
 Object name hash: used for auto-placement only.
 Child collection: authoritative export identity.
 Visible vertex-group numbers: canonical global bone indices.
-Prepare Export: localizes build copies into chunk-local indices and writes PaletteTable.
+Prepare Export: localizes evaluated mesh data into part-local indices, writes per-part LocalToGlobalBoneMap files, and materializes the runtime capture/gather resources.
 ```
 
 ### Import/Export/INI Rules
@@ -759,11 +818,17 @@ Notable inherited rules:
 Analyze picks the resolved draw/model using mod_importer discovery logic.
 Import should prefer the output/display path with the strongest o-slot evidence where that is the mod_importer rule.
 Texture marking should reuse mod_importer candidate and material semantics.
-Export should use mod_importer collection properties and buffer writers.
+Export should reuse mod_importer evaluated-mesh, shape-key, texture, and collection-tree ideas.
 INI generation should reuse mod_importer fast-path syntax where possible.
 ```
 
-BoneMerge adds only the global bone capture/replay tables and the delayed shadow replay scheduling on top of the shared import/export base.
+BoneMerge differs from mod_importer in the final VB/IB writer. BoneMerge must write the true
+FrameAnalysis vertex layout for each IB region, including packed normals and non-UV TEXCOORD
+fields. It should reuse mod_importer algorithms where they match, but not force BoneMerge meshes
+into mod_importer's fixed runtime buffer layout.
+
+BoneMerge adds the global bone capture/replay tables, per-part canonical palettes, LOD scatter
+capture, and delayed shadow replay scheduling on top of the shared workflow.
 
 Texture overrides are the exception to direct INI reuse: candidate detection and texture conversion can reuse `mod_importer`, but replacement output uses `TextureOverride hash = <texture_hash>; this = Resource...` rather than slot-style `ps-t` assignment.
 
@@ -1033,7 +1098,7 @@ This preserves the runtime bone-store semantics and avoids event-order drift whe
 
 `bone_capture_available` and `lod_match_excluded` are separate concepts. A dynamic/pre-skinned `vb0` candidate can still be `bone_capture_available=true` for main runtime capture while `lod_match_excluded=true` prevents the LOD matcher from using its positions or requiring the LOD scatter pass to fill its global slots.
 
-The global bone index and capture-store index have the same meaning in HLSL. Exported chunk palettes must reference these indices exactly. Runtime capture for sparse native palettes must use the same `used_local_bone_indices` table so local source bone `248` can be written to compact global slot `base + compact_index`, not blindly to `base + 248`.
+The global bone index and capture-store index have the same meaning in HLSL. Exported part palettes must reference these indices exactly. Runtime capture for sparse native palettes must use the same `used_local_bone_indices` table so local source bone `248` can be written to compact global slot `base + compact_index`, not blindly to `base + 248`.
 
 #### lod_frameanalysis
 
@@ -1095,7 +1160,7 @@ The global bone index and capture-store index have the same meaning in HLSL. Exp
 }
 ```
 
-The inline `pairs` array is for diagnostics and project portability. The generated runtime should materialize it into compact static buffers such as `LodCaptureMeta.buf` and `LodCapturePairs.buf`.
+The inline `pairs` array is for diagnostics and project portability. The generated runtime should materialize it into compact static buffers such as `LodCaptureRecords.buf` and `LodCaptureScatterPairs.buf`.
 
 #### lod_mapping
 
@@ -1267,9 +1332,9 @@ stride/slot/layout are per candidate import draw
 +8/+16 BLENDINDICES0 R8G8B8A8_UINT or R32G32B32A32_UINT
 ```
 
-`BLENDINDICES0` are source-local palette indices. They are not global bone indices. Import must decode them using the current candidate's `skin_format`, never a project-wide default. Import should keep them as local vertex groups until Apply Global Bone Pool renames or maps them. Export localizes the final chunk again and writes compact local indices, while `PaletteTable.buf` maps those final local indices back to global capture-store indices.
+`BLENDINDICES0` are source-local palette indices. They are not global bone indices. Import must decode them using the current candidate's `skin_format`, never a project-wide default. Import should keep them as local vertex groups until Apply Global Bone Pool renames or maps them. Export localizes each final part again and writes compact local indices. The per-part `LocalToGlobalBoneMap.buf` records local index -> canonical global bone.
 
-The source `IB` can be `DXGI_FORMAT_R16_UINT`, even if older exported mods wrote `DXGI_FORMAT_R32_UINT`. Import should record the native index format from FrameAnalysis. Export may choose a wider format only when the generated index data requires it or when reusing an inherited mod_importer rule.
+The source `IB` can be `DXGI_FORMAT_R16_UINT`, even if older exported mods wrote `DXGI_FORMAT_R32_UINT`. Import should record the native index format from FrameAnalysis for diagnostics, but BoneMerge export always writes `DXGI_FORMAT_R32_UINT`. This avoids vertex-count limits and keeps automatic part splitting simple.
 
 #### Multi-Pass Layout Evidence
 
@@ -1312,13 +1377,80 @@ Use the evaluated mesh from Blender/mod_importer-compatible export rules.
 Apply visible modifiers and current shape-key results the same way mod_importer does.
 Export positions from the evaluated mesh.
 Export UV0 from the primary UV layer.
-Export UV1 from the second UV layer; if absent, copy UV0.
+Export UV1 from the second UV layer only when the target layout truly contains TEXCOORD1.
 Export normals from Blender custom split normals, then octahedral-encode them for NORMAL0.
 Keep packed non-UV auxiliary fields such as TEXCOORD4 as custom/raw attributes.
-If a required raw auxiliary attribute is missing on an edited mesh, use the mod_importer-compatible fallback or stop with a diagnostic instead of writing garbage.
+If a required UV/raw auxiliary attribute is missing on an edited mesh, use an explicitly documented profile fallback or stop with a diagnostic instead of writing garbage.
 ```
 
 Shape key and morph handling should be reused from `E:/vscode/mod_importer` wherever possible. BoneMerge should not invent a separate shape-key interpretation. The user-facing rule remains: the mesh visible in Blender is the mesh that is written.
+
+Export is the inverse of import:
+
+```text
+Blender-space position -> game-space POSITION0
+Blender custom split normal -> game-space normal -> packed NORMAL0
+Blender UV layers -> TEXCOORD0/TEXCOORD1 only when the target layout contains those fields
+raw/custom packed auxiliary attributes -> TEXCOORD2/4/5/6 fields exactly as the target layout expects
+global numeric vertex groups -> part-local BLENDINDICES0 via the part palette
+normalized visible weights -> BLENDWEIGHTS0 in the target field format
+Blender triangle winding -> game winding inverse of the import transform
+```
+
+The exporter must build the final vertex stream from evaluated loop data, not only Blender vertex
+data. A new exported vertex is needed whenever any field that is written to the target layout
+differs:
+
+```text
+position
+normal
+UV0/UV1
+raw packed auxiliary values
+top-four normalized weight/index tuple
+```
+
+This protects hard normals, UV seams, material seams, and triangle-level part splits. If the object
+was imported with X mirror conversion, export applies the inverse mirror conversion before packing.
+The per-object mirror setting must be taken from object metadata first, then the scene default; do
+not guess from mesh coordinates.
+
+### Export Buffer Writer Contract
+
+Each region uses the actual `vertex_layout_table[region_key]` as the writer contract. For every
+part, create a zero-filled bytearray of `vertex_count * stride` for each required VB slot, then
+`pack_into` each field using the field's exact offset, format, and component width.
+
+Required behavior:
+
+```text
+POSITION0 R32G32B32_FLOAT:
+  write evaluated game-space position.
+
+NORMAL0 R32_FLOAT:
+  encode Blender custom split normal with the BoneMerge/game octahedral codec.
+
+NORMAL0 R32G32B32_FLOAT:
+  write normalized game-space float normal.
+
+TEXCOORD0 R32G32_FLOAT:
+  write primary UV layer.
+
+TEXCOORD1 R32G32_FLOAT:
+  write the second UV layer when present. If the target layout requires TEXCOORD1 and it is missing,
+  stop export unless that layout profile explicitly permits a UV0-copy fallback.
+
+TEXCOORD2/4/5/6 packed or float fields:
+  write preserved custom/raw attributes. If missing, stop export unless a documented profile fallback exists.
+
+BLENDWEIGHTS0:
+  write top-four visible weights, normalized and encoded to the target format.
+
+BLENDINDICES0:
+  write part-local palette indices encoded to the target format. R8 indices require local index <= 255.
+```
+
+All non-UV TEXCOORD fields are data fields, not Blender UV maps. Their raw bytes must survive an
+untouched import/export round trip.
 
 ### Build Global Bone Pool
 
@@ -1333,7 +1465,7 @@ local_bone_count > 0
 
 Candidates with `shadow_capture_ready == true` are capture sources and must be placed first. Candidates without early-shadow capture are still allowed into the mapping pool after all capture-ready candidates. Their child export collections are created with a visible unavailable marker, because their own bones cannot be collected; they can still host delayed/material replay for meshes that use already-captured global bones.
 
-Accepted candidates are sorted by capture availability, then descending `match_index_count`, with larger source chunks occupying earlier global-bone positions and earlier vertex-group naming ranges. Ties use compact local bone count, mesh fingerprint, first index, and hash only as deterministic tie-breakers.
+Accepted candidates are sorted by capture availability, then descending `match_index_count`, with larger source parts occupying earlier global-bone positions and earlier vertex-group naming ranges. Ties use compact local bone count, mesh fingerprint, first index, and hash only as deterministic tie-breakers.
 
 The pool is compact:
 
@@ -1344,7 +1476,7 @@ compact_index = index of source_local_bone in used_local_bone_indices
 
 This means imported raw vertex groups may be sparse and overlapping across IBs, but after Apply Global Bone Pool global-renames them they become compact and globally unique for the selected source identity. Runtime capture must therefore use the same sparse-source table; a continuous copy of `0..source_local_bone_count` is no longer semantically correct for compact pools.
 
-It also creates the single export root collection if it does not exist. After this step, users edit models and place final meshes under hash collections inside the export root.
+It also creates the single export root collection if it does not exist. After this step, users edit models and place final meshes under IB region collections inside the export root.
 
 ## LOD Mapping And Runtime
 
@@ -1364,8 +1496,30 @@ candidate IB list
 imported source models
 canonical global pool built from enabled candidates, with capture-ready records first
 canonical global bone indices
-final export chunks and PaletteTable semantics
+final export region parts and LocalToGlobalBoneMap semantics
 ```
+
+LOD does not change exported VB/IB resources. Exported region parts, their R32 IBs, and their
+part-local palettes are canonical high-detail replacement resources. Main and LOD runtime paths
+only differ in how they fill the canonical global bone pool before replay:
+
+```text
+main path:
+  native main local bone -> canonical global bone
+
+LOD path:
+  native LOD local bone -> one or more canonical global bones
+```
+
+Therefore a part palette always maps:
+
+```text
+part local bone -> canonical global bone
+```
+
+It never maps to an LOD-local bone. When LOD is active, LOD scatter capture must fill every
+canonical global bone used by visible exported parts, or export/generation must report the missing
+global bones.
 
 LOD FrameAnalysis folders are optional secondary sources. They are analyzed only after Build Global Bone Pool, because LOD mapping needs the canonical global bone indices created from the user-confirmed Candidate IB list.
 
@@ -1566,16 +1720,16 @@ LOD capture uses scatter writes into the canonical global bone pool. It must wri
 Suggested runtime resources:
 
 ```text
-Buffer/LodCaptureMeta.buf
-uint4 LodCaptureMeta[N]
+Buffer/LodCaptureRecords.buf
+uint4 LodCaptureRecords[N]
 
 x = pair_base
 y = pair_count
 z = lod_local_bone_count
 w = flags/reserved
 
-Buffer/LodCapturePairs.buf
-uint2 LodCapturePairs[K]
+Buffer/LodCaptureScatterPairs.buf
+uint2 LodCaptureScatterPairs[K]
 
 x = lod_local_bone
 y = canonical_global_bone
@@ -1590,7 +1744,7 @@ main local bone -> canonical global bone
 LOD capture uses scatter:
 
 ```text
-for pair in LodCapturePairs[pair_base : pair_base + pair_count]:
+for pair in LodCaptureScatterPairs[pair_base : pair_base + pair_count]:
     global_current[pair.canonical_global_bone] =
         native_lod_t0_current[pair.lod_local_bone]
 
@@ -1601,10 +1755,22 @@ for pair in LodCapturePairs[pair_base : pair_base + pair_count]:
 The draw/consume path stays unchanged:
 
 ```text
-chunk local bone -> PaletteTable -> canonical global bone -> local fake vs-t0
+part local bone -> LocalToGlobalBoneMap -> canonical global bone -> local fake vs-t0
 ```
 
 This is the key LOD contract: final replacement geometry still uses the high-detail canonical global bone semantics. LOD only changes which native source matrices fill those global slots before drawing.
+
+Generated replay with LOD still draws the same exported region parts:
+
+```text
+Gather part00 palette -> bind local fake vs-t0 -> draw part00
+Gather part01 palette -> bind local fake vs-t0 -> draw part01
+...
+```
+
+The gather step is identical for main and LOD because both paths have already populated the same
+canonical global store. The only LOD-specific buffers are the scatter capture metadata/pairs used
+before replay.
 
 ### LOD TextureOverrides And INI Output
 
@@ -1617,8 +1783,8 @@ TextureOverride LOD capture:
   hash = lod_ib_hash
   match_index_count = lod_match_index_count
   if vs == expected_lod_capture_vs:
-      bind LodCaptureMeta one-record view
-      bind LodCapturePairs
+      bind LodCaptureRecords
+      bind LodCaptureScatterPairs
       bind native vs-t0
       dispatch RecordBonesScatter
 ```
@@ -1632,7 +1798,7 @@ TextureOverride LOD consume/replay:
   if this LOD source has exported replacement geometry:
       skip original LOD draw where appropriate
       gather canonical global bones into the local fake vs-t0
-      draw the high-detail replacement chunks that target this LOD stage
+      draw the high-detail replacement parts that target this LOD stage
 ```
 
 Unmodified LOD source IBs are left on the game's original path. Modified/exported LOD source IBs follow the same delayed shadow replay rule as main parts:
@@ -1641,15 +1807,15 @@ Unmodified LOD source IBs are left on the game's original path. Modified/exporte
 1. Capture all required LOD native palettes into the canonical global pool.
 2. Skip only original LOD shadow draws whose source IBs are replaced.
 3. Leave unmodified LOD shadow draws untouched.
-4. At the final compatible LOD shadow host, replay all delayed modified replacement chunks.
+4. At the final compatible LOD shadow host, replay all delayed modified replacement parts.
 5. Draw transparent shadow batches first, then bind white shadow PS resources and draw normal shadow batches.
 ```
 
-The replay host and resource bindings are LOD-stage-specific, but the replacement chunk resources, chunk local palettes, and `PaletteTable` still use canonical high-detail global bone semantics.
+The replay host and resource bindings are LOD-stage-specific, but the replacement part resources and part-local `LocalToGlobalBoneMap` files still use canonical high-detail global bone semantics.
 
 ## Replay Scheduling
 
-The core replay goal is that any exported chunk can use bones captured from any source IB. A modified IB may reference bones from draws that occur later than its original shadow draw. Drawing that modified IB at its original shadow position can therefore read incomplete bone data.
+The core replay goal is that any exported part can use bones captured from any source IB. A modified IB may reference bones from draws that occur later than its original shadow draw. Drawing that modified IB at its original shadow position can therefore read incomplete bone data.
 
 To avoid this, modified shadow drawing is delayed:
 
@@ -1657,17 +1823,17 @@ To avoid this, modified shadow drawing is delayed:
 1. Early/source encounters capture native bone palettes.
 2. Original shadow draws for modified/exported IBs are skipped at their original positions.
 3. Unmodified game IBs are left alone and keep their original shadow drawing.
-4. At the final compatible shadow host, all delayed modified shadow chunks are replayed after the global bone store is complete.
+4. At the final compatible shadow host, all delayed modified shadow parts are replayed after the global bone store is complete.
 ```
 
-The replay host is not limited to drawing only its own IB. It is a late scheduling point that can draw replacement chunks from multiple source IBs, because those chunks now gather from the completed global bone store.
+The replay host is not limited to drawing only its own IB. It is a late scheduling point that can draw replacement parts from multiple source IBs, because those parts now gather from the completed global bone store.
 
 Replay host selection:
 
 ```text
 host_draw_index > max(required_capture_draw_index)
 host is the last matching draw in the compatible render-state group
-host pass has render/depth/blend/texture state that replacement chunks can inherit
+host pass has render/depth/blend/texture state that replacement parts can inherit
 ```
 
 The last matching draw is preferred because the global bone store is complete by then and the current render state is compatible with the final replacement drawing path.
@@ -1688,23 +1854,23 @@ The "last" host is calculated from the target character's early shadow stage, no
 In the observed pattern, the earlier VS in the pair is the normal/opaque shadow path and the later VS is the transparent shadow path. When the last host is the later transparent VS draw, replay uses that state as the scheduling point:
 
 ```text
-1. replay transparent shadow chunks first, without binding white PS resources
+1. replay transparent shadow parts first, without binding white PS resources
 2. bind the white shadow PS resource once
-3. replay normal/opaque shadow chunks
+3. replay normal/opaque shadow parts
 ```
 
-Normal/opaque chunks need the white PS resource because they are being delayed from the earlier normal shadow draw into the later transparent host. Transparent chunks inherit the transparent shadow state and do not bind white.
+Normal/opaque parts need the white PS resource because they are being delayed from the earlier normal shadow draw into the later transparent host. Transparent parts inherit the transparent shadow state and do not bind white.
 
-The host can be any compatible late draw in the cluster. It does not have to be the same IB as every replayed chunk. If the host IB itself is exported and skipped, the override still acts as the scheduling carrier; if the host IB is unmodified, its original draw should remain and the replay draws are appended by the generated override logic.
+The host can be any compatible late draw in the cluster. It does not have to be the same IB as every replayed part. If the host IB itself is exported and skipped, the override still acts as the scheduling carrier; if the host IB is unmodified, its original draw should remain and the replay draws are appended by the generated override logic.
 
-When a replay host draws multiple chunks with one reusable local bone buffer, each chunk must gather and draw immediately:
+When a replay host draws multiple parts with one reusable local bone buffer, each part must gather and draw immediately:
 
 ```text
-Gather chunk A -> bind local vs-t0 -> draw chunk A
-Gather chunk B -> bind local vs-t0 -> draw chunk B
+Gather part A -> bind local vs-t0 -> draw part A
+Gather part B -> bind local vs-t0 -> draw part B
 ```
 
-Do not gather several chunks first and draw later, because the local buffer is overwritten by each gather call.
+Do not gather several parts first and draw later, because the local buffer is overwritten by each gather call.
 
 ### Shadow And Transparent Replay
 
@@ -1754,13 +1920,19 @@ Replay host:
   verify that the chosen last shadow-stage host occurs after every required capture draw and inherits compatible state.
 
 Vertex group export:
-  prune empty groups, remap groups from zero, enforce <= 256 local groups per exported collection/chunk, and write PaletteTable from local group to canonical global bone.
+  prune empty groups, sort numeric global groups, localize per part from zero, enforce <= 256 local groups per part, and auto-split oversized regions before writing part palettes.
 
 Raw auxiliary attributes:
   preserve required packed fields such as TEXCOORD4, or stop export with a clear diagnostic when an edited mesh lacks them.
 
+R32 index buffers:
+  export all replacement IBs as DXGI_FORMAT_R32_UINT and verify generated drawindexed ranges.
+
+WYSIWYG loop export:
+  export evaluated loop data so custom normals, UV seams, and split triangles survive.
+
 LOD:
-  keep optional until the main path is stable; same-hash LOD/main cases require structural validation and a runtime discriminator.
+  keep optional for the UI, but generation must check exported global bones against LOD coverage when LOD mappings are present.
 ```
 
 ### First Implementation Slice
@@ -1776,17 +1948,27 @@ Build the plugin as a vertical slice instead of trying to finish every feature a
 4. Global Pool UI list:
    add selected objects, build source-local to canonical-global mapping, rename groups.
 5. Export root contract:
-   one root collection, hash subcollections, WYSIWYG evaluated mesh export, <= 256 local bones.
-6. Static runtime buffers:
-   CaptureMeta, PaletteMeta, PaletteTable, global/local current and previous matrix stores.
-7. INI generation:
+   one root collection, IB region subcollections, optional part subcollections, WYSIWYG evaluated loop export.
+6. Export buffer package:
+   R32 IB, true-layout VB writers, per-part palette files, debug export manifest, auto-split for >256 local bones.
+7. Static runtime buffers:
+   MainCaptureRecords, MainCaptureSourceLocalBones, LocalToGlobalBoneMap, LOD scatter tables, global/local current and previous matrix stores.
+8. INI generation:
    capture overrides, gather/replay overrides, texture hash overrides, delayed shadow replay plan.
-8. LOD analysis and scatter capture:
+9. LOD analysis and scatter capture:
    add after the main non-LOD loop can import, export, and replay correctly.
 ```
 
 The first usable milestone should be:
 
 ```text
-Analyze Main -> Import Selected -> Build Global Pool -> Export one edited hash collection -> generated INI renders without deformation.
+Analyze Main -> Import Selected -> Build Global Pool -> Export one edited IB region collection -> generated INI renders without deformation.
+```
+
+The first export-only milestone should come before INI generation:
+
+```text
+Import one untouched source IB -> place it in its matching region collection -> Export Buffers
+-> compare debug manifest against vertex_layout_table
+-> verify R32 IB, VB strides, field offsets, packed normals, raw TEXCOORD fields, and part palette.
 ```

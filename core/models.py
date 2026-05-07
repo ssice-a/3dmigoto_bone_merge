@@ -104,6 +104,7 @@ class LocalPaletteRecord:
     file_path: str
     resource_suffix: str
     variant_id: str = ""
+    match_first_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -170,4 +171,3 @@ class CapturePlan:
     part_records: tuple[PartRecord, ...]
     shadow_host: ShadowHostRecord | None
     warnings: tuple[str, ...] = field(default_factory=tuple)
-

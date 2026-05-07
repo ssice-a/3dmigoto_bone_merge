@@ -24,6 +24,12 @@ def _preset_choice_update(self, _context):
     return
 
 
+EXPORT_MODE_ITEMS = (
+    ("BUFFER_ONLY", "Buffer Only", "Export all runtime buffer files and export_manifest.json without regenerating BoneStore.ini"),
+    ("BUFFER_AND_INI", "Buffer + INI", "Export buffer files, HLSL assets, export_manifest.json, and BoneStore.ini"),
+)
+
+
 class BMC_TargetItem(bpy.types.PropertyGroup):
     object_name: bpy.props.StringProperty(name="Object", default="")
     object_ref: bpy.props.PointerProperty(name="Object Ref", type=bpy.types.Object)
@@ -133,7 +139,7 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_ini_path"),
     (bpy.types.Scene, "bmc_target_collection"),
     (bpy.types.Scene, "bmc_export_collection"),
-    (bpy.types.Scene, "bmc_export_build_collection"),
+    (bpy.types.Scene, "bmc_export_mode"),
     (bpy.types.Scene, "bmc_export_manifest_path"),
     (bpy.types.Scene, "bmc_shadow_host_hash"),
     (bpy.types.Scene, "bmc_shadow_host_match_index_count"),
@@ -254,14 +260,15 @@ def register_addon_properties():
         description="Collection containing mesh objects that should participate in Bone Merge Capture scanning.",
     )
     bpy.types.Scene.bmc_export_collection = bpy.props.PointerProperty(
-        name="Export Source Collection",
+        name="Export Root Collection",
         type=bpy.types.Collection,
-        description="Editable source collection containing final draw chunk child collections for export.",
+        description="Single editable root collection containing final IB region and part collections for export.",
     )
-    bpy.types.Scene.bmc_export_build_collection = bpy.props.PointerProperty(
-        name="Export Build Collection",
-        type=bpy.types.Collection,
-        description="Disposable generated collection rebuilt from Export Source Collection during Prepare Export.",
+    bpy.types.Scene.bmc_export_mode = bpy.props.EnumProperty(
+        name="Export Mode",
+        items=EXPORT_MODE_ITEMS,
+        default="BUFFER_ONLY",
+        description="Choose whether this export writes only buffers or also regenerates BoneStore.ini.",
     )
     bpy.types.Scene.bmc_export_manifest_path = bpy.props.StringProperty(
         name="Export Manifest",

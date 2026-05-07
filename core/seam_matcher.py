@@ -87,68 +87,60 @@ def seam_aliases_to_payload(aliases: tuple[SeamAliasRecord, ...] | list[SeamAlia
 
 
 def build_seam_mapping(mesh_objects) -> SeamBuildResult:
+    mesh_objects = _mesh_objects_with_bbox_neighbors(list(mesh_objects), _OBJECT_BBOX_GAP_TOLERANCE)
     caches = {mesh_obj.name: _build_seam_cache(mesh_obj) for mesh_obj in mesh_objects}
     object_names = [mesh_obj.name for mesh_obj in mesh_objects if caches.get(mesh_obj.name)]
+    total_possible_pairs = max(0, len(object_names) * (len(object_names) - 1) // 2)
     candidate_edges: list[dict] = []
-    skipped_pairs = 0
     tested_pairs = 0
 
-    for source_index, source_name in enumerate(object_names):
-        source_cache = caches[source_name]
-        for target_name in object_names[source_index + 1 :]:
-            target_cache = caches[target_name]
-            tested_pairs += 1
-            if not _bounds_overlap_with_gap(
-                source_cache["bounds_min"],
-                source_cache["bounds_max"],
-                target_cache["bounds_min"],
-                target_cache["bounds_max"],
-                _OBJECT_BBOX_GAP_TOLERANCE,
-            ):
-                skipped_pairs += 1
-                continue
+    for source_name, source_cache, target_name, target_cache in _iter_bbox_candidate_pairs(
+        caches,
+        object_names,
+        _OBJECT_BBOX_GAP_TOLERANCE,
+    ):
+        tested_pairs += 1
+        matched_pairs = _build_vertex_pairs(
+            source_cache["seam_vertices"],
+            source_cache["spatial_hash"],
+            target_cache["seam_vertices"],
+            target_cache["spatial_hash"],
+            _MATCH_TOLERANCE,
+        )
+        if len(matched_pairs) < _MIN_VERTEX_PAIRS:
+            continue
 
-            matched_pairs = _build_vertex_pairs(
-                source_cache["seam_vertices"],
-                source_cache["spatial_hash"],
-                target_cache["seam_vertices"],
-                target_cache["spatial_hash"],
-                _MATCH_TOLERANCE,
-            )
-            if len(matched_pairs) < _MIN_VERTEX_PAIRS:
+        candidates = _build_mapping_candidates_from_seams(
+            source_cache["weight_items_by_vertex"],
+            target_cache["weight_items_by_vertex"],
+            matched_pairs,
+            _WEIGHT_TOLERANCE,
+        )
+        for candidate in candidates:
+            source_group = int(candidate["group_a"])
+            target_group = int(candidate["group_b"])
+            if source_group == target_group:
                 continue
-
-            candidates = _build_mapping_candidates_from_seams(
-                source_cache["weight_items_by_vertex"],
-                target_cache["weight_items_by_vertex"],
-                matched_pairs,
-                _WEIGHT_TOLERANCE,
+            candidate_edges.append(
+                {
+                    "source_name": source_name,
+                    "source_group": source_group,
+                    "target_name": target_name,
+                    "target_group": target_group,
+                    "votes": int(candidate["votes"]),
+                    "score": float(candidate["score"]),
+                    "average_distance": float(candidate["average_distance"]),
+                    "average_weight_difference": float(candidate["average_weight_difference"]),
+                }
             )
-            for candidate in candidates:
-                source_group = int(candidate["group_a"])
-                target_group = int(candidate["group_b"])
-                if source_group == target_group:
-                    continue
-                candidate_edges.append(
-                    {
-                        "source_name": source_name,
-                        "source_group": source_group,
-                        "target_name": target_name,
-                        "target_group": target_group,
-                        "votes": int(candidate["votes"]),
-                        "score": float(candidate["score"]),
-                        "average_distance": float(candidate["average_distance"]),
-                        "average_weight_difference": float(candidate["average_weight_difference"]),
-                    }
-                )
 
     aliases = _build_aliases_from_edges(candidate_edges)
     summaries = _build_pair_summaries(aliases)
     return SeamBuildResult(
         aliases=tuple(aliases),
         pair_summaries=tuple(summaries),
-        matched_pairs=tested_pairs - skipped_pairs,
-        skipped_pairs=skipped_pairs,
+        matched_pairs=tested_pairs,
+        skipped_pairs=total_possible_pairs - tested_pairs,
     )
 
 
@@ -495,6 +487,81 @@ def _build_spatial_hash(vertices, tolerance):
     return spatial_hash
 
 
+def _mesh_objects_with_bbox_neighbors(mesh_objects: list, max_gap: float) -> list:
+    if len(mesh_objects) < 2:
+        return mesh_objects
+    object_bounds = []
+    for mesh_obj in mesh_objects:
+        bounds = _object_bounds_world(mesh_obj)
+        if bounds is None:
+            continue
+        object_bounds.append((mesh_obj, bounds[0], bounds[1]))
+    if len(object_bounds) < 2:
+        return []
+
+    sorted_bounds = sorted(object_bounds, key=lambda item: (item[1][0], item[2][0], item[0].name))
+    neighbor_names: set[str] = set()
+    for source_index, (source_obj, source_min, source_max) in enumerate(sorted_bounds):
+        source_max_x = float(source_max[0]) + float(max_gap)
+        for target_index in range(source_index + 1, len(sorted_bounds)):
+            target_obj, target_min, target_max = sorted_bounds[target_index]
+            if float(target_min[0]) > source_max_x:
+                break
+            if not _bounds_overlap_with_gap(source_min, source_max, target_min, target_max, max_gap):
+                continue
+            neighbor_names.add(source_obj.name)
+            neighbor_names.add(target_obj.name)
+    return [mesh_obj for mesh_obj in mesh_objects if mesh_obj.name in neighbor_names]
+
+
+def _object_bounds_world(mesh_obj):
+    raw_points = getattr(mesh_obj, "bound_box", None)
+    if raw_points:
+        points = [_world_coord_tuple(_transform_point(mesh_obj.matrix_world, point)) for point in raw_points]
+    else:
+        vertices = getattr(getattr(mesh_obj, "data", None), "vertices", None)
+        if not vertices:
+            return None
+        points = [_world_coord_tuple(_transform_point(mesh_obj.matrix_world, vertex.co)) for vertex in vertices]
+    if not points:
+        return None
+    return _points_bounds_min(points), _points_bounds_max(points)
+
+
+def _transform_point(matrix, point):
+    try:
+        return matrix @ point
+    except TypeError:
+        try:
+            from mathutils import Vector
+
+            return matrix @ Vector(point)
+        except Exception:
+            return point
+
+
+def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: float):
+    sorted_items = sorted(
+        ((name, caches[name]) for name in object_names),
+        key=lambda item: (item[1]["bounds_min"][0], item[1]["bounds_max"][0], item[0]),
+    )
+    for source_index, (source_name, source_cache) in enumerate(sorted_items):
+        source_max_x = float(source_cache["bounds_max"][0]) + float(max_gap)
+        for target_index in range(source_index + 1, len(sorted_items)):
+            target_name, target_cache = sorted_items[target_index]
+            if float(target_cache["bounds_min"][0]) > source_max_x:
+                break
+            if not _bounds_overlap_with_gap(
+                source_cache["bounds_min"],
+                source_cache["bounds_max"],
+                target_cache["bounds_min"],
+                target_cache["bounds_max"],
+                max_gap,
+            ):
+                continue
+            yield source_name, source_cache, target_name, target_cache
+
+
 def _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance):
     tolerance_squared = tolerance * tolerance
     nearest_by_source = {}
@@ -553,6 +620,30 @@ def _bounds_max(vertices):
         max_x = max(max_x, float(world_co[0]))
         max_y = max(max_y, float(world_co[1]))
         max_z = max(max_z, float(world_co[2]))
+    return max_x, max_y, max_z
+
+
+def _points_bounds_min(points):
+    first = points[0]
+    min_x = float(first[0])
+    min_y = float(first[1])
+    min_z = float(first[2])
+    for point in points[1:]:
+        min_x = min(min_x, float(point[0]))
+        min_y = min(min_y, float(point[1]))
+        min_z = min(min_z, float(point[2]))
+    return min_x, min_y, min_z
+
+
+def _points_bounds_max(points):
+    first = points[0]
+    max_x = float(first[0])
+    max_y = float(first[1])
+    max_z = float(first[2])
+    for point in points[1:]:
+        max_x = max(max_x, float(point[0]))
+        max_y = max(max_y, float(point[1]))
+        max_z = max(max_z, float(point[2]))
     return max_x, max_y, max_z
 
 

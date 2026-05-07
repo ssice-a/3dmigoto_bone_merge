@@ -41,6 +41,11 @@ class PointGeometry:
     blend_weights: list[tuple[float, float, float, float]]
 
 
+_POINT_GEOMETRY_CACHE: dict[tuple, PointGeometry] = {}
+_FRAMEANALYSIS_MANIFEST_CACHE: dict[tuple, dict] = {}
+_POINT_CLOUD_CACHE: dict[tuple, tuple] = {}
+
+
 def analyze_lod_for_manifest(
     canonical_manifest: dict,
     lod_frameanalysis_dir: str,
@@ -55,7 +60,7 @@ def analyze_lod_for_manifest(
     if not canonical_manifest.get("bone_pool_order"):
         raise ValueError("Build Global Bone Pool before Analyze LOD")
 
-    lod_manifest = analyze_main_frameanalysis(normalized_lod_dir)
+    lod_manifest = _analyze_main_frameanalysis_cached(normalized_lod_dir)
     main_points, canonical_global_count, main_records = _build_canonical_point_cloud(canonical_manifest)
     lod_points, lod_records = _build_lod_point_cloud(lod_manifest)
     if not main_points:
@@ -231,6 +236,19 @@ def build_lod_scatter_mapping(
     }
 
 
+def _analyze_main_frameanalysis_cached(frameanalysis_dir: str) -> dict:
+    normalized_dir = os.path.abspath(frameanalysis_dir)
+    log_path = os.path.join(normalized_dir, "log.txt")
+    cache_key = (normalized_dir, _file_fingerprint(log_path))
+    cached = _FRAMEANALYSIS_MANIFEST_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    manifest = analyze_main_frameanalysis(normalized_dir)
+    _FRAMEANALYSIS_MANIFEST_CACHE.clear()
+    _FRAMEANALYSIS_MANIFEST_CACHE[cache_key] = manifest
+    return manifest
+
+
 def review_lod_global_pool_coverage(canonical_manifest: dict, lod_capture_records: list[dict]) -> dict:
     ignored_global_bones = _lod_match_excluded_global_bones(canonical_manifest)
     filled_globals = {
@@ -402,6 +420,10 @@ def _aggregate_points_by_cell(points: list[WeightedPoint], cell_size: float) -> 
 
 
 def _build_canonical_point_cloud(canonical_manifest: dict) -> tuple[list[WeightedPoint], int, list[dict]]:
+    cache_key = _canonical_point_cloud_cache_key(canonical_manifest)
+    cached = _POINT_CLOUD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     frameanalysis_dir = str(canonical_manifest.get("frameanalysis_dir", "") or "")
     candidates_by_key = {
         _source_key_from_candidate(candidate): candidate
@@ -434,10 +456,16 @@ def _build_canonical_point_cloud(canonical_manifest: dict) -> tuple[list[Weighte
                 "local_bone_count": local_count,
             }
         )
-    return points, canonical_global_count, main_records
+    result = (points, canonical_global_count, main_records)
+    _POINT_CLOUD_CACHE[cache_key] = result
+    return result
 
 
 def _build_lod_point_cloud(lod_manifest: dict) -> tuple[list[WeightedPoint], dict[str, dict]]:
+    cache_key = _lod_point_cloud_cache_key(lod_manifest)
+    cached = _POINT_CLOUD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     frameanalysis_dir = str(lod_manifest.get("frameanalysis_dir", "") or "")
     points: list[WeightedPoint] = []
     lod_records: dict[str, dict] = {}
@@ -454,7 +482,91 @@ def _build_lod_point_cloud(lod_manifest: dict) -> tuple[list[WeightedPoint], dic
         geometry = _load_candidate_point_geometry(candidate, frameanalysis_dir)
         points.extend(_geometry_points(geometry, _lod_weight_resolver(source_key)))
         lod_records[source_key] = _lod_record_payload(candidate, source_key)
-    return points, lod_records
+    result = (points, lod_records)
+    _POINT_CLOUD_CACHE[cache_key] = result
+    return result
+
+
+def _canonical_point_cloud_cache_key(canonical_manifest: dict) -> tuple:
+    frameanalysis_dir = str(canonical_manifest.get("frameanalysis_dir", "") or "")
+    candidates_by_key = {
+        _source_key_from_candidate(candidate): candidate
+        for candidate in canonical_manifest.get("candidate_ibs", []) or []
+    }
+    remaps_by_key = _object_remaps_by_key(canonical_manifest)
+    records = []
+    for record in canonical_manifest.get("bone_pool_order", []) or []:
+        source_key = _source_key_from_candidate(record)
+        candidate = candidates_by_key.get(source_key)
+        remap = remaps_by_key.get(source_key) or _object_remap_from_pool_record(record)
+        local_to_global = tuple(
+            sorted(
+                (int(local), int(global_bone))
+                for local, global_bone in dict(remap.get("local_group_to_global_group", {}) or {}).items()
+            )
+        )
+        records.append(
+            (
+                source_key,
+                int(record.get("global_bone_base", record.get("capture_store_base", 0)) or 0),
+                int(record.get("local_bone_count", 0) or 0),
+                bool(_record_lod_match_excluded(record)),
+                local_to_global,
+                _candidate_file_cache_key(candidate, frameanalysis_dir) if candidate is not None else (),
+            )
+        )
+    return (
+        "canonical",
+        frameanalysis_dir,
+        str(canonical_manifest.get("global_pool_generation", "") or ""),
+        tuple(records),
+    )
+
+
+def _lod_point_cloud_cache_key(lod_manifest: dict) -> tuple:
+    frameanalysis_dir = str(lod_manifest.get("frameanalysis_dir", "") or "")
+    records = []
+    for candidate in lod_manifest.get("candidate_ibs", []) or []:
+        if not bool(candidate.get("enabled", True)):
+            continue
+        if not bool(candidate.get("shadow_capture_ready", False)):
+            continue
+        if bool(candidate.get("lod_match_excluded", False)):
+            continue
+        if int(candidate.get("local_bone_count", 0) or 0) <= 0:
+            continue
+        records.append(
+            (
+                _source_key_from_candidate(candidate),
+                int(candidate.get("local_bone_count", 0) or 0),
+                _candidate_file_cache_key(candidate, frameanalysis_dir),
+            )
+        )
+    return ("lod", frameanalysis_dir, tuple(records))
+
+
+def _candidate_file_cache_key(candidate: dict, frameanalysis_dir: str) -> tuple:
+    import_paths = dict(candidate.get("import_paths", {}) or {})
+    vb_payload = dict(import_paths.get("vb", {}) or {})
+    ib_txt_path = _resolve_path(str(import_paths.get("ib", "") or ""), frameanalysis_dir)
+    ib_buf_path = _resolve_path(str(import_paths.get("ib_buf", "") or ""), frameanalysis_dir)
+    skin_slot_name, skin_slot_index = _skin_slot_from_candidate(candidate)
+    skin_format = dict(candidate.get("skin_format", {}) or {})
+    paths = [
+        ib_txt_path,
+        ib_buf_path,
+        *_resolved_payload_paths(dict(vb_payload.get("vb0", {}) or {}), frameanalysis_dir),
+        *_resolved_payload_paths(dict(vb_payload.get(skin_slot_name, {}) or {}), frameanalysis_dir),
+    ]
+    return (
+        str(skin_slot_name),
+        int(skin_slot_index),
+        str(skin_format.get("blend_indices_format", "") or "").upper(),
+        str(skin_format.get("blend_weights_format", "") or "").upper(),
+        int(skin_format.get("blend_indices_offset", -1) or -1),
+        int(skin_format.get("blend_weights_offset", -1) or -1),
+        tuple(_file_fingerprint(path) for path in paths if path),
+    )
 
 
 def _load_candidate_point_geometry(candidate: dict, frameanalysis_dir: str) -> PointGeometry:
@@ -465,6 +577,11 @@ def _load_candidate_point_geometry(candidate: dict, frameanalysis_dir: str) -> P
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no IB txt path")
     if not ib_buf_path or not os.path.exists(ib_buf_path):
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no IB buf path")
+
+    cache_key = _point_geometry_cache_key(candidate, frameanalysis_dir, ib_txt_path, ib_buf_path)
+    cached = _POINT_GEOMETRY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     ib_header = _parse_buffer_header(ib_txt_path)
     indices = _read_index_buffer(ib_buf_path, ib_header)
@@ -480,17 +597,72 @@ def _load_candidate_point_geometry(candidate: dict, frameanalysis_dir: str) -> P
     skin_slot_name, skin_slot_index = _skin_slot_from_candidate(candidate)
     skin_slot = _load_slot_slice(vb_payload, skin_slot_name, skin_slot_index, frameanalysis_dir, warnings)
     if skin_slot is None:
-        return PointGeometry(
+        geometry = PointGeometry(
             positions=positions,
             blend_indices=[(0, 0, 0, 0) for _ in original_vertex_ids],
             blend_weights=[(0.0, 0.0, 0.0, 0.0) for _ in original_vertex_ids],
         )
+        _POINT_GEOMETRY_CACHE[cache_key] = geometry
+        return geometry
     _validate_skin_format(skin_slot, dict(candidate.get("skin_format", {}) or {}), warnings)
-    return PointGeometry(
+    geometry = PointGeometry(
         positions=positions,
         blend_indices=_read_blend_indices(skin_slot, original_vertex_ids),
         blend_weights=_read_blend_weights(skin_slot, original_vertex_ids),
     )
+    _POINT_GEOMETRY_CACHE[cache_key] = geometry
+    return geometry
+
+
+def _point_geometry_cache_key(candidate: dict, frameanalysis_dir: str, ib_txt_path: str, ib_buf_path: str) -> tuple:
+    import_paths = dict(candidate.get("import_paths", {}) or {})
+    vb_payload = dict(import_paths.get("vb", {}) or {})
+    vb0_payload = dict(vb_payload.get("vb0", {}) or {})
+    skin_slot_name, skin_slot_index = _skin_slot_from_candidate(candidate)
+    skin_payload = dict(vb_payload.get(skin_slot_name, {}) or {})
+    skin_format = dict(candidate.get("skin_format", {}) or {})
+    paths = [
+        ib_txt_path,
+        ib_buf_path,
+        *_resolved_payload_paths(vb0_payload, frameanalysis_dir),
+        *_resolved_payload_paths(skin_payload, frameanalysis_dir),
+    ]
+    return (
+        _source_key_from_candidate(candidate),
+        str(skin_slot_name),
+        int(skin_slot_index),
+        str(skin_format.get("blend_indices_format", "") or "").upper(),
+        str(skin_format.get("blend_weights_format", "") or "").upper(),
+        int(skin_format.get("blend_indices_offset", -1) or -1),
+        int(skin_format.get("blend_weights_offset", -1) or -1),
+        tuple(_file_fingerprint(path) for path in paths if path),
+    )
+
+
+def _resolved_payload_paths(payload: dict, frameanalysis_dir: str) -> list[str]:
+    paths = [
+        _resolve_path(str(payload.get("buf", "") or ""), frameanalysis_dir),
+        *(
+            _resolve_path(str(path), frameanalysis_dir)
+            for path in list(payload.get("txt", []) or [])
+            if str(path)
+        ),
+        *(
+            _resolve_path(str(path), frameanalysis_dir)
+            for path in list(payload.get("layout_txt", []) or [])
+            if str(path)
+        ),
+    ]
+    return [path for path in paths if path]
+
+
+def _file_fingerprint(path: str) -> tuple[str, int, int]:
+    normalized = os.path.abspath(path)
+    try:
+        stat = os.stat(normalized)
+    except OSError:
+        return normalized, -1, -1
+    return normalized, int(stat.st_mtime_ns), int(stat.st_size)
 
 
 def _geometry_points(geometry: PointGeometry, resolver) -> list[WeightedPoint]:

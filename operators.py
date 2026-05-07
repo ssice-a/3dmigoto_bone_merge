@@ -1350,15 +1350,27 @@ def _candidate_source_meshes_and_remaps(context, manifest: dict) -> list[tuple[o
     return meshes_and_remaps
 
 
-def _apply_global_names_to_candidate_source_objects(context, manifest: dict) -> tuple[int, int, list[str]]:
-    result = _apply_remap_to_meshes(_candidate_source_meshes_and_remaps(context, manifest), manifest)
+def _apply_global_names_to_candidate_source_objects(
+    context,
+    manifest: dict,
+    meshes_and_remaps: list[tuple[object, dict]] | None = None,
+) -> tuple[int, int, list[str]]:
+    if meshes_and_remaps is None:
+        meshes_and_remaps = _candidate_source_meshes_and_remaps(context, manifest)
+    result = _apply_remap_to_meshes(meshes_and_remaps, manifest)
     if result is None:
         return 0, 0, []
     return int(result.updated_objects), int(result.renamed_groups), list(result.skipped_objects)
 
 
-def _merge_candidate_source_seam_groups(context, manifest: dict):
-    meshes = [mesh_obj for mesh_obj, _remap in _candidate_source_meshes_and_remaps(context, manifest)]
+def _merge_candidate_source_seam_groups(
+    context,
+    manifest: dict,
+    meshes_and_remaps: list[tuple[object, dict]] | None = None,
+):
+    if meshes_and_remaps is None:
+        meshes_and_remaps = _candidate_source_meshes_and_remaps(context, manifest)
+    meshes = [mesh_obj for mesh_obj, _remap in meshes_and_remaps]
     if len(meshes) < 2:
         return None
     return build_and_apply_seam_mapping(meshes)
@@ -2876,12 +2888,14 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
                 self.report({"ERROR"}, "Global bone pool is empty; run Build Global Bone Pool first")
                 return {"CANCELLED"}
             _update_scene_mapping_payload(scene, manifest_path)
+            meshes_and_remaps = _candidate_source_meshes_and_remaps(context, manifest)
             updated_objects, renamed_groups, rename_warnings = _apply_global_names_to_candidate_source_objects(
                 context,
                 manifest,
+                meshes_and_remaps,
             )
             try:
-                seam_result = _merge_candidate_source_seam_groups(context, manifest)
+                seam_result = _merge_candidate_source_seam_groups(context, manifest, meshes_and_remaps)
             except Exception as seam_exc:
                 seam_warnings.append(f"Seam merge skipped: {seam_exc}")
         except Exception as exc:

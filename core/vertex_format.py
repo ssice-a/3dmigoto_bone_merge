@@ -41,6 +41,31 @@ def pack_into_vertex_format(buffer: bytearray, offset: int, fmt: str, values: It
     buffer[int(offset):end_offset] = data
 
 
+def unpack_vertex_format(fmt: str, data: bytes | bytearray | memoryview, offset: int = 0) -> tuple[float, ...]:
+    """Unpack one vertex element according to a DXGI-like FrameAnalysis format."""
+
+    normalized_fmt = _normalize_format(fmt)
+    if normalized_fmt == "R32_FLOAT":
+        return (float(struct.unpack_from("<f", data, offset)[0]),)
+    if normalized_fmt == "R32G32_FLOAT":
+        return tuple(float(value) for value in struct.unpack_from("<2f", data, offset))
+    if normalized_fmt == "R32G32B32_FLOAT":
+        return tuple(float(value) for value in struct.unpack_from("<3f", data, offset))
+    if normalized_fmt == "R32G32B32A32_FLOAT":
+        return tuple(float(value) for value in struct.unpack_from("<4f", data, offset))
+    if normalized_fmt == "R32G32B32A32_UINT":
+        return tuple(float(value) for value in struct.unpack_from("<4I", data, offset))
+    if normalized_fmt == "R16G16B16A16_UNORM":
+        return tuple(float(value) / 65535.0 for value in struct.unpack_from("<4H", data, offset))
+    if normalized_fmt == "R8G8B8A8_UINT":
+        return tuple(float(value) for value in struct.unpack_from("<4B", data, offset))
+    if normalized_fmt == "R8G8B8A8_SNORM":
+        return tuple(float(_storage_to_signed_byte(value)) / 127.0 for value in struct.unpack_from("<4B", data, offset))
+    if normalized_fmt == "R8G8B8A8_UNORM":
+        return tuple(float(value) / 255.0 for value in struct.unpack_from("<4B", data, offset))
+    raise ValueError(f"Unsupported vertex format: {fmt}")
+
+
 def format_size(fmt: str) -> int:
     normalized_fmt = _normalize_format(fmt)
     sizes = {
@@ -112,6 +137,10 @@ def _snorm_to_int(value: float, max_abs: int) -> int:
 
 def _signed_byte_to_storage(value: int) -> int:
     return int(value) & 0xFF
+
+
+def _storage_to_signed_byte(value: int) -> int:
+    return int(value) - 256 if int(value) >= 128 else int(value)
 
 
 def _signed10_storage(value: int) -> int:

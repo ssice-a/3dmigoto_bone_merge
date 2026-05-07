@@ -19,6 +19,46 @@ class _LoopVertex:
     polygon: object
 
 
+@dataclass
+class _MeshExportCache:
+    mesh_obj: object
+    mesh: object
+    group_index_to_global: dict[int, int]
+    mirror_flip: bool
+    top4_by_vertex: dict[int, tuple[tuple[float, float, float, float], tuple[int, int, int, int]]]
+    uv_layers: dict[str, object | None]
+    attribute_refs: dict[str, object | None]
+
+
+@dataclass
+class _ExportPartCache:
+    palette_to_local: dict[int, int]
+    mesh_caches: dict[int, _MeshExportCache]
+
+    @classmethod
+    def from_part(cls, part: ExportPartPlan) -> "_ExportPartCache":
+        return cls(
+            palette_to_local={int(global_bone): local_index for local_index, global_bone in enumerate(part.palette_values)},
+            mesh_caches={},
+        )
+
+    def mesh_cache(self, loop_vertex: _LoopVertex) -> _MeshExportCache:
+        key = id(loop_vertex.mesh_obj)
+        cache = self.mesh_caches.get(key)
+        if cache is None:
+            cache = _MeshExportCache(
+                mesh_obj=loop_vertex.mesh_obj,
+                mesh=loop_vertex.mesh,
+                group_index_to_global=_group_index_to_global(loop_vertex.mesh_obj),
+                mirror_flip=bool(_object_get(loop_vertex.mesh_obj, "bmc_mirror_flip", False)),
+                top4_by_vertex={},
+                uv_layers={},
+                attribute_refs={},
+            )
+            self.mesh_caches[key] = cache
+        return cache
+
+
 def write_part_geometry_buffers(buffer_dir: str, parts: tuple[ExportPartPlan, ...], vertex_layout_table: dict) -> list[dict]:
     """Write IB/VB buffers for every export part and return manifest records."""
 
@@ -35,6 +75,7 @@ def _write_part_geometry_buffers(buffer_dir: str, part: ExportPartPlan, vertex_l
     loop_vertices, indices = _collect_part_loop_vertices(part)
     if not loop_vertices:
         raise ValueError(f"{part.region.key}/{part.part_name}: no triangles to export")
+    export_cache = _ExportPartCache.from_part(part)
 
     ib_file_name = f"{part.file_stem}-Index.buf"
     ib_file_path = os.path.join(buffer_dir, ib_file_name)
@@ -45,7 +86,7 @@ def _write_part_geometry_buffers(buffer_dir: str, part: ExportPartPlan, vertex_l
         role_name = _slot_file_role(slot_name)
         file_name = f"{part.file_stem}-{role_name}.buf"
         file_path = os.path.join(buffer_dir, file_name)
-        _write_vertex_slot_buffer(file_path, slot_name, slot_layout, loop_vertices, part.palette_values)
+        _write_vertex_slot_buffer(file_path, slot_name, slot_layout, loop_vertices, export_cache)
         vb_records[slot_name] = {
             "role": role_name,
             "file_name": file_name,
@@ -174,26 +215,28 @@ def _write_vertex_slot_buffer(
     slot_name: str,
     slot_layout: dict,
     loop_vertices: list[_LoopVertex],
-    palette_values: tuple[int, ...],
+    export_cache: _ExportPartCache,
 ) -> None:
     directory = os.path.dirname(file_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     stride = int(slot_layout["stride"])
+    output = bytearray(len(loop_vertices) * stride)
+    fields = list(slot_layout["fields"])
+    for record_index, loop_vertex in enumerate(loop_vertices):
+        record_base = record_index * stride
+        for field in fields:
+            field_bytes = _field_bytes(slot_name, field, loop_vertex, export_cache)
+            offset = int(field["aligned_byte_offset"])
+            end_offset = offset + len(field_bytes)
+            if offset < 0 or end_offset > stride:
+                raise ValueError(f"{slot_name}: field {field['semantic']} exceeds stride {stride}")
+            output[record_base + offset:record_base + end_offset] = field_bytes
     with open(file_path, "wb") as file_handle:
-        for loop_vertex in loop_vertices:
-            record = bytearray(stride)
-            for field in slot_layout["fields"]:
-                field_bytes = _field_bytes(slot_name, field, loop_vertex, palette_values)
-                offset = int(field["aligned_byte_offset"])
-                end_offset = offset + len(field_bytes)
-                if offset < 0 or end_offset > len(record):
-                    raise ValueError(f"{slot_name}: field {field['semantic']} exceeds stride {stride}")
-                record[offset:end_offset] = field_bytes
-            file_handle.write(record)
+        file_handle.write(output)
 
 
-def _field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex, palette_values: tuple[int, ...]) -> bytes:
+def _field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> bytes:
     semantic_name = str(field["semantic_name"]).upper()
     semantic_index = int(field["semantic_index"])
     fmt = str(field["format"]).upper()
@@ -205,14 +248,14 @@ def _field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex, palette_
             return int(encode_game_packed_normal(normal)).to_bytes(4, "little", signed=False)
         return pack_vertex_format(fmt, normal)
     if semantic_name == "TEXCOORD" and semantic_index in {0, 1} and _normalize_format(fmt) == "R32G32_FLOAT":
-        return pack_vertex_format(fmt, _uv(loop_vertex, f"UV{semantic_index}"))
+        return pack_vertex_format(fmt, _uv(loop_vertex, f"UV{semantic_index}", export_cache))
     if semantic_name == "TEXCOORD":
-        return _texcoord_field_bytes(slot_name, field, loop_vertex)
+        return _texcoord_field_bytes(slot_name, field, loop_vertex, export_cache)
     if semantic_name == "BLENDWEIGHTS" and semantic_index == 0:
-        weights, _indices = _local_top4_weights(loop_vertex, palette_values)
+        weights, _indices = _local_top4_weights(loop_vertex, export_cache)
         return pack_vertex_format(fmt, weights)
     if semantic_name == "BLENDINDICES" and semantic_index == 0:
-        _weights, indices = _local_top4_weights(loop_vertex, palette_values)
+        _weights, indices = _local_top4_weights(loop_vertex, export_cache)
         return pack_vertex_format(fmt, indices)
     raise ValueError(f"{slot_name}: unsupported export semantic {semantic_name}{semantic_index}")
 
@@ -235,27 +278,36 @@ def _game_normal(loop_vertex: _LoopVertex) -> tuple[float, float, float]:
     return _normalize3(normal)
 
 
-def _uv(loop_vertex: _LoopVertex, layer_name: str) -> tuple[float, float]:
-    uv_layers = getattr(loop_vertex.mesh, "uv_layers", None)
-    layer = None
-    if uv_layers is not None:
-        getter = getattr(uv_layers, "get", None)
-        if callable(getter):
-            layer = getter(layer_name)
-        elif isinstance(uv_layers, dict):
-            layer = uv_layers.get(layer_name)
+def _uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCache) -> tuple[float, float]:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    layer = mesh_cache.uv_layers.get(layer_name)
+    if layer_name not in mesh_cache.uv_layers:
+        uv_layers = getattr(loop_vertex.mesh, "uv_layers", None)
+        layer = None
+        if uv_layers is not None:
+            getter = getattr(uv_layers, "get", None)
+            if callable(getter):
+                layer = getter(layer_name)
+            elif isinstance(uv_layers, dict):
+                layer = uv_layers.get(layer_name)
+        mesh_cache.uv_layers[layer_name] = layer
     if layer is None:
         raise ValueError(f"{getattr(loop_vertex.mesh_obj, 'name', '<mesh>')}: missing required UV layer {layer_name}")
     uv = getattr(layer.data[loop_vertex.loop_index], "uv", (0.0, 0.0))
     return (float(uv[0]), float(uv[1]))
 
 
-def _texcoord_field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex) -> bytes:
+def _texcoord_field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> bytes:
     fmt = _normalize_format(str(field["format"]))
     semantic_index = int(field["semantic_index"])
     component_count = _format_component_count(fmt)
     values = [
-        _point_attribute_value(loop_vertex.mesh, _texcoord_attr_names(slot_name, semantic_index, component), loop_vertex.vertex_index)
+        _point_attribute_value(
+            loop_vertex.mesh,
+            _texcoord_attr_names(slot_name, semantic_index, component),
+            loop_vertex.vertex_index,
+            export_cache.mesh_cache(loop_vertex),
+        )
         for component in range(component_count)
     ]
     if any(value is None for value in values):
@@ -267,16 +319,18 @@ def _texcoord_field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex)
     return pack_vertex_format(fmt, [float(value) for value in values])
 
 
-def _local_top4_weights(loop_vertex: _LoopVertex, palette_values: tuple[int, ...]) -> tuple[tuple[float, float, float, float], tuple[int, int, int, int]]:
-    palette_to_local = {int(global_bone): local_index for local_index, global_bone in enumerate(palette_values)}
-    group_index_to_global = _group_index_to_global(loop_vertex.mesh_obj)
+def _local_top4_weights(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[tuple[float, float, float, float], tuple[int, int, int, int]]:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    cached = mesh_cache.top4_by_vertex.get(loop_vertex.vertex_index)
+    if cached is not None:
+        return cached
     vertex = getattr(loop_vertex.mesh, "vertices")[loop_vertex.vertex_index]
     weighted: list[tuple[int, float]] = []
     for group_element in getattr(vertex, "groups", []) or []:
-        global_group = group_index_to_global.get(int(group_element.group))
+        global_group = mesh_cache.group_index_to_global.get(int(group_element.group))
         if global_group is None:
             continue
-        local_index = palette_to_local.get(int(global_group))
+        local_index = export_cache.palette_to_local.get(int(global_group))
         if local_index is None:
             continue
         weight = float(group_element.weight)
@@ -287,13 +341,17 @@ def _local_top4_weights(loop_vertex: _LoopVertex, palette_values: tuple[int, ...
     top = weighted[:4]
     total = sum(weight for _index, weight in top)
     if total <= 1e-12:
-        return (0.0, 0.0, 0.0, 0.0), (0, 0, 0, 0)
+        result = (0.0, 0.0, 0.0, 0.0), (0, 0, 0, 0)
+        mesh_cache.top4_by_vertex[loop_vertex.vertex_index] = result
+        return result
     weights = [weight / total for _index, weight in top]
     indices = [index for index, _weight in top]
     while len(weights) < 4:
         weights.append(0.0)
         indices.append(0)
-    return tuple(weights[:4]), tuple(indices[:4])
+    result = tuple(weights[:4]), tuple(indices[:4])
+    mesh_cache.top4_by_vertex[loop_vertex.vertex_index] = result
+    return result
 
 
 def _group_index_to_global(mesh_obj) -> dict[int, int]:
@@ -315,16 +373,19 @@ def _texcoord_attr_names(slot_name: str, semantic_index: int, component: int) ->
     return tuple(names)
 
 
-def _point_attribute_value(mesh, names: tuple[str, ...], vertex_index: int):
-    attributes = getattr(mesh, "attributes", None)
+def _point_attribute_value(mesh, names: tuple[str, ...], vertex_index: int, mesh_cache: _MeshExportCache):
     for name in names:
-        attribute = None
-        if attributes is not None:
-            getter = getattr(attributes, "get", None)
-            if callable(getter):
-                attribute = getter(name)
-            elif isinstance(attributes, dict):
-                attribute = attributes.get(name)
+        attribute = mesh_cache.attribute_refs.get(name)
+        if name not in mesh_cache.attribute_refs:
+            attributes = getattr(mesh, "attributes", None)
+            attribute = None
+            if attributes is not None:
+                getter = getattr(attributes, "get", None)
+                if callable(getter):
+                    attribute = getter(name)
+                elif isinstance(attributes, dict):
+                    attribute = attributes.get(name)
+            mesh_cache.attribute_refs[name] = attribute
         if attribute is None:
             continue
         data = getattr(attribute, "data", [])

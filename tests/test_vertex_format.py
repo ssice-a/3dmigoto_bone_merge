@@ -31,6 +31,10 @@ class VertexFormatTests(unittest.TestCase):
             struct.unpack("<2f", vertex_format.pack_vertex_format("R32G32_FLOAT", [0.25, -0.5])),
             (0.25, -0.5),
         )
+        self.assertEqual(
+            vertex_format.unpack_vertex_format("R32G32_FLOAT", vertex_format.pack_vertex_format("R32G32_FLOAT", [0.25, -0.5])),
+            (0.25, -0.5),
+        )
 
     def test_pack_unorm_and_snorm_formats(self):
         self.assertEqual(

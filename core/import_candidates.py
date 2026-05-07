@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
+from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
 
 
 _VERTEX_DATA_RE = re.compile(
@@ -48,6 +49,7 @@ class _SlotSlice:
     header: BufferHeader
     elements: dict[tuple[str, int], HeaderElement]
     base_offset: int
+    data: bytes
 
 
 def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> LoadedCandidateGeometry:
@@ -380,10 +382,7 @@ def _read_index_buffer(path: str, header: BufferHeader) -> list[int]:
         data = file_handle.read(index_count * stride)
     if len(data) < index_count * stride:
         raise ValueError(f"IB buffer is shorter than expected: {path}")
-    return [
-        int(struct.unpack_from(unpack_format, data, index * stride)[0])
-        for index in range(index_count)
-    ]
+    return [int(record[0]) for record in struct.iter_unpack(unpack_format, data)]
 
 
 def _load_slot_slice(
@@ -420,6 +419,13 @@ def _load_slot_slice(
         warnings.append(f"{slot_name}: missing buf path")
         return None
     base_offset = _resolve_slot_base_offset(buf_path, header)
+    slice_size = int(header.vertex_count) * int(header.stride)
+    with open(buf_path, "rb") as file_handle:
+        file_handle.seek(int(base_offset))
+        data = file_handle.read(slice_size)
+    if len(data) < slice_size:
+        warnings.append(f"{slot_name}: buf slice is shorter than vertex_count*stride")
+        return None
     return _SlotSlice(
         slot_name=slot_name,
         slot_index=slot_index,
@@ -427,6 +433,7 @@ def _load_slot_slice(
         header=header,
         elements=elements,
         base_offset=base_offset,
+        data=data,
     )
 
 
@@ -701,8 +708,11 @@ def _element_layout_payload(element: HeaderElement) -> dict:
 
 
 def _read_uint32_records(slot: _SlotSlice, element: HeaderElement, vertex_ids: list[int]) -> list[int]:
-    raw_records = _read_raw_records(slot, element, vertex_ids, 4)
-    return [int(struct.unpack("<I", record)[0]) for record in raw_records]
+    _validate_vertex_record_range(slot, element, vertex_ids, 4)
+    stride = int(slot.header.stride)
+    element_offset = int(element.aligned_byte_offset)
+    data = slot.data
+    return [int(struct.unpack_from("<I", data, int(vertex_id) * stride + element_offset)[0]) for vertex_id in vertex_ids]
 
 
 def _read_int8x4_records(
@@ -710,8 +720,14 @@ def _read_int8x4_records(
     element: HeaderElement,
     vertex_ids: list[int],
 ) -> list[tuple[int, int, int, int]]:
-    raw_records = _read_raw_records(slot, element, vertex_ids, 4)
-    return [tuple(_signed_int8(byte_value) for byte_value in record) for record in raw_records]
+    _validate_vertex_record_range(slot, element, vertex_ids, 4)
+    stride = int(slot.header.stride)
+    element_offset = int(element.aligned_byte_offset)
+    data = slot.data
+    return [
+        tuple(_signed_int8(byte_value) for byte_value in data[int(vertex_id) * stride + element_offset:int(vertex_id) * stride + element_offset + 4])
+        for vertex_id in vertex_ids
+    ]
 
 
 def _read_blend_weights(
@@ -751,8 +767,15 @@ def _read_format_records(
     element: HeaderElement,
     vertex_ids: list[int],
 ) -> list[tuple[float, ...]]:
-    raw_records = _read_raw_records(slot, element, vertex_ids, _format_size(element.fmt))
-    return [_unpack_format(record, 0, element.fmt) for record in raw_records]
+    size = _format_size(element.fmt)
+    _validate_vertex_record_range(slot, element, vertex_ids, size)
+    stride = int(slot.header.stride)
+    element_offset = int(element.aligned_byte_offset)
+    data = slot.data
+    return [
+        _unpack_format(data, int(vertex_id) * stride + element_offset, element.fmt)
+        for vertex_id in vertex_ids
+    ]
 
 
 def _read_raw_records(
@@ -761,16 +784,8 @@ def _read_raw_records(
     vertex_ids: list[int],
     size: int,
 ) -> list[bytes]:
-    if not vertex_ids:
-        return []
-    max_vertex_id = max(vertex_ids)
-    if max_vertex_id >= int(slot.header.vertex_count):
-        raise ValueError(
-            f"{slot.slot_name}: vertex id {max_vertex_id} exceeds vertex_count {slot.header.vertex_count}"
-        )
-    with open(slot.buf_path, "rb") as file_handle:
-        file_handle.seek(int(slot.base_offset))
-        data = file_handle.read(int(slot.header.vertex_count) * int(slot.header.stride))
+    _validate_vertex_record_range(slot, element, vertex_ids, size)
+    data = slot.data
     records: list[bytes] = []
     for vertex_id in vertex_ids:
         offset = int(vertex_id) * int(slot.header.stride) + int(element.aligned_byte_offset)
@@ -781,27 +796,26 @@ def _read_raw_records(
     return records
 
 
+def _validate_vertex_record_range(
+    slot: _SlotSlice,
+    element: HeaderElement,
+    vertex_ids: list[int],
+    size: int,
+) -> None:
+    if not vertex_ids:
+        return
+    max_vertex_id = max(vertex_ids)
+    if max_vertex_id >= int(slot.header.vertex_count):
+        raise ValueError(
+            f"{slot.slot_name}: vertex id {max_vertex_id} exceeds vertex_count {slot.header.vertex_count}"
+        )
+    max_offset = int(max_vertex_id) * int(slot.header.stride) + int(element.aligned_byte_offset) + int(size)
+    if max_offset > len(slot.data):
+        raise ValueError(f"{slot.slot_name}: record read exceeds loaded slice")
+
+
 def _format_size(fmt: str) -> int:
-    upper_fmt = str(fmt or "").upper()
-    if upper_fmt in {"R32_FLOAT", "DXGI_FORMAT_R32_FLOAT"}:
-        return 4
-    if upper_fmt in {"R32G32_FLOAT", "DXGI_FORMAT_R32G32_FLOAT"}:
-        return 8
-    if upper_fmt in {"R32G32B32_FLOAT", "DXGI_FORMAT_R32G32B32_FLOAT"}:
-        return 12
-    if upper_fmt in {"R32G32B32A32_FLOAT", "DXGI_FORMAT_R32G32B32A32_FLOAT"}:
-        return 16
-    if upper_fmt in {"R32G32B32A32_UINT", "DXGI_FORMAT_R32G32B32A32_UINT"}:
-        return 16
-    if upper_fmt in {"R16G16B16A16_UNORM", "DXGI_FORMAT_R16G16B16A16_UNORM"}:
-        return 8
-    if upper_fmt in {"R8G8B8A8_UINT", "DXGI_FORMAT_R8G8B8A8_UINT"}:
-        return 4
-    if upper_fmt in {"R8G8B8A8_SNORM", "DXGI_FORMAT_R8G8B8A8_SNORM"}:
-        return 4
-    if upper_fmt in {"R8G8B8A8_UNORM", "DXGI_FORMAT_R8G8B8A8_UNORM"}:
-        return 4
-    raise ValueError(f"Unsupported vertex format: {fmt}")
+    return _shared_format_size(fmt)
 
 
 def _is_format(fmt: str, name: str) -> bool:
@@ -811,26 +825,7 @@ def _is_format(fmt: str, name: str) -> bool:
 
 
 def _unpack_format(data: bytes, offset: int, fmt: str) -> tuple[float, ...]:
-    upper_fmt = str(fmt or "").upper()
-    if upper_fmt in {"R32_FLOAT", "DXGI_FORMAT_R32_FLOAT"}:
-        return (float(struct.unpack_from("<f", data, offset)[0]),)
-    if upper_fmt in {"R32G32_FLOAT", "DXGI_FORMAT_R32G32_FLOAT"}:
-        return tuple(float(value) for value in struct.unpack_from("<2f", data, offset))
-    if upper_fmt in {"R32G32B32_FLOAT", "DXGI_FORMAT_R32G32B32_FLOAT"}:
-        return tuple(float(value) for value in struct.unpack_from("<3f", data, offset))
-    if upper_fmt in {"R32G32B32A32_FLOAT", "DXGI_FORMAT_R32G32B32A32_FLOAT"}:
-        return tuple(float(value) for value in struct.unpack_from("<4f", data, offset))
-    if upper_fmt in {"R32G32B32A32_UINT", "DXGI_FORMAT_R32G32B32A32_UINT"}:
-        return tuple(float(value) for value in struct.unpack_from("<4I", data, offset))
-    if upper_fmt in {"R16G16B16A16_UNORM", "DXGI_FORMAT_R16G16B16A16_UNORM"}:
-        return tuple(float(value) / 65535.0 for value in struct.unpack_from("<4H", data, offset))
-    if upper_fmt in {"R8G8B8A8_UINT", "DXGI_FORMAT_R8G8B8A8_UINT"}:
-        return tuple(float(value) for value in struct.unpack_from("<4B", data, offset))
-    if upper_fmt in {"R8G8B8A8_SNORM", "DXGI_FORMAT_R8G8B8A8_SNORM"}:
-        return tuple(float(_signed_int8(value)) / 127.0 for value in struct.unpack_from("<4B", data, offset))
-    if upper_fmt in {"R8G8B8A8_UNORM", "DXGI_FORMAT_R8G8B8A8_UNORM"}:
-        return tuple(float(value) / 255.0 for value in struct.unpack_from("<4B", data, offset))
-    raise ValueError(f"Unsupported vertex format: {fmt}")
+    return unpack_vertex_format(fmt, data, offset)
 
 
 def _signed_int8(value: int) -> int:
@@ -851,6 +846,14 @@ def _normalize_vector(vector: tuple[float, float, float]) -> tuple[float, float,
 
 def _apply_uv_layer(mesh, layer_name: str, values: list[tuple[float, float]]) -> None:
     uv_layer = mesh.uv_layers.new(name=layer_name)
+    flat_uvs: list[float] = []
+    for loop in mesh.loops:
+        vertex_index = int(loop.vertex_index)
+        uv = values[vertex_index] if vertex_index < len(values) else (0.0, 0.0)
+        flat_uvs.extend([float(uv[0]), float(uv[1])])
+    if _foreach_set(uv_layer.data, "uv", flat_uvs):
+        mesh.uv_layers.active = mesh.uv_layers.get("UV0")
+        return
     for polygon in mesh.polygons:
         for loop_index in polygon.loop_indices:
             vertex_index = mesh.loops[loop_index].vertex_index
@@ -869,14 +872,29 @@ def _apply_custom_normals(mesh, normals: list[tuple[float, float, float]]) -> No
 
 def _store_int_attribute(mesh, name: str, values: list[int]) -> None:
     attribute = mesh.attributes.new(name=name, type="INT", domain="POINT")
+    if _foreach_set(attribute.data, "value", [int(value) for value in values]):
+        return
     for item, value in zip(attribute.data, values):
         item.value = int(value)
 
 
 def _store_float_attribute(mesh, name: str, values: list[float]) -> None:
     attribute = mesh.attributes.new(name=name, type="FLOAT", domain="POINT")
+    if _foreach_set(attribute.data, "value", [float(value) for value in values]):
+        return
     for item, value in zip(attribute.data, values):
         item.value = float(value)
+
+
+def _foreach_set(data, attribute_name: str, values: list[float | int]) -> bool:
+    setter = getattr(data, "foreach_set", None)
+    if not callable(setter):
+        return False
+    try:
+        setter(attribute_name, values)
+        return True
+    except Exception:
+        return False
 
 
 def _store_uint32_split_attributes(mesh, base_name: str, values: list[int]) -> None:

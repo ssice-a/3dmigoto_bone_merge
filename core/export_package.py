@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import re
-import struct
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
@@ -228,16 +227,13 @@ def part_palette_manifest_record(part: ExportPartPlan, file_path: str = "") -> d
 def write_r32_index_buffer(path: str, indices: Iterable[int]) -> str:
     """Write an index buffer as little-endian DXGI_FORMAT_R32_UINT."""
 
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(path, "wb") as file_handle:
-        for index in indices:
-            value = int(index)
-            if value < 0:
-                raise ValueError(f"R32 index cannot be negative: {value}")
-            file_handle.write(struct.pack("<I", value))
-    return path
+    values = []
+    for index in indices:
+        value = int(index)
+        if value < 0:
+            raise ValueError(f"R32 index cannot be negative: {value}")
+        values.append(value)
+    return write_uint32_buffer(path, values)
 
 
 def _collect_region_part_sources(region_collection, identity: ExportRegionIdentity, warnings: list[str]) -> list[_PartSource]:

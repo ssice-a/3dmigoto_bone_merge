@@ -32,6 +32,10 @@ _MIN_PAIR_SCORE = 0.001
 _TARGET_MATCH_POINT_COUNT = 25000
 _MIN_LOD_LINK_COVERAGE_RATIO = 0.15
 _MIN_LOD_LINK_GLOBALS = 4
+_BONE_SAMPLE_TARGET = 24
+_BONE_SAMPLE_TOP_WEIGHT_COUNT = 12
+_MIN_BONE_MATCH_SCORE = 0.01
+_MIN_BONE_MATCH_VOTES = 1
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,20 @@ class PointGeometry:
     positions: list[tuple[float, float, float]]
     blend_indices: list[tuple[int, int, int, int]]
     blend_weights: list[tuple[float, float, float, float]]
+
+
+@dataclass(frozen=True)
+class BoneSample:
+    position: tuple[float, float, float]
+    weight: float
+
+
+@dataclass(frozen=True)
+class LodBoneSample:
+    position: tuple[float, float, float]
+    weight: float
+    lod_record_key: str
+    lod_local_bone: int
 
 
 _POINT_GEOMETRY_CACHE: dict[tuple, PointGeometry] = {}
@@ -68,22 +86,18 @@ def analyze_lod_for_manifest(
 
     main_points, canonical_global_count, main_records = _build_canonical_point_cloud(canonical_manifest)
     lod_manifest = _analyze_main_frameanalysis_cached(normalized_lod_dir)
-    canonical_source_keys = {str(record.get("source_key", "") or "") for record in main_records}
-    lod_points, lod_records, skipped_same_source_count = _build_lod_point_cloud(
+    canonical_ib_hashes = {str(record.get("ib_hash", "") or "").lower() for record in main_records if str(record.get("ib_hash", "") or "")}
+    lod_points, lod_records, skipped_main_hash_count = _build_lod_point_cloud(
         lod_manifest,
-        excluded_source_keys=canonical_source_keys,
+        excluded_ib_hashes=canonical_ib_hashes,
     )
-    fallback_used = False
-    if not lod_points and canonical_source_keys:
-        lod_points, lod_records, skipped_same_source_count = _build_lod_point_cloud(lod_manifest)
-        fallback_used = True
     if not main_points:
         raise ValueError("No canonical weighted point cloud could be built from the main manifest")
     if not lod_points:
         raise ValueError("No LOD weighted point cloud could be built from the LOD FrameAnalysis")
 
     ignored_global_bones = _lod_match_excluded_global_bones(canonical_manifest)
-    mapping = build_lod_scatter_mapping(
+    mapping = build_lod_bone_cloud_mapping(
         main_points,
         lod_points,
         canonical_global_count,
@@ -95,15 +109,6 @@ def analyze_lod_for_manifest(
     variant_id = _build_lod_variant_id(normalized_lod_dir, capture_records)
     generated_at = datetime.now(timezone.utc).isoformat()
     validation = list(mapping["validation"])
-    if fallback_used:
-        validation.append(
-            {
-                "severity": "warning",
-                "code": "lod_same_source_fallback",
-                "message": "LOD analysis fell back to same-key candidates because no different LOD capture candidates were available.",
-                "draw_indices": [],
-            }
-        )
     validation.extend(review["validation"])
     validation.extend(
         {
@@ -128,7 +133,7 @@ def analyze_lod_for_manifest(
                 "match_tolerance": float(mapping["match_tolerance"]),
                 "matched_vertex_count": int(mapping["matched_vertex_count"]),
                 "lod_vertex_count": int(len(lod_points)),
-                "skipped_same_source_lod_candidate_count": int(skipped_same_source_count),
+                "skipped_main_hash_lod_candidate_count": int(skipped_main_hash_count),
                 "canonical_match_point_count": int(mapping["canonical_match_point_count"]),
                 "lod_match_point_count": int(mapping["lod_match_point_count"]),
                 "shadow_stage": dict(lod_manifest.get("shadow_stage", {}) or {}),
@@ -258,6 +263,272 @@ def build_lod_scatter_mapping(
         "ignored_global_bone_count": len(ignored_global_bones),
         "required_global_bone_count": required_global_count,
     }
+
+
+def build_lod_bone_cloud_mapping(
+    canonical_points: list[WeightedPoint],
+    lod_points: list[WeightedPoint],
+    canonical_global_count: int,
+    *,
+    ignored_global_bones: set[int] | None = None,
+) -> dict:
+    """Match canonical global bones to LOD local bones using per-bone weighted point clouds."""
+
+    ignored_global_bones = {
+        int(value)
+        for value in (ignored_global_bones or set())
+        if 0 <= int(value) < int(canonical_global_count)
+    }
+    tolerance = _initial_match_tolerance(canonical_points, lod_points)
+    canonical_clouds = _sample_canonical_bone_clouds(canonical_points, ignored_global_bones)
+    lod_clouds = _sample_lod_bone_clouds(lod_points)
+
+    best_stats: dict[tuple[str, int, int], dict] = {}
+    best_matched_count = 0
+    best_tolerance = tolerance
+    for scale in (1.0, 2.0, 4.0):
+        trial_tolerance = tolerance * scale
+        stats = _score_bone_clouds(canonical_clouds, lod_clouds, trial_tolerance)
+        matched_count = _count_matched_globals_from_stats(stats, canonical_global_count, ignored_global_bones)
+        if matched_count > best_matched_count or (matched_count == best_matched_count and len(stats) > len(best_stats)):
+            best_stats = stats
+            best_matched_count = matched_count
+            best_tolerance = trial_tolerance
+        if matched_count >= max(1, int((canonical_global_count - len(ignored_global_bones)) * 0.98)):
+            break
+
+    best_by_global: dict[int, tuple[tuple[str, int], dict]] = {}
+    for (lod_key, lod_local_bone, canonical_global), stats in best_stats.items():
+        if int(canonical_global) < 0 or int(canonical_global) >= int(canonical_global_count):
+            continue
+        if canonical_global in ignored_global_bones:
+            continue
+        if not _bone_match_stats_accepted(stats):
+            continue
+        current = best_by_global.get(int(canonical_global))
+        if current is None or _pair_rank(stats) > _pair_rank(current[1]):
+            best_by_global[int(canonical_global)] = ((str(lod_key), int(lod_local_bone)), stats)
+
+    mapping_entries = []
+    global_to_lod: dict[int, dict] = {}
+    for canonical_global in range(int(canonical_global_count)):
+        if canonical_global in ignored_global_bones:
+            mapping_entries.append(
+                {
+                    "canonical_global_bone": int(canonical_global),
+                    "lod_record_key": "",
+                    "lod_local_bone": -1,
+                    "score": 0.0,
+                    "votes": 0,
+                    "status": "ignored_lod_match_excluded",
+                }
+            )
+            continue
+        selected = best_by_global.get(canonical_global)
+        if selected is None:
+            mapping_entries.append(
+                {
+                    "canonical_global_bone": int(canonical_global),
+                    "lod_record_key": "",
+                    "lod_local_bone": -1,
+                    "score": 0.0,
+                    "votes": 0,
+                    "status": "unmatched",
+                }
+            )
+            continue
+        (lod_key, lod_local_bone), stats = selected
+        entry = {
+            "canonical_global_bone": int(canonical_global),
+            "lod_record_key": lod_key,
+            "lod_local_bone": int(lod_local_bone),
+            "score": float(stats["score"]),
+            "votes": int(stats["votes"]),
+            "average_distance": float(stats["distance_sum"]) / max(1, int(stats["votes"])),
+            "status": "matched",
+        }
+        mapping_entries.append(entry)
+        global_to_lod[int(canonical_global)] = entry
+
+    unmatched_count = sum(1 for entry in mapping_entries if str(entry["status"]) == "unmatched")
+    required_global_count = max(0, int(canonical_global_count) - len(ignored_global_bones))
+    validation = []
+    if unmatched_count:
+        validation.append(
+            {
+                "severity": "warning",
+                "code": "lod_unmatched_global_bones",
+                "message": f"LOD mapping left {unmatched_count}/{required_global_count} required canonical global bone(s) unmatched.",
+                "draw_indices": [],
+            }
+        )
+    if best_matched_count <= 0:
+        validation.append(
+            {
+                "severity": "error",
+                "code": "lod_no_vertex_matches",
+                "message": "LOD point cloud did not match any canonical vertices within the tested tolerances.",
+                "draw_indices": [],
+            }
+        )
+
+    return {
+        "global_to_lod": global_to_lod,
+        "mapping_entries": mapping_entries,
+        "validation": validation,
+        "matched_vertex_count": best_matched_count,
+        "match_tolerance": best_tolerance,
+        "canonical_match_point_count": sum(len(samples) for samples in canonical_clouds.values()),
+        "lod_match_point_count": sum(len(samples) for samples in lod_clouds.values()),
+        "ignored_global_bone_count": len(ignored_global_bones),
+        "required_global_bone_count": required_global_count,
+    }
+
+
+def _sample_canonical_bone_clouds(
+    points: list[WeightedPoint],
+    ignored_global_bones: set[int],
+) -> dict[int, list[BoneSample]]:
+    clouds: dict[int, list[BoneSample]] = {}
+    for point in points:
+        for key, weight in point.weights:
+            try:
+                global_bone = int(key)
+            except (TypeError, ValueError):
+                continue
+            if global_bone in ignored_global_bones:
+                continue
+            if float(weight) <= _WEIGHT_EPSILON:
+                continue
+            clouds.setdefault(global_bone, []).append(BoneSample(point.position, float(weight)))
+    return {
+        global_bone: _sample_bone_cloud(samples)
+        for global_bone, samples in clouds.items()
+        if samples
+    }
+
+
+def _sample_lod_bone_clouds(points: list[WeightedPoint]) -> dict[tuple[str, int], list[LodBoneSample]]:
+    clouds: dict[tuple[str, int], list[BoneSample]] = {}
+    for point in points:
+        for key, weight in point.weights:
+            parsed = _parse_lod_bone_key(key)
+            if parsed is None or float(weight) <= _WEIGHT_EPSILON:
+                continue
+            clouds.setdefault(parsed, []).append(BoneSample(point.position, float(weight)))
+
+    sampled_clouds: dict[tuple[str, int], list[LodBoneSample]] = {}
+    for (lod_record_key, lod_local_bone), samples in clouds.items():
+        sampled_clouds[(lod_record_key, lod_local_bone)] = [
+            LodBoneSample(sample.position, sample.weight, lod_record_key, lod_local_bone)
+            for sample in _sample_bone_cloud(samples)
+        ]
+    return sampled_clouds
+
+
+def _parse_lod_bone_key(key) -> tuple[str, int] | None:
+    if not isinstance(key, (tuple, list)) or len(key) != 2:
+        return None
+    lod_record_key, lod_local_bone = key
+    try:
+        return str(lod_record_key), int(lod_local_bone)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sample_bone_cloud(samples: list[BoneSample]) -> list[BoneSample]:
+    if len(samples) <= _BONE_SAMPLE_TARGET:
+        return list(samples)
+
+    selected: list[BoneSample] = []
+    selected_keys: set[tuple[tuple[float, float, float], int]] = set()
+
+    def add(sample: BoneSample) -> None:
+        key = (sample.position, round(float(sample.weight), 8))
+        if key in selected_keys or len(selected) >= _BONE_SAMPLE_TARGET:
+            return
+        selected_keys.add(key)
+        selected.append(sample)
+
+    by_weight = sorted(samples, key=lambda item: (-float(item.weight), item.position))
+    for sample in by_weight[: min(_BONE_SAMPLE_TOP_WEIGHT_COUNT, _BONE_SAMPLE_TARGET)]:
+        add(sample)
+
+    if len(selected) < _BONE_SAMPLE_TARGET:
+        cell_size = max(_positions_diag([sample.position for sample in samples]) * 0.08, 1.0e-5)
+        buckets: dict[tuple[int, int, int], BoneSample] = {}
+        for sample in samples:
+            key = _cell_key(sample.position, cell_size)
+            current = buckets.get(key)
+            if current is None or float(sample.weight) > float(current.weight):
+                buckets[key] = sample
+        for sample in sorted(buckets.values(), key=lambda item: (-float(item.weight), item.position)):
+            add(sample)
+            if len(selected) >= _BONE_SAMPLE_TARGET:
+                break
+
+    for sample in by_weight:
+        add(sample)
+        if len(selected) >= _BONE_SAMPLE_TARGET:
+            break
+    return selected
+
+
+def _score_bone_clouds(
+    canonical_clouds: dict[int, list[BoneSample]],
+    lod_clouds: dict[tuple[str, int], list[LodBoneSample]],
+    tolerance: float,
+) -> dict[tuple[str, int, int], dict]:
+    lod_samples = [sample for samples in lod_clouds.values() for sample in samples]
+    lod_hash = _generic_build_spatial_hash(lod_samples, lambda sample: sample.position, tolerance)
+    tolerance_squared = tolerance * tolerance
+    stats: dict[tuple[str, int, int], dict] = {}
+
+    for canonical_global, canonical_samples in canonical_clouds.items():
+        for canonical_sample in canonical_samples:
+            best_by_lod_bone: dict[tuple[str, int], tuple[float, float, float]] = {}
+            base_key = _cell_key(canonical_sample.position, tolerance)
+            for cell_key in _neighbor_keys(base_key):
+                for lod_sample in lod_hash.get(cell_key, ()):
+                    distance_squared = _distance_squared(canonical_sample.position, lod_sample.position)
+                    if distance_squared > tolerance_squared:
+                        continue
+                    distance = math.sqrt(distance_squared)
+                    distance_score = 1.0 / (1.0 + distance / max(tolerance, 1.0e-6))
+                    score = float(canonical_sample.weight) * float(lod_sample.weight) * distance_score
+                    if score <= _MIN_PAIR_SCORE:
+                        continue
+                    lod_key = (lod_sample.lod_record_key, lod_sample.lod_local_bone)
+                    current = best_by_lod_bone.get(lod_key)
+                    if current is None or score > current[0]:
+                        best_by_lod_bone[lod_key] = (score, distance, float(lod_sample.weight))
+            for (lod_record_key, lod_local_bone), (score, distance, _lod_weight) in best_by_lod_bone.items():
+                key = (str(lod_record_key), int(lod_local_bone), int(canonical_global))
+                record = stats.setdefault(key, {"score": 0.0, "votes": 0, "distance_sum": 0.0})
+                record["score"] += float(score)
+                record["votes"] += 1
+                record["distance_sum"] += float(distance)
+    return stats
+
+
+def _count_matched_globals_from_stats(
+    stats: dict[tuple[str, int, int], dict],
+    canonical_global_count: int,
+    ignored_global_bones: set[int],
+) -> int:
+    matched = set()
+    for (_lod_key, _lod_local_bone, canonical_global), record in stats.items():
+        if int(canonical_global) < 0 or int(canonical_global) >= int(canonical_global_count):
+            continue
+        if int(canonical_global) in ignored_global_bones:
+            continue
+        if _bone_match_stats_accepted(record):
+            matched.add(int(canonical_global))
+    return len(matched)
+
+
+def _bone_match_stats_accepted(stats: dict) -> bool:
+    return float(stats.get("score", 0.0)) >= _MIN_BONE_MATCH_SCORE and int(stats.get("votes", 0)) >= _MIN_BONE_MATCH_VOTES
 
 
 def _analyze_main_frameanalysis_cached(frameanalysis_dir: str) -> dict:
@@ -488,17 +759,17 @@ def _build_canonical_point_cloud(canonical_manifest: dict) -> tuple[list[Weighte
 def _build_lod_point_cloud(
     lod_manifest: dict,
     *,
-    excluded_source_keys: set[str] | None = None,
+    excluded_ib_hashes: set[str] | None = None,
 ) -> tuple[list[WeightedPoint], dict[str, dict], int]:
-    normalized_excluded_source_keys = {str(value) for value in (excluded_source_keys or set()) if str(value)}
-    cache_key = _lod_point_cloud_cache_key(lod_manifest, normalized_excluded_source_keys)
+    normalized_excluded_ib_hashes = {str(value).lower() for value in (excluded_ib_hashes or set()) if str(value)}
+    cache_key = _lod_point_cloud_cache_key(lod_manifest, normalized_excluded_ib_hashes)
     cached = _POINT_CLOUD_CACHE.get(cache_key)
     if cached is not None:
         return cached
     frameanalysis_dir = str(lod_manifest.get("frameanalysis_dir", "") or "")
     points: list[WeightedPoint] = []
     lod_records: dict[str, dict] = {}
-    skipped_same_source_count = 0
+    skipped_main_hash_count = 0
     for candidate in lod_manifest.get("candidate_ibs", []) or []:
         if not bool(candidate.get("enabled", True)):
             continue
@@ -508,14 +779,15 @@ def _build_lod_point_cloud(
             continue
         if int(candidate.get("local_bone_count", 0) or 0) <= 0:
             continue
-        source_key = _source_key_from_candidate(candidate)
-        if source_key in normalized_excluded_source_keys:
-            skipped_same_source_count += 1
+        ib_hash = str(candidate.get("ib_hash", "") or "").lower()
+        if ib_hash in normalized_excluded_ib_hashes:
+            skipped_main_hash_count += 1
             continue
+        source_key = _source_key_from_candidate(candidate)
         geometry = _load_candidate_point_geometry(candidate, frameanalysis_dir)
         points.extend(_geometry_points(geometry, _lod_weight_resolver(source_key)))
         lod_records[source_key] = _lod_record_payload(candidate, source_key)
-    result = (points, lod_records, skipped_same_source_count)
+    result = (points, lod_records, skipped_main_hash_count)
     _POINT_CLOUD_CACHE[cache_key] = result
     return result
 
@@ -556,9 +828,9 @@ def _canonical_point_cloud_cache_key(canonical_manifest: dict) -> tuple:
     )
 
 
-def _lod_point_cloud_cache_key(lod_manifest: dict, excluded_source_keys: set[str] | None = None) -> tuple:
+def _lod_point_cloud_cache_key(lod_manifest: dict, excluded_ib_hashes: set[str] | None = None) -> tuple:
     frameanalysis_dir = str(lod_manifest.get("frameanalysis_dir", "") or "")
-    normalized_excluded_source_keys = {str(value) for value in (excluded_source_keys or set()) if str(value)}
+    normalized_excluded_ib_hashes = {str(value).lower() for value in (excluded_ib_hashes or set()) if str(value)}
     records = []
     for candidate in lod_manifest.get("candidate_ibs", []) or []:
         if not bool(candidate.get("enabled", True)):
@@ -569,9 +841,10 @@ def _lod_point_cloud_cache_key(lod_manifest: dict, excluded_source_keys: set[str
             continue
         if int(candidate.get("local_bone_count", 0) or 0) <= 0:
             continue
-        source_key = _source_key_from_candidate(candidate)
-        if source_key in normalized_excluded_source_keys:
+        ib_hash = str(candidate.get("ib_hash", "") or "").lower()
+        if ib_hash in normalized_excluded_ib_hashes:
             continue
+        source_key = _source_key_from_candidate(candidate)
         records.append(
             (
                 source_key,
@@ -579,7 +852,7 @@ def _lod_point_cloud_cache_key(lod_manifest: dict, excluded_source_keys: set[str
                 _candidate_file_cache_key(candidate, frameanalysis_dir),
             )
         )
-    return ("lod", frameanalysis_dir, tuple(sorted(normalized_excluded_source_keys)), tuple(records))
+    return ("lod", frameanalysis_dir, tuple(sorted(normalized_excluded_ib_hashes)), tuple(records))
 
 
 def _candidate_file_cache_key(candidate: dict, frameanalysis_dir: str) -> tuple:

@@ -36,6 +36,44 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual(result["global_to_lod"][20]["lod_record_key"], "lod_b-6-0")
         self.assertEqual(result["global_to_lod"][20]["lod_local_bone"], 2)
 
+    def test_bone_cloud_mapping_supports_lod_local_to_multiple_globals(self):
+        canonical_points = [
+            lod_analyze.WeightedPoint((0.0, 0.0, 0.0), ((10, 1.0),)),
+            lod_analyze.WeightedPoint((0.0, 0.1, 0.0), ((11, 1.0),)),
+            lod_analyze.WeightedPoint((1.0, 0.0, 0.0), ((20, 1.0),)),
+        ]
+        lod_points = [
+            lod_analyze.WeightedPoint((0.0, 0.0, 0.0), ((("lod_a-3-0", 4), 1.0),)),
+            lod_analyze.WeightedPoint((0.0, 0.1, 0.0), ((("lod_a-3-0", 4), 1.0),)),
+            lod_analyze.WeightedPoint((1.0, 0.0, 0.0), ((("lod_b-6-0", 2), 1.0),)),
+        ]
+
+        result = lod_analyze.build_lod_bone_cloud_mapping(canonical_points, lod_points, 24)
+
+        self.assertEqual(result["global_to_lod"][10]["lod_record_key"], "lod_a-3-0")
+        self.assertEqual(result["global_to_lod"][10]["lod_local_bone"], 4)
+        self.assertEqual(result["global_to_lod"][11]["lod_record_key"], "lod_a-3-0")
+        self.assertEqual(result["global_to_lod"][11]["lod_local_bone"], 4)
+        self.assertEqual(result["global_to_lod"][20]["lod_record_key"], "lod_b-6-0")
+        self.assertEqual(result["global_to_lod"][20]["lod_local_bone"], 2)
+
+    def test_bone_cloud_mapping_keeps_small_bone_samples(self):
+        canonical_points = []
+        lod_points = []
+        for index in range(40):
+            position = (index * 0.001, 0.0, 0.0)
+            canonical_points.append(lod_analyze.WeightedPoint(position, ((254, 1.0),)))
+            lod_points.append(lod_analyze.WeightedPoint(position, ((("lod_finger-8-0", 126), 1.0),)))
+        for index in range(80):
+            position = (1.0 + index * 0.001, 0.0, 0.0)
+            canonical_points.append(lod_analyze.WeightedPoint(position, ((100, 1.0),)))
+            lod_points.append(lod_analyze.WeightedPoint(position, ((("lod_hand-8-0", 5), 1.0),)))
+
+        result = lod_analyze.build_lod_bone_cloud_mapping(canonical_points, lod_points, 300)
+
+        self.assertEqual(result["global_to_lod"][254]["lod_record_key"], "lod_finger-8-0")
+        self.assertEqual(result["global_to_lod"][254]["lod_local_bone"], 126)
+
     def test_capture_records_group_scatter_pairs_by_lod_source(self):
         lod_records = {
             "lod_a-3-0": {

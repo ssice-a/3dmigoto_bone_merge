@@ -1611,19 +1611,18 @@ This may make the affected area stiffer, but it should avoid the destructive cas
 
 ### Main To LOD Draw Linking
 
-Main and LOD IB hashes usually differ. Hash is therefore not the primary relationship key between a main part and a LOD part.
-
-If a LOD and the main part have the same IB hash, the analyzer must still validate them structurally. The safe cases are:
+Main and LOD IB hashes are expected to differ for this workflow. LOD analysis can see both the high-detail main draw and the distance LOD draw in the same FrameAnalysis folder, so the LOD candidate set must first remove every IB hash that already belongs to the built main Global Pool.
 
 ```text
-same hash + same match/index range + same IA/VB fingerprint + same local palette shape:
-  treat as the same runtime identity; no separate LOD scatter table is needed
+main_hash_set:
+  all ib_hash values from the built Global Pool
 
-same hash but different geometry, VB fingerprint, local bone count, or palette shape:
-  treat as a distinct LOD candidate and require a reliable runtime discriminator
+LOD candidate filter:
+  shadow/capture ready
+  ib_hash not in main_hash_set
 ```
 
-Reliable discriminators include `match_index_count`, first index/range where supported by the generated override pattern, VS/PS/pass role, and texture-slot evidence. If the same hash and same override filters can match two incompatible identities, generation must stop with an ambiguity diagnostic. A single runtime override must not sometimes run the main linear capture and sometimes need LOD scatter capture without a way to tell which draw it is seeing.
+If all LOD candidates are removed by this filter, generation should stop with a diagnostic instead of falling back to a same-hash self-match. Self-matching hides the real LOD source and produces incorrect scatter records.
 
 For each main source IB in the Global Pool list, build a main draw signature:
 
@@ -1649,7 +1648,7 @@ Then search each LOD FrameAnalysis for candidate LOD draws:
 2. If VS is shared, compare PS hash.
 3. If VS and PS are both shared, compare PS texture slot hashes.
 4. Use IA layout, index_count, vertex_count, bounds, and sampled mesh fingerprints as structural validation.
-5. Use IB hash only as an output identity after the relationship is resolved.
+5. Use IB hash as the runtime output identity after the relationship is resolved; it must already have passed the main-hash exclusion filter.
 ```
 
 The resolved relationship should be recorded explicitly:
@@ -1685,7 +1684,7 @@ LOD:
   part B = waist
 ```
 
-Therefore the mapper should combine all user-confirmed main Global Pool objects into one `MainSet`, and combine all resolved LOD candidate parts for the same character into one `LodSet`.
+Therefore the mapper should combine all user-confirmed main Global Pool objects into one `MainSet`, and combine all resolved LOD candidate parts for the same character into one `LodSet`. When building the LOD candidate set, any IB hash already present in `MainSet` must be filtered out. In the observed captures the same frame can contain both the high-detail main draw and the LOD draw; accepting main hashes as LOD candidates causes self-matching such as `640d1c0e -> 640d1c0e` and hides the real LOD source.
 
 ```text
 MainSet:
@@ -1701,21 +1700,20 @@ LodSet:
   position / packed normal / optional UVs
 ```
 
-The mapping algorithm should use weighted nearest-neighbor voting across the whole sets:
+The mapping algorithm should use bone-level weighted point clouds across the whole sets, not a single compressed global vertex cloud. Each canonical global bone and each `(lod_ib, lod_local_bone)` builds its own weighted sample cloud. Small bones must have a sample floor so fingers, eyelashes, hair tips, and other low-area regions are not lost during acceleration.
 
 ```text
-for each LOD vertex:
-    find K nearest MainSet vertices in object space
-    score each neighbor by:
-        distance similarity
-        optional normal similarity
-        optional UV similarity
-        part/bounds compatibility
+canonical_cloud[global_bone]:
+  sampled high-weight points affected by this canonical global bone
 
-    for each LOD local bone affecting the LOD vertex:
-        for each main global bone affecting each matched main vertex:
-            vote[lod_ib, lod_local_bone, main_global_bone] +=
-                lod_weight * main_weight * match_score
+lod_cloud[lod_ib, lod_local_bone]:
+  sampled high-weight points affected by this LOD local bone
+
+for each canonical global bone cloud:
+    query nearby LOD bone samples through a spatial grid
+    accumulate score[lod_ib, lod_local_bone, global_bone] by:
+        canonical_weight * lod_weight * distance_similarity
+    choose the strongest accepted LOD bone for that canonical global bone
 ```
 
 The result is not a one-to-one mapping. The analyzer should produce:

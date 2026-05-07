@@ -17,7 +17,7 @@ LocalPaletteRecord = models.LocalPaletteRecord
 
 
 class RuntimeIniTests(unittest.TestCase):
-    def test_sparse_capture_uses_static_local_index_table(self):
+    def test_main_capture_uses_one_static_bone_map(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
             "bone_pool_order": [
@@ -46,16 +46,17 @@ class RuntimeIniTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette])
-            indices_path = runtime["buffers"]["capture_local_indices"]["file_path"]
-            meta_path = runtime["buffers"]["capture_meta"]["file_path"]
+            map_path = runtime["buffers"]["main_capture_bone_map"]["file_path"]
 
-            self.assertEqual((2, 52, 248), _read_uints(indices_path))
-            self.assertEqual((10, 3, 0, 0), _read_uints(meta_path))
+            self.assertEqual(
+                (1, 8, 3, 0, 0, 3, 3, 0, 2, 10, 52, 11, 248, 12),
+                _read_uints(map_path),
+            )
 
             ini_text = ini_export.build_bonestore_ini_content(runtime)
             self.assertNotIn("ResourceBoneMeta", ini_text)
-            self.assertIn("ResourceMainCaptureRecords", ini_text)
-            self.assertIn("ResourceMainCaptureSourceLocalBones", ini_text)
+            self.assertIn("ResourceMainCaptureBoneMap", ini_text)
+            self.assertNotIn("ResourceMainCaptureSourceLocalBones", ini_text)
             self.assertIn("x100 = 0", ini_text)
             self.assertIn("x101 = 3", ini_text)
 
@@ -91,13 +92,16 @@ class RuntimeIniTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [])
-            self.assertEqual((0, 2, 1, 0), _read_uints(runtime["buffers"]["lod_capture_meta"]["file_path"]))
-            self.assertEqual((0, 0, 0, 1), _read_uints(runtime["buffers"]["lod_capture_pairs"]["file_path"]))
+            self.assertEqual(
+                (1, 8, 2, 1, 0, 2, 1, 1, 0, 0, 0, 1),
+                _read_uints(runtime["buffers"]["lod_capture_bone_map"]["file_path"]),
+            )
 
             ini_text = ini_export.build_bonestore_ini_content(runtime)
             self.assertIn("hash = 87654321", ini_text)
             self.assertIn("match_first_index = 5", ini_text)
             self.assertIn("run = CustomShader_RecordBonesScatter", ini_text)
+            self.assertIn("ResourceLodCaptureBoneMap", ini_text)
             self.assertIn("hash = bbbbbbbbbbbbbbbb", ini_text)
 
     def test_export_rejects_capture_unavailable_global_groups(self):

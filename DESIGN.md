@@ -86,22 +86,32 @@ w = reserved
 
 `source_index_count` stays in the offline manifest as a validation and ordering field. It must not be passed to runtime shaders unless a future shader genuinely needs it.
 
-Do not generate one INI `ResourceBoneMeta_*` section per IB. Per-IB INI resources make the runtime config noisy and were a failed older design. Capture metadata should be materialized into compact static buffer files:
+Do not generate one INI `ResourceBoneMeta_*` section per IB. Per-IB INI resources make the runtime config noisy and were a failed older design. Main capture metadata and source-local to global mapping should be materialized into one compact static buffer file:
 
 ```text
-Buffer/MainCaptureRecords.buf
-Buffer/MainCaptureSourceLocalBones.buf
+Buffer/MainCaptureBoneMap.buf
 ```
 
-The static main capture record format should be:
+The static main capture map format is:
 
 ```text
-uint4 MainCaptureRecords[N]
+uint MainCaptureBoneMap[]
 
-x = capture_store_base
-y = source_local_bone_count
-z = source_local_bone_base in MainCaptureSourceLocalBones
-w = reserved
+header:
+  x = record_count
+  y = pair_table_uint_base
+  z = total_pair_count
+  w = flags/reserved
+
+record:
+  x = pair_base
+  y = pair_count
+  z = source_bone_count
+  w = flags/reserved
+
+pair:
+  x = source_local_bone
+  y = target_global_bone
 ```
 
 At runtime, the `TextureOverride` hash and `if vs == ...` filter select the capture draw, and `x100` selects the compact capture record inside the static table.
@@ -239,10 +249,8 @@ The other fields are offline validation, sorting, diagnostics, and INI matching 
   "max_local_bone_count": 256,
   "global_previous_row_offset": 100000,
   "local_previous_row_offset": 1024,
-  "main_capture_records_path": "Buffer/MainCaptureRecords.buf",
-  "main_capture_source_local_bones_path": "Buffer/MainCaptureSourceLocalBones.buf",
-  "lod_capture_records_path": "Buffer/LodCaptureRecords.buf",
-  "lod_capture_scatter_pairs_path": "Buffer/LodCaptureScatterPairs.buf",
+  "main_capture_bone_map_path": "Buffer/MainCaptureBoneMap.buf",
+  "lod_capture_bone_map_path": "Buffer/LodCaptureBoneMap.buf",
   "global_bone_store_rows": 101263,
   "local_bone_store_rows": 1795
 }
@@ -341,8 +349,7 @@ Capture pass:
 ```ini
 if vs == <capture_filter>
   run = CustomShader_ExtractCB1
-  cs-t2 = ResourceMainCaptureRecords
-  cs-t3 = ResourceMainCaptureSourceLocalBones
+  cs-t2 = ResourceMainCaptureBoneMap
   run = CustomShader_RecordBones
 endif
 ```
@@ -416,30 +423,30 @@ Future optimization should target reducing draw-time CS count:
 
 Runtime data should be table-driven and generated offline.
 
-### MainCaptureRecords
+### MainCaptureBoneMap
 
 ```text
-Buffer/MainCaptureRecords.buf
-uint4 MainCaptureRecords[N]
+Buffer/MainCaptureBoneMap.buf
+uint MainCaptureBoneMap[]
 
-x = capture_store_base
-y = source_local_bone_count
-z = source_local_bone_base in MainCaptureSourceLocalBones
-w = reserved
+header uint4:
+  x = record_count
+  y = pair_table_uint_base
+  z = total_pair_count
+  w = flags/reserved
+
+record uint4:
+  x = pair_base
+  y = pair_count
+  z = source_bone_count
+  w = flags/reserved
+
+pair uint2:
+  x = source_local_bone
+  y = target_global_bone
 ```
 
-`x100` selects the record. `cs-t2` binds `ResourceMainCaptureRecords`.
-
-### MainCaptureSourceLocalBones
-
-```text
-Buffer/MainCaptureSourceLocalBones.buf
-uint MainCaptureSourceLocalBones[K]
-
-MainCaptureSourceLocalBones[base + i] = source_local_bone_index
-```
-
-`cs-t3` binds this source-local bone index table. It exists because the source IB's useful local bones can be sparse.
+`x100` selects the record. `cs-t2` binds `ResourceMainCaptureBoneMap`. Main capture normally stores direct pairs such as `local 0 -> global_base + 0`, while LOD capture uses the same pair shape in a separate LOD file.
 
 ### LocalToGlobalBoneMap
 
@@ -739,7 +746,7 @@ Build Global Bone Pool creates:
 ```text
 used source local bone -> compact global bone
 capture records sorted by capture availability, then match_index_count descending
-MainCaptureRecords / global pool manifest entries
+MainCaptureBoneMap / global pool manifest entries
 the single export root collection, if missing
 empty export child collections for accepted candidates, with unavailable markers for no-shadow mappings
 ```
@@ -1160,7 +1167,7 @@ The global bone index and capture-store index have the same meaning in HLSL. Exp
 }
 ```
 
-The inline `pairs` array is for diagnostics and project portability. The generated runtime should materialize it into compact static buffers such as `LodCaptureRecords.buf` and `LodCaptureScatterPairs.buf`.
+The inline `pairs` array is for diagnostics and project portability. The generated runtime should materialize it into a compact static `LodCaptureBoneMap.buf` when LOD is enabled.
 
 #### lod_mapping
 
@@ -1720,19 +1727,24 @@ LOD capture uses scatter writes into the canonical global bone pool. It must wri
 Suggested runtime resources:
 
 ```text
-Buffer/LodCaptureRecords.buf
-uint4 LodCaptureRecords[N]
+Buffer/LodCaptureBoneMap.buf
+uint LodCaptureBoneMap[]
 
-x = pair_base
-y = pair_count
-z = lod_local_bone_count
-w = flags/reserved
+header uint4:
+  x = record_count
+  y = pair_table_uint_base
+  z = total_pair_count
+  w = flags/reserved
 
-Buffer/LodCaptureScatterPairs.buf
-uint2 LodCaptureScatterPairs[K]
+record uint4:
+  x = pair_base
+  y = pair_count
+  z = lod_local_bone_count
+  w = flags/reserved
 
-x = lod_local_bone
-y = canonical_global_bone
+pair uint2:
+  x = lod_local_bone
+  y = canonical_global_bone
 ```
 
 Main capture remains linear or manifest-ordered:
@@ -1744,7 +1756,7 @@ main local bone -> canonical global bone
 LOD capture uses scatter:
 
 ```text
-for pair in LodCaptureScatterPairs[pair_base : pair_base + pair_count]:
+for pair in LodCaptureBoneMap[record.pair_base : record.pair_base + record.pair_count]:
     global_current[pair.canonical_global_bone] =
         native_lod_t0_current[pair.lod_local_bone]
 
@@ -1783,8 +1795,7 @@ TextureOverride LOD capture:
   hash = lod_ib_hash
   match_index_count = lod_match_index_count
   if vs == expected_lod_capture_vs:
-      bind LodCaptureRecords
-      bind LodCaptureScatterPairs
+      bind LodCaptureBoneMap
       bind native vs-t0
       dispatch RecordBonesScatter
 ```
@@ -1952,7 +1963,7 @@ Build the plugin as a vertical slice instead of trying to finish every feature a
 6. Export buffer package:
    R32 IB, true-layout VB writers, per-part palette files, debug export manifest, auto-split for >256 local bones.
 7. Static runtime buffers:
-   MainCaptureRecords, MainCaptureSourceLocalBones, LocalToGlobalBoneMap, LOD scatter tables, global/local current and previous matrix stores.
+   MainCaptureBoneMap, LocalToGlobalBoneMap, optional LodCaptureBoneMap, global/local current and previous matrix stores.
 8. INI generation:
    capture overrides, gather/replay overrides, texture hash overrides, delayed shadow replay plan.
 9. LOD analysis and scatter capture:

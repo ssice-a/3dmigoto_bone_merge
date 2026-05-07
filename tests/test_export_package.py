@@ -303,16 +303,16 @@ class ExportPackageTests(unittest.TestCase):
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Index.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Position.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Blend.buf").exists())
-            self.assertTrue((buffer_dir / "MainCaptureRecords.buf").exists())
-            self.assertTrue((buffer_dir / "MainCaptureSourceLocalBones.buf").exists())
-            self.assertTrue((buffer_dir / "LodCaptureRecords.buf").exists())
-            self.assertTrue((buffer_dir / "LodCaptureScatterPairs.buf").exists())
+            self.assertTrue((buffer_dir / "MainCaptureBoneMap.buf").exists())
+            self.assertFalse((buffer_dir / "MainCaptureRecords.buf").exists())
+            self.assertFalse((buffer_dir / "MainCaptureSourceLocalBones.buf").exists())
+            self.assertFalse((buffer_dir / "LodCaptureBoneMap.buf").exists())
             self.assertFalse((Path(tmpdir) / "BoneStore.ini").exists())
             self.assertFalse((Path(tmpdir) / "hlsl").exists())
 
             export_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertIn("runtime", export_manifest)
-            self.assertIn("capture_meta", export_manifest["runtime"]["buffers"])
+            self.assertIn("main_capture_bone_map", export_manifest["runtime"]["buffers"])
             self.assertEqual(
                 struct.unpack("<3I", (buffer_dir / "640d1c0e-46845-0_part00-Index.buf").read_bytes()),
                 (0, 2, 1),

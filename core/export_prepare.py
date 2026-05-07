@@ -13,7 +13,7 @@ from ..constants import (
     EXPORT_MANIFEST_FILE_NAME,
 )
 from .hlsl_assets import export_required_hlsl
-from .ini_export import build_bonestore_namespace, materialize_bonestore_runtime, write_bonestore_ini
+from .ini_export import materialize_bonestore_runtime, write_bonestore_ini
 from .io import ensure_directory, read_json, write_json
 from .models import LocalPaletteRecord
 from .export_buffers import write_part_geometry_buffers
@@ -74,7 +74,7 @@ def prepare_export_collection(
         "export_source_collection": source_collection.name,
         "export_collection": source_collection.name,
         "buffer_dir": buffer_dir,
-        "bonestore_namespace": build_bonestore_namespace(normalized_output_dir),
+        "bonestore_namespace": "",
         "palettes": palette_records,
         "geometry_buffers": geometry_records,
         "objects": object_records,
@@ -185,6 +185,7 @@ def regenerate_bonestore_runtime_files(
     elif normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
         export_manifest = read_json(normalized_export_manifest_path)
     geometry_records = list(export_manifest.get("geometry_buffers", []) or []) if isinstance(export_manifest, dict) else []
+    _attach_object_names_to_geometry_records(geometry_records, list(export_manifest.get("objects", []) or []))
     runtime_plan = materialize_bonestore_runtime(output_dir, manifest, palette_records, geometry_records)
     ini_path = write_bonestore_ini(output_dir, runtime_plan) if write_ini else ""
 
@@ -197,6 +198,7 @@ def regenerate_bonestore_runtime_files(
             "capture_records": list(runtime_plan.get("capture_records", []) or []),
             "lod_capture_records": list(runtime_plan.get("lod_capture_records", []) or []),
             "lod_replay_links": list(runtime_plan.get("lod_replay_links", []) or []),
+            "lod_key_annotations": list(runtime_plan.get("lod_key_annotations", []) or []),
             "geometry": list(runtime_plan.get("geometry", []) or []),
             "shadow_stage": dict(runtime_plan.get("shadow_stage", {}) or {}),
             "shadow_replay_plan": dict(runtime_plan.get("shadow_replay_plan", {}) or {}),
@@ -205,6 +207,39 @@ def regenerate_bonestore_runtime_files(
         }
         write_json(normalized_export_manifest_path, export_manifest)
     return ini_path
+
+
+def _attach_object_names_to_geometry_records(geometry_records: list[dict], object_records: list[dict]) -> None:
+    names_by_part: dict[tuple[str, int, int, int], list[str]] = {}
+    for object_record in object_records:
+        key = (
+            str(object_record.get("host_ib_hash", "") or object_record.get("ib_hash", "") or "").lower(),
+            int(object_record.get("host_match_first_index", object_record.get("match_first_index", 0)) or 0),
+            int(object_record.get("host_match_index_count", object_record.get("match_index_count", 0)) or 0),
+            int(object_record.get("part_index", object_record.get("chunk_index", 0)) or 0),
+        )
+        object_name = str(object_record.get("object", object_record.get("object_name", "")) or "").strip()
+        if not key[0] or key[2] <= 0 or not object_name:
+            continue
+        bucket = names_by_part.setdefault(key, [])
+        if object_name not in bucket:
+            bucket.append(object_name)
+
+    if not names_by_part:
+        return
+
+    for geometry_record in geometry_records:
+        if geometry_record.get("object_names"):
+            continue
+        key = (
+            str(geometry_record.get("ib_hash", "") or "").lower(),
+            int(geometry_record.get("match_first_index", 0) or 0),
+            int(geometry_record.get("match_index_count", 0) or 0),
+            int(geometry_record.get("part_index", geometry_record.get("chunk_index", 0)) or 0),
+        )
+        names = names_by_part.get(key)
+        if names:
+            geometry_record["object_names"] = list(names)
 
 
 def _local_palette_record_from_export_record(record: dict) -> LocalPaletteRecord:

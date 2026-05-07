@@ -60,6 +60,58 @@ class LodAnalyzeTests(unittest.TestCase):
             [(4, 10), (4, 11)],
         )
 
+    def test_lod_links_drop_sparse_noise_sources(self):
+        main_records = [
+            {
+                "source_key": "main_body-100-0",
+                "ib_hash": "main_body",
+                "match_first_index": 0,
+                "match_index_count": 100,
+                "global_bone_base": 100,
+                "local_bone_count": 33,
+            },
+            {
+                "source_key": "main_hair-200-0",
+                "ib_hash": "main_hair",
+                "match_first_index": 0,
+                "match_index_count": 200,
+                "global_bone_base": 200,
+                "local_bone_count": 8,
+            },
+        ]
+        lod_records = {
+            "lod_sparse-1-0": {
+                "lod_record_key": "lod_sparse-1-0",
+                "lod_ib_hash": "lod_sparse",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 1,
+            },
+            "lod_hair-2-0": {
+                "lod_record_key": "lod_hair-2-0",
+                "lod_ib_hash": "lod_hair",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 2,
+            },
+        }
+        global_to_lod = {
+            100: {"lod_record_key": "lod_sparse-1-0", "lod_local_bone": 0, "score": 1.0, "votes": 4},
+            101: {"lod_record_key": "lod_sparse-1-0", "lod_local_bone": 1, "score": 1.0, "votes": 4},
+            102: {"lod_record_key": "lod_sparse-1-0", "lod_local_bone": 2, "score": 1.0, "votes": 4},
+            200: {"lod_record_key": "lod_hair-2-0", "lod_local_bone": 0, "score": 1.0, "votes": 4},
+            201: {"lod_record_key": "lod_hair-2-0", "lod_local_bone": 1, "score": 1.0, "votes": 4},
+            202: {"lod_record_key": "lod_hair-2-0", "lod_local_bone": 2, "score": 1.0, "votes": 4},
+            203: {"lod_record_key": "lod_hair-2-0", "lod_local_bone": 3, "score": 1.0, "votes": 4},
+        }
+
+        links = lod_analyze._build_lod_links(main_records, lod_records, global_to_lod)
+
+        self.assertEqual(links[0]["source_key"], "main_body-100-0")
+        self.assertEqual(links[0]["status"], "unmatched")
+        self.assertEqual(links[0]["lod_sources"], [])
+        self.assertEqual(links[1]["source_key"], "main_hair-200-0")
+        self.assertEqual(links[1]["status"], "matched")
+        self.assertEqual(links[1]["lod_sources"][0]["lod_record_key"], "lod_hair-2-0")
+
     def test_review_blocks_when_global_pool_is_not_filled(self):
         manifest = {
             "bone_pool_order": [

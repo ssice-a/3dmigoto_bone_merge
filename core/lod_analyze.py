@@ -30,6 +30,8 @@ from .spatial_index import (
 _WEIGHT_EPSILON = 1.0e-5
 _MIN_PAIR_SCORE = 0.001
 _TARGET_MATCH_POINT_COUNT = 25000
+_MIN_LOD_LINK_COVERAGE_RATIO = 0.15
+_MIN_LOD_LINK_GLOBALS = 4
 
 
 @dataclass(frozen=True)
@@ -64,9 +66,17 @@ def analyze_lod_for_manifest(
     if not canonical_manifest.get("bone_pool_order"):
         raise ValueError("Build Global Bone Pool before Analyze LOD")
 
-    lod_manifest = _analyze_main_frameanalysis_cached(normalized_lod_dir)
     main_points, canonical_global_count, main_records = _build_canonical_point_cloud(canonical_manifest)
-    lod_points, lod_records = _build_lod_point_cloud(lod_manifest)
+    lod_manifest = _analyze_main_frameanalysis_cached(normalized_lod_dir)
+    canonical_source_keys = {str(record.get("source_key", "") or "") for record in main_records}
+    lod_points, lod_records, skipped_same_source_count = _build_lod_point_cloud(
+        lod_manifest,
+        excluded_source_keys=canonical_source_keys,
+    )
+    fallback_used = False
+    if not lod_points and canonical_source_keys:
+        lod_points, lod_records, skipped_same_source_count = _build_lod_point_cloud(lod_manifest)
+        fallback_used = True
     if not main_points:
         raise ValueError("No canonical weighted point cloud could be built from the main manifest")
     if not lod_points:
@@ -85,6 +95,15 @@ def analyze_lod_for_manifest(
     variant_id = _build_lod_variant_id(normalized_lod_dir, capture_records)
     generated_at = datetime.now(timezone.utc).isoformat()
     validation = list(mapping["validation"])
+    if fallback_used:
+        validation.append(
+            {
+                "severity": "warning",
+                "code": "lod_same_source_fallback",
+                "message": "LOD analysis fell back to same-key candidates because no different LOD capture candidates were available.",
+                "draw_indices": [],
+            }
+        )
     validation.extend(review["validation"])
     validation.extend(
         {
@@ -109,6 +128,7 @@ def analyze_lod_for_manifest(
                 "match_tolerance": float(mapping["match_tolerance"]),
                 "matched_vertex_count": int(mapping["matched_vertex_count"]),
                 "lod_vertex_count": int(len(lod_points)),
+                "skipped_same_source_lod_candidate_count": int(skipped_same_source_count),
                 "canonical_match_point_count": int(mapping["canonical_match_point_count"]),
                 "lod_match_point_count": int(mapping["lod_match_point_count"]),
                 "shadow_stage": dict(lod_manifest.get("shadow_stage", {}) or {}),
@@ -465,14 +485,20 @@ def _build_canonical_point_cloud(canonical_manifest: dict) -> tuple[list[Weighte
     return result
 
 
-def _build_lod_point_cloud(lod_manifest: dict) -> tuple[list[WeightedPoint], dict[str, dict]]:
-    cache_key = _lod_point_cloud_cache_key(lod_manifest)
+def _build_lod_point_cloud(
+    lod_manifest: dict,
+    *,
+    excluded_source_keys: set[str] | None = None,
+) -> tuple[list[WeightedPoint], dict[str, dict], int]:
+    normalized_excluded_source_keys = {str(value) for value in (excluded_source_keys or set()) if str(value)}
+    cache_key = _lod_point_cloud_cache_key(lod_manifest, normalized_excluded_source_keys)
     cached = _POINT_CLOUD_CACHE.get(cache_key)
     if cached is not None:
         return cached
     frameanalysis_dir = str(lod_manifest.get("frameanalysis_dir", "") or "")
     points: list[WeightedPoint] = []
     lod_records: dict[str, dict] = {}
+    skipped_same_source_count = 0
     for candidate in lod_manifest.get("candidate_ibs", []) or []:
         if not bool(candidate.get("enabled", True)):
             continue
@@ -483,10 +509,13 @@ def _build_lod_point_cloud(lod_manifest: dict) -> tuple[list[WeightedPoint], dic
         if int(candidate.get("local_bone_count", 0) or 0) <= 0:
             continue
         source_key = _source_key_from_candidate(candidate)
+        if source_key in normalized_excluded_source_keys:
+            skipped_same_source_count += 1
+            continue
         geometry = _load_candidate_point_geometry(candidate, frameanalysis_dir)
         points.extend(_geometry_points(geometry, _lod_weight_resolver(source_key)))
         lod_records[source_key] = _lod_record_payload(candidate, source_key)
-    result = (points, lod_records)
+    result = (points, lod_records, skipped_same_source_count)
     _POINT_CLOUD_CACHE[cache_key] = result
     return result
 
@@ -527,8 +556,9 @@ def _canonical_point_cloud_cache_key(canonical_manifest: dict) -> tuple:
     )
 
 
-def _lod_point_cloud_cache_key(lod_manifest: dict) -> tuple:
+def _lod_point_cloud_cache_key(lod_manifest: dict, excluded_source_keys: set[str] | None = None) -> tuple:
     frameanalysis_dir = str(lod_manifest.get("frameanalysis_dir", "") or "")
+    normalized_excluded_source_keys = {str(value) for value in (excluded_source_keys or set()) if str(value)}
     records = []
     for candidate in lod_manifest.get("candidate_ibs", []) or []:
         if not bool(candidate.get("enabled", True)):
@@ -539,14 +569,17 @@ def _lod_point_cloud_cache_key(lod_manifest: dict) -> tuple:
             continue
         if int(candidate.get("local_bone_count", 0) or 0) <= 0:
             continue
+        source_key = _source_key_from_candidate(candidate)
+        if source_key in normalized_excluded_source_keys:
+            continue
         records.append(
             (
-                _source_key_from_candidate(candidate),
+                source_key,
                 int(candidate.get("local_bone_count", 0) or 0),
                 _candidate_file_cache_key(candidate, frameanalysis_dir),
             )
         )
-    return ("lod", frameanalysis_dir, tuple(records))
+    return ("lod", frameanalysis_dir, tuple(sorted(normalized_excluded_source_keys)), tuple(records))
 
 
 def _candidate_file_cache_key(candidate: dict, frameanalysis_dir: str) -> tuple:
@@ -883,6 +916,8 @@ def _build_lod_links(main_records: list[dict], lod_records: dict[str, dict], glo
             continue
         lod_sources = []
         for lod_key, bucket in sorted(by_lod.items(), key=lambda item: (-int(item[1]["mapped_global_count"]), -float(item[1]["score"]), item[0])):
+            if int(bucket["mapped_global_count"]) < _minimum_lod_link_global_count(count):
+                continue
             lod_record = lod_records.get(lod_key, {})
             lod_sources.append(
                 {
@@ -895,8 +930,15 @@ def _build_lod_links(main_records: list[dict], lod_records: dict[str, dict], glo
                     "votes": int(bucket["votes"]),
                 }
             )
-        links.append({**main_record, "lod_sources": lod_sources, "status": "matched"})
+        links.append({**main_record, "lod_sources": lod_sources, "status": "matched" if lod_sources else "unmatched"})
     return links
+
+
+def _minimum_lod_link_global_count(local_bone_count: int) -> int:
+    count = max(0, int(local_bone_count))
+    if count <= 0:
+        return 1
+    return min(count, max(_MIN_LOD_LINK_GLOBALS, math.ceil(count * _MIN_LOD_LINK_COVERAGE_RATIO)))
 
 
 def _lod_record_payload(candidate: dict, source_key: str) -> dict:

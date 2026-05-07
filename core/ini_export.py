@@ -5,14 +5,12 @@ from __future__ import annotations
 import os
 import re
 import struct
-import zlib
 
 from ..constants import BONESTORE_INI_FILE_NAME, BUFFER_EXPORT_DIR_NAME
 from .io import ensure_directory, write_uint32_buffer
 from .models import LocalPaletteRecord
 
 
-_SAFE_NAMESPACE_RE = re.compile(r"[^0-9A-Za-z_]+")
 _SAFE_SUFFIX_RE = re.compile(r"[^0-9A-Za-z_]+")
 
 _MAIN_CAPTURE_BONE_MAP_FILE = "MainCaptureBoneMap.buf"
@@ -28,14 +26,6 @@ _GLOBAL_BONE_POOL_ROWS_PER_SLOT = 200000
 _LOCAL_BONE_POOL_ROWS_PER_SLOT = 2048
 _CB1_ROWS = 4096
 _RUNTIME_STATE_ROWS = 64
-
-
-def build_bonestore_namespace(output_directory: str) -> str:
-    normalized_output_directory = os.path.abspath(output_directory)
-    base_name = os.path.basename(normalized_output_directory.rstrip("\\/")) or "BoneStore"
-    safe_base_name = _SAFE_NAMESPACE_RE.sub("_", base_name).strip("_") or "BoneStore"
-    checksum = zlib.crc32(normalized_output_directory.lower().encode("utf-8")) & 0xFFFFFFFF
-    return f"BMC\\{safe_base_name}_{checksum:08x}"
 
 
 def materialize_bonestore_runtime(
@@ -55,6 +45,7 @@ def materialize_bonestore_runtime(
     geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
     _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
     lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
+    lod_key_annotations = _build_lod_key_annotations(capture_manifest, geometry_payloads)
     shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
     lod_shadow_replay_plan = _build_lod_shadow_replay_plan(capture_manifest, geometry_payloads, lod_replay_links)
     if _shadow_plan_needs_white_texture(shadow_replay_plan) or _shadow_plan_needs_white_texture(lod_shadow_replay_plan):
@@ -88,12 +79,13 @@ def materialize_bonestore_runtime(
 
     return {
         "schema_version": 2,
-        "namespace": build_bonestore_namespace(normalized_output_dir),
+        "namespace": "",
         "global_bone_count": _global_bone_count(capture_manifest),
         "shadow_vs_hashes": _runtime_shadow_vs_hashes(capture_manifest),
         "capture_records": capture_records,
         "lod_capture_records": lod_records,
         "lod_replay_links": lod_replay_links,
+        "lod_key_annotations": lod_key_annotations,
         "palettes": palette_records,
         "geometry": geometry_payloads,
         "shadow_stage": _normalize_shadow_stage(capture_manifest),
@@ -113,10 +105,6 @@ def write_bonestore_ini(output_directory: str, runtime_plan: dict) -> str:
 
 def build_bonestore_ini_content(runtime_plan: dict) -> str:
     lines: list[str] = []
-    namespace = str(runtime_plan.get("namespace", "") or "")
-    if namespace:
-        lines.append(f"namespace = {namespace}")
-        lines.append("")
 
     lines.extend(
         [
@@ -305,6 +293,7 @@ def _normalize_geometry_records(output_directory: str, geometry_records: list[di
             {
                 "region_collection": str(record.get("region_collection", "") or ""),
                 "part_name": str(record.get("part_name", f"part{part_index:02d}") or f"part{part_index:02d}"),
+                "object_names": _normalize_object_names(record),
                 "ib_hash": ib_hash,
                 "match_first_index": match_first_index,
                 "match_index_count": match_index_count,
@@ -317,6 +306,21 @@ def _normalize_geometry_records(output_directory: str, geometry_records: list[di
             }
         )
     return normalized_records
+
+
+def _normalize_object_names(record: dict) -> list[str]:
+    raw_names = record.get("object_names", [])
+    if not raw_names:
+        raw_names = record.get("objects", [])
+    if not raw_names:
+        raw_name = record.get("object_name", "")
+        raw_names = [raw_name] if raw_name else []
+    names: list[str] = []
+    for raw_name in raw_names or []:
+        name = str(raw_name or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def _normalize_shadow_stage(capture_manifest: dict) -> dict:
@@ -416,6 +420,44 @@ def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]
         links_by_lod_key[key]
         for key in sorted(links_by_lod_key)
         if links_by_lod_key[key].get("geometry_suffixes")
+    ]
+
+
+def _build_lod_key_annotations(capture_manifest: dict, geometry_records: list[dict]) -> list[dict]:
+    geometry_by_key = _geometry_records_by_key(geometry_records)
+    annotations_by_lod_key: dict[tuple[str, int, int], dict] = {}
+
+    for link in capture_manifest.get("lod_links", []) or []:
+        main_key = _main_key_from_lod_link(dict(link or {}))
+        if not _is_valid_override_key(main_key):
+            continue
+        main_payload = _key_payload(main_key)
+        geometry_suffixes = [
+            str(record.get("resource_suffix", "") or "")
+            for record in geometry_by_key.get(main_key, []) or []
+            if str(record.get("resource_suffix", "") or "")
+        ]
+        for source in link.get("lod_sources", []) or []:
+            lod_key = _lod_key_from_source(dict(source or {}))
+            if not _is_valid_override_key(lod_key):
+                continue
+            bucket = annotations_by_lod_key.setdefault(
+                lod_key,
+                {
+                    "lod_key": _key_payload(lod_key),
+                    "main_keys": [],
+                    "geometry_suffixes": [],
+                },
+            )
+            _append_unique_payload(bucket["main_keys"], main_payload)
+            for suffix in geometry_suffixes:
+                if suffix not in bucket["geometry_suffixes"]:
+                    bucket["geometry_suffixes"].append(suffix)
+
+    return [
+        annotations_by_lod_key[key]
+        for key in sorted(annotations_by_lod_key)
+        if annotations_by_lod_key[key].get("main_keys")
     ]
 
 
@@ -916,6 +958,9 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
     for host_key, plan in zip(shadow_host_keys, shadow_plans):
         if host_key is not None:
             shadow_hosts_by_key.setdefault(host_key, []).append(plan)
+    lod_role_keys = _lod_texture_override_keys(capture_by_key, lod_geometry_by_key, lod_shadow_plan)
+    main_role_keys = _main_texture_override_keys(capture_by_key, geometry_by_key, shadow_plan)
+    lod_annotations_by_key = _lod_annotations_by_key(runtime_plan)
 
     all_keys_set = set(capture_by_key).union(geometry_by_key).union(lod_geometry_by_key)
     all_keys_set.update(shadow_hosts_by_key)
@@ -935,13 +980,23 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
         )
         ib_hash, match_first_index, match_index_count = key
         suffix = _safe_suffix(f"{ib_hash}_{match_index_count}_{match_first_index}")
+        section_name = _texture_override_section_name(
+            suffix,
+            has_lod=key in lod_role_keys,
+            has_main=key in main_role_keys,
+        )
+        lod_hash_annotation = _lod_hash_line_annotation(lod_annotations_by_key.get(key))
         lines.extend(
             [
-                f"[TextureOverride_BMC_{suffix}]",
+                section_name,
+            ]
+        )
+        if lod_hash_annotation:
+            lines.append(f"; {lod_hash_annotation}")
+        lines.extend(
+            [
                 f"hash = {ib_hash}",
-                f"match_first_index = {match_first_index}",
                 f"match_index_count = {match_index_count}",
-                "match_priority = -500",
             ]
         )
         if grouped_records.get("main") or grouped_records.get("lod"):
@@ -955,7 +1010,6 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
                 lines.extend(
                     [
                         f"  x100 = {record_index}",
-                        "  x102 = 0",
                         "  cs-t2 = ResourceMainCaptureBoneMap",
                         "  run = CustomShader_RecordBones",
                     ]
@@ -964,7 +1018,6 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
                 lines.extend(
                     [
                         f"  x100 = {record_index}",
-                        "  x102 = 0",
                         "  cs-t2 = ResourceLodCaptureBoneMap",
                         "  run = CustomShader_RecordBones",
                     ]
@@ -991,6 +1044,78 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
     if lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+def _lod_texture_override_keys(
+    capture_by_key: dict[tuple[str, int, int], dict[str, list[int]]],
+    lod_geometry_by_key: dict[tuple[str, int, int], list[dict]],
+    lod_shadow_plan: dict,
+) -> set[tuple[str, int, int]]:
+    keys = {
+        key
+        for key, grouped_records in capture_by_key.items()
+        if grouped_records.get("lod")
+    }
+    keys.update(lod_geometry_by_key)
+    host_key = _shadow_plan_host_key(lod_shadow_plan)
+    if host_key is not None:
+        keys.add(host_key)
+    keys.update(_shadow_plan_skip_keys(lod_shadow_plan))
+    return keys
+
+
+def _main_texture_override_keys(
+    capture_by_key: dict[tuple[str, int, int], dict[str, list[int]]],
+    geometry_by_key: dict[tuple[str, int, int], list[dict]],
+    shadow_plan: dict,
+) -> set[tuple[str, int, int]]:
+    keys = {
+        key
+        for key, grouped_records in capture_by_key.items()
+        if grouped_records.get("main")
+    }
+    keys.update(geometry_by_key)
+    host_key = _shadow_plan_host_key(shadow_plan)
+    if host_key is not None:
+        keys.add(host_key)
+    keys.update(_shadow_plan_skip_keys(shadow_plan))
+    return keys
+
+
+def _texture_override_section_name(suffix: str, *, has_lod: bool, has_main: bool) -> str:
+    role_suffix = ""
+    if has_lod and has_main:
+        role_suffix = "_MAIN_LOD"
+    elif has_lod:
+        role_suffix = "_LOD"
+    return f"[TextureOverride_BMC_{suffix}{role_suffix}]"
+
+
+def _lod_annotations_by_key(runtime_plan: dict) -> dict[tuple[str, int, int], dict]:
+    annotations: dict[tuple[str, int, int], dict] = {}
+    for annotation in runtime_plan.get("lod_key_annotations", []) or []:
+        key = _key_from_payload(dict(annotation.get("lod_key", {}) or {}))
+        if _is_valid_override_key(key):
+            annotations[key] = dict(annotation)
+    return annotations
+
+
+def _lod_hash_line_annotation(annotation: dict | None) -> str:
+    if not annotation:
+        return ""
+
+    main_labels = [
+        _hash_label(_key_from_payload(dict(payload or {})))
+        for payload in annotation.get("main_keys", []) or []
+        if _is_valid_override_key(_key_from_payload(dict(payload or {})))
+    ]
+    if main_labels:
+        return "main:" + ",".join(main_labels)
+    return ""
+
+
+def _hash_label(key: tuple[str, int, int]) -> str:
+    return str(key[0])
 
 
 def _visible_replay_lines(geometry_records: list[dict]) -> list[str]:
@@ -1053,8 +1178,18 @@ def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
     if vb0:
         lines.append(f"{indent}vb3 = {vb0.get('resource_name')}")
     index_count = int(record.get("index_count", 0) or 0)
+    object_comment = _blender_object_comment(record)
+    if object_comment:
+        lines.append(f"{indent}; Blender objects: {object_comment}")
     lines.append(f"{indent}drawindexedinstanced = {index_count},INSTANCE_COUNT,0,0,FIRST_INSTANCE")
     return lines
+
+
+def _blender_object_comment(record: dict) -> str:
+    names = _normalize_object_names(record)
+    if not names:
+        return ""
+    return ", ".join(name.replace("\n", " ").replace("\r", " ") for name in names)
 
 
 def _local_bone_count_for_resource_suffix(record: dict) -> int:

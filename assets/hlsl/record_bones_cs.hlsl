@@ -7,8 +7,6 @@
 // u2 = RuntimeState
 //
 // x100 = capture record index
-// x102 = capture sequence flags: bit0 begin, bit1 end
-// x103 = native capture instance slot, defaults to 0
 
 #include "bone_store_common.hlsli"
 
@@ -20,30 +18,10 @@ Texture1D<float4> IniParams : register(t120);
 RWStructuredBuffer<uint4> GlobalBonePool_UAV : register(u1);
 RWStructuredBuffer<uint4> RuntimeState_UAV : register(u2);
 
-void EnsureCaptureSlot(uint flags)
+void EnsureCaptureSlot()
 {
     uint4 header = RuntimeState_UAV[BMC_STATE_HEADER];
-    uint active_slot = header.y;
-
-    if ((flags & BMC_CAPTURE_SEQUENCE_BEGIN) != 0)
-    {
-        uint next_slot = (active_slot == BMC_INVALID_SLOT || header.z == 0) ? 0 : active_slot + 1;
-        if (next_slot < BMC_MAX_INSTANCE_SLOTS)
-        {
-            header.y = next_slot;
-            header.z = max(header.z, next_slot + 1);
-            RuntimeState_UAV[BMC_STATE_HEADER] = header;
-            RuntimeState_UAV[BMC_STATE_SLOT_BASE + next_slot] = uint4(0, header.x, 0, 0);
-        }
-        else
-        {
-            header.w |= BMC_STATE_OVERFLOW_FLAG;
-            RuntimeState_UAV[BMC_STATE_HEADER] = header;
-        }
-        return;
-    }
-
-    if (active_slot == BMC_INVALID_SLOT || header.z == 0)
+    if (header.y == BMC_INVALID_SLOT || header.z == 0)
     {
         header.y = 0;
         header.z = max(header.z, 1);
@@ -56,11 +34,10 @@ void EnsureCaptureSlot(uint flags)
 void main(uint3 tid : SV_DispatchThreadID)
 {
     uint record_index = BMC_INI_PARAM_UINT(IniParams, BMC_CAPTURE_RECORD_INIPARAM);
-    uint flags = BMC_INI_PARAM_UINT(IniParams, BMC_CAPTURE_SEQUENCE_FLAGS_INIPARAM);
 
     if (tid.x == 0)
     {
-        EnsureCaptureSlot(flags);
+        EnsureCaptureSlot();
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -82,7 +59,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     uint pair_count = CaptureBoneMap[record_base + 1];
     uint rows_to_copy = pair_count * BMC_BONE_ROWS;
 
-    uint native_slot = BMC_INI_PARAM_UINT(IniParams, BMC_NATIVE_CAPTURE_INSTANCE_SLOT_INIPARAM);
+    uint native_slot = 0;
     uint native_cb1_bone_row = native_slot * BMC_CB1_INSTANCE_STRIDE + BMC_CB1_BONE_BASE_ROW;
     uint src_current_base = DumpedCB1[native_cb1_bone_row].x;
     uint src_previous_base = DumpedCB1[native_cb1_bone_row].y;
@@ -107,7 +84,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     GroupMemoryBarrierWithGroupSync();
 
-    if (tid.x == 0 && (((flags & BMC_CAPTURE_SEQUENCE_END) != 0) || flags == 0))
+    if (tid.x == 0)
     {
         RuntimeState_UAV[BMC_STATE_SLOT_BASE + slot] = uint4(1, RuntimeState_UAV[BMC_STATE_HEADER].x, 0, 0);
     }

@@ -18,11 +18,6 @@ static const uint BMC_LOCAL_SLOT_ROW_STRIDE = 2048;
 
 static const uint BMC_CAPTURE_RECORD_INIPARAM = 100;
 static const uint BMC_LOCAL_BONE_COUNT_INIPARAM = 101;
-static const uint BMC_CAPTURE_SEQUENCE_FLAGS_INIPARAM = 102;
-static const uint BMC_NATIVE_CAPTURE_INSTANCE_SLOT_INIPARAM = 103;
-
-static const uint BMC_CAPTURE_SEQUENCE_BEGIN = 1;
-static const uint BMC_CAPTURE_SEQUENCE_END = 2;
 
 static const uint BMC_CAPTURE_MAP_HEADER_UINTS = 4;
 static const uint BMC_CAPTURE_RECORD_STRIDE = 4;

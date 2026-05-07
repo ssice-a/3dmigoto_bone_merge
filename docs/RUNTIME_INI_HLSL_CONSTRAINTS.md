@@ -26,9 +26,9 @@ logic. HLSL can and should be kept in separate shader files, but all generated
 3Dmigoto resources, overrides, draw orchestration, and frame reset hooks live in
 the single generated `BoneStore.ini`.
 
-3Dmigoto namespaces resource names per loaded INI by default. Explicit
-`namespace = BMC\<mod>_<crc>` should still be generated because it makes logs
-stable and cross-INI references unambiguous.
+Do not emit an explicit `namespace = ...` line. 3Dmigoto keeps resources from
+separate loaded INIs isolated for this use case, and an explicit namespace adds
+noise without helping the generated runtime.
 
 Two separate generated INIs may reuse short resource names such as:
 
@@ -39,7 +39,8 @@ Two separate generated INIs may reuse short resource names such as:
 [ResourceMainCaptureBoneMap]
 ```
 
-They do not collide unless the INIs explicitly share the same namespace.
+They do not collide in normal generated output because the generator does not
+opt into a shared explicit namespace.
 
 `ShaderOverride` and `TextureOverride` hash matching still participates in the
 global 3Dmigoto override system. Resource isolation does not prevent two mods
@@ -176,16 +177,18 @@ use record N from the currently bound capture map
 The alternative, one capture-map buffer per IB, was rejected because it creates
 too many resources and makes the INI noisier.
 
-`x102` is reserved for capture sequence flags:
+`x102` is reserved for future capture sequence flags. It must not be emitted or
+read while the generator cannot prove the multi-instance capture sequence:
 
 ```text
 bit 0 = begin capture sequence
 bit 1 = end capture sequence
 ```
 
-When `x102 = 0`, `RecordBones` uses the single-instance fast path and writes
-slot 0. Multi-instance generation should set begin/end only after the analyzer
-has verified that the capture sequence order matches replay instance slots.
+The current generated `RecordBones` shader does not read `x102`; it always uses
+slot 0. Multi-instance generation should reintroduce begin/end only after the
+analyzer has verified that the capture sequence order matches replay instance
+slots.
 
 ## Capture Map Buffer Contract
 

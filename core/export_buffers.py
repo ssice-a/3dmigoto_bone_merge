@@ -99,6 +99,7 @@ def _write_part_geometry_buffers(buffer_dir: str, part: ExportPartPlan, vertex_l
     return {
         "region_collection": part.region.collection_name,
         "part_name": part.part_name,
+        "object_names": [usage.name for usage in part.object_usages],
         "ib_hash": part.region.ib_hash,
         "match_first_index": int(part.region.match_first_index),
         "match_index_count": int(part.region.match_index_count),

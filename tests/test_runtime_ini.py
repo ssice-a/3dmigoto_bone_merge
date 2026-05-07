@@ -54,6 +54,9 @@ class RuntimeIniTests(unittest.TestCase):
             )
 
             ini_text = ini_export.build_bonestore_ini_content(runtime)
+            self.assertNotIn("namespace =", ini_text)
+            self.assertNotIn("match_priority", ini_text)
+            self.assertNotIn("x102", ini_text)
             self.assertNotIn("ResourceBoneMeta", ini_text)
             self.assertIn("ResourceMainCaptureBoneMap", ini_text)
             self.assertNotIn("ResourceMainCaptureSourceLocalBones", ini_text)
@@ -100,7 +103,8 @@ class RuntimeIniTests(unittest.TestCase):
 
             ini_text = ini_export.build_bonestore_ini_content(runtime)
             self.assertIn("hash = 87654321", ini_text)
-            self.assertIn("match_first_index = 5", ini_text)
+            self.assertIn("[TextureOverride_BMC_87654321_77_5_LOD]", ini_text)
+            self.assertNotIn("match_first_index = 5", ini_text)
             self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", ini_text)
             self.assertIn("run = CustomShader_RecordBones", ini_text)
             self.assertNotIn("CustomShader_RecordBonesScatter", ini_text)
@@ -170,7 +174,7 @@ class RuntimeIniTests(unittest.TestCase):
                 tmpdir,
                 manifest,
                 [palette],
-                [_geometry_record("aaaaaaaa", 10, 0, 6)],
+                [_geometry_record("aaaaaaaa", 10, 0, 6, object_names=["body_mesh"])],
             )
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
@@ -190,17 +194,32 @@ class RuntimeIniTests(unittest.TestCase):
             ],
             runtime["lod_replay_links"],
         )
+        self.assertEqual(
+            [
+                {
+                    "lod_key": {"ib_hash": "bbbbbbbb", "match_first_index": 5, "match_index_count": 20},
+                    "main_keys": [{"ib_hash": "aaaaaaaa", "match_first_index": 0, "match_index_count": 10}],
+                    "geometry_suffixes": ["aaaaaaaa_10_0_part00"],
+                }
+            ],
+            runtime["lod_key_annotations"],
+        )
         lod_section = ini_text[
-            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_5]") :
+            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_5_LOD]") :
             ini_text.index("[Present]")
         ]
         self.assertIn("hash = bbbbbbbb", lod_section)
+        self.assertIn("; main:aaaaaaaa\nhash = bbbbbbbb", lod_section)
+        self.assertNotIn("hash = bbbbbbbb ;", lod_section)
+        self.assertNotIn("LOD maps to main", lod_section)
+        self.assertNotIn("LOD replay exported", lod_section)
         self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", lod_section)
         self.assertIn("if vs != 200", lod_section)
         self.assertIn("; replay aaaaaaaa_10_0_part00", lod_section)
         self.assertIn("ResourcePart_aaaaaaaa_10_0_part00_Index", lod_section)
         self.assertIn("ResourcePartLocalToGlobalBoneMap_aaaaaaaa_10_0_part00", lod_section)
         self.assertNotIn("ResourcePart_bbbbbbbb_20_5_part00_Index", lod_section)
+        self.assertIn("; Blender objects: body_mesh\n  drawindexedinstanced", lod_section)
 
     def test_lod_shadow_replay_skips_lod_hash_and_draws_main_geometry(self):
         manifest = {
@@ -279,7 +298,7 @@ class RuntimeIniTests(unittest.TestCase):
                 tmpdir,
                 manifest,
                 [palette],
-                [_geometry_record("aaaaaaaa", 10, 0, 6)],
+                [_geometry_record("aaaaaaaa", 10, 0, 6, object_names=["shadow_body"])],
             )
             ini_text = ini_export.build_bonestore_ini_content(runtime)
             self.assertTrue((Path(tmpdir) / "Texture" / "white.dds").exists())
@@ -290,14 +309,16 @@ class RuntimeIniTests(unittest.TestCase):
             runtime["lod_shadow_replay_plan"]["skip_keys"],
         )
         lod_section = ini_text[
-            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_5]") :
+            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_5_LOD]") :
             ini_text.index("[Present]")
         ]
         self.assertIn("if vs == 200", lod_section)
+        self.assertIn("; main:aaaaaaaa\nhash = bbbbbbbb", lod_section)
         self.assertIn("  handling = skip", lod_section)
         self.assertIn("  ps-t0 = ResourceBMCWhiteShadow", lod_section)
         self.assertIn("; delayed normal shadow replay", lod_section)
         self.assertIn("; replay aaaaaaaa_10_0_part00", lod_section)
+        self.assertIn("; Blender objects: shadow_body", lod_section)
 
     def test_generated_ini_uses_single_lifecycle_commandlist_only(self):
         manifest = {
@@ -606,9 +627,16 @@ def _read_uints(path: str) -> tuple[int, ...]:
     return struct.unpack("<" + "I" * (len(data) // 4), data)
 
 
-def _geometry_record(ib_hash: str, match_index_count: int, match_first_index: int, index_count: int) -> dict:
+def _geometry_record(
+    ib_hash: str,
+    match_index_count: int,
+    match_first_index: int,
+    index_count: int,
+    object_names: list[str] | None = None,
+) -> dict:
     key = f"{ib_hash}-{match_index_count}-{match_first_index}_part00"
     return {
+        "object_names": list(object_names or []),
         "ib_hash": ib_hash,
         "match_first_index": match_first_index,
         "match_index_count": match_index_count,

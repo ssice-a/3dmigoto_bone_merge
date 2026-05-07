@@ -7,7 +7,6 @@ import os
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import floor
 
 from .import_candidates import (
     _load_slot_slice,
@@ -21,6 +20,11 @@ from .import_candidates import (
 )
 from .main_analyze import analyze_main_frameanalysis
 from .main_analyze import _parse_buffer_header
+from .spatial_index import (
+    build_spatial_hash as _generic_build_spatial_hash,
+    cell_key as _generic_cell_key,
+    neighbor_keys as _generic_neighbor_keys,
+)
 
 
 _WEIGHT_EPSILON = 1.0e-5
@@ -788,23 +792,15 @@ def _nearest_point(position: tuple[float, float, float], spatial_hash: dict, tol
 
 
 def _build_spatial_hash(points: list[WeightedPoint], tolerance: float) -> dict[tuple[int, int, int], list[WeightedPoint]]:
-    spatial_hash: dict[tuple[int, int, int], list[WeightedPoint]] = {}
-    for point in points:
-        spatial_hash.setdefault(_cell_key(point.position, tolerance), []).append(point)
-    return spatial_hash
+    return _generic_build_spatial_hash(points, lambda point: point.position, tolerance)
 
 
 def _cell_key(position: tuple[float, float, float], tolerance: float) -> tuple[int, int, int]:
-    inverse = 1.0 / max(tolerance, 1.0e-6)
-    return floor(position[0] * inverse), floor(position[1] * inverse), floor(position[2] * inverse)
+    return _generic_cell_key(position, tolerance)
 
 
 def _neighbor_keys(base_key: tuple[int, int, int]):
-    base_x, base_y, base_z = base_key
-    for offset_x in (-1, 0, 1):
-        for offset_y in (-1, 0, 1):
-            for offset_z in (-1, 0, 1):
-                yield base_x + offset_x, base_y + offset_y, base_z + offset_z
+    yield from _generic_neighbor_keys(base_key)
 
 
 def _initial_match_tolerance(canonical_points: list[WeightedPoint], lod_points: list[WeightedPoint]) -> float:

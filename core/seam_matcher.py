@@ -3,7 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import floor
+
+from .spatial_index import (
+    build_spatial_hash as _generic_build_spatial_hash,
+    cell_key as _generic_cell_key,
+    expanded_neighbor_cell_keys as _generic_expanded_neighbor_cell_keys,
+    neighbor_keys as _generic_neighbor_keys,
+)
+
+try:
+    from mathutils import Vector as _MathutilsVector
+except Exception:
+    _MathutilsVector = None
 
 
 _MATCH_TOLERANCE = 0.0015
@@ -12,6 +23,7 @@ _MIN_VERTEX_PAIRS = 4
 _MIN_MAPPING_VOTES = 3
 _MAX_AVERAGE_DISTANCE = 0.001
 _OBJECT_BBOX_GAP_TOLERANCE = 0.01
+_GROUP_BBOX_GAP_TOLERANCE = 0.003
 _WEIGHT_EPSILON = 1.0e-8
 _WEIGHT_FLOOR = 1.0e-4
 
@@ -94,17 +106,22 @@ def build_seam_mapping(mesh_objects) -> SeamBuildResult:
     candidate_edges: list[dict] = []
     tested_pairs = 0
 
-    for source_name, source_cache, target_name, target_cache in _iter_bbox_candidate_pairs(
+    for source_name, source_cache, target_name, target_cache, allowed_group_pairs in _iter_bbox_candidate_pairs(
         caches,
         object_names,
         _OBJECT_BBOX_GAP_TOLERANCE,
     ):
         tested_pairs += 1
+        source_vertices, source_spatial_hash, target_vertices, target_spatial_hash = _pair_vertices_for_allowed_groups(
+            source_cache,
+            target_cache,
+            allowed_group_pairs,
+        )
         matched_pairs = _build_vertex_pairs(
-            source_cache["seam_vertices"],
-            source_cache["spatial_hash"],
-            target_cache["seam_vertices"],
-            target_cache["spatial_hash"],
+            source_vertices,
+            source_spatial_hash,
+            target_vertices,
+            target_spatial_hash,
             _MATCH_TOLERANCE,
         )
         if len(matched_pairs) < _MIN_VERTEX_PAIRS:
@@ -115,6 +132,7 @@ def build_seam_mapping(mesh_objects) -> SeamBuildResult:
             target_cache["weight_items_by_vertex"],
             matched_pairs,
             _WEIGHT_TOLERANCE,
+            allowed_group_pairs,
         )
         for candidate in candidates:
             source_group = int(candidate["group_a"])
@@ -230,13 +248,40 @@ def _build_seam_cache(mesh_obj) -> dict | None:
     ]
     if len(weighted_seam_vertices) < _MIN_VERTEX_PAIRS:
         return None
+    spatial_hash = _build_spatial_hash(weighted_seam_vertices, _MATCH_TOLERANCE)
+    cell_keys = frozenset(spatial_hash)
+    group_clouds = _build_group_clouds(weighted_seam_vertices, weight_items_by_vertex)
     return {
         "seam_vertices": weighted_seam_vertices,
-        "spatial_hash": _build_spatial_hash(weighted_seam_vertices, _MATCH_TOLERANCE),
+        "spatial_hash": spatial_hash,
+        "cell_keys": cell_keys,
+        "neighbor_cell_keys": _expanded_neighbor_cell_keys(cell_keys),
+        "group_clouds": group_clouds,
         "bounds_min": _bounds_min(weighted_seam_vertices),
         "bounds_max": _bounds_max(weighted_seam_vertices),
         "weight_items_by_vertex": weight_items_by_vertex,
     }
+
+
+def _build_group_clouds(weighted_seam_vertices, weight_items_by_vertex) -> dict[int, dict]:
+    points_by_group: dict[int, list[tuple[int, tuple[float, float, float]]]] = {}
+    for vertex_index, world_co in weighted_seam_vertices:
+        for group_number, _weight in weight_items_by_vertex.get(vertex_index, ()):
+            points_by_group.setdefault(int(group_number), []).append((vertex_index, world_co))
+
+    clouds: dict[int, dict] = {}
+    for group_number, points in points_by_group.items():
+        if len(points) < _MIN_VERTEX_PAIRS:
+            continue
+        cell_keys = frozenset(_cell_key(world_co, _MATCH_TOLERANCE) for _vertex_index, world_co in points)
+        clouds[int(group_number)] = {
+            "points": tuple(points),
+            "bounds_min": _bounds_min(points),
+            "bounds_max": _bounds_max(points),
+            "cell_keys": cell_keys,
+            "neighbor_cell_keys": _expanded_neighbor_cell_keys(cell_keys),
+        }
+    return clouds
 
 
 def _build_group_index_to_number_map(mesh_obj) -> dict[int, int]:
@@ -272,14 +317,21 @@ def _resolve_boundary_vertex_indices(mesh_obj):
     edge_face_counts = {}
     for polygon in mesh.polygons:
         for edge_key in polygon.edge_keys:
-            edge_face_counts[tuple(sorted(edge_key))] = edge_face_counts.get(tuple(sorted(edge_key)), 0) + 1
+            normalized_edge_key = _normalized_edge_key(edge_key)
+            edge_face_counts[normalized_edge_key] = edge_face_counts.get(normalized_edge_key, 0) + 1
 
     boundary_indices = set()
     for edge in mesh.edges:
-        edge_key = tuple(sorted(edge.vertices))
+        edge_key = _normalized_edge_key(edge.vertices)
         if edge.is_loose or edge_face_counts.get(edge_key, 0) == 1:
             boundary_indices.update(edge.vertices)
     return boundary_indices
+
+
+def _normalized_edge_key(edge_vertices) -> tuple[int, int]:
+    left = int(edge_vertices[0])
+    right = int(edge_vertices[1])
+    return (left, right) if left <= right else (right, left)
 
 
 def _build_sorted_vertex_weight_cache(mesh_obj, vertex_indices: set[int], group_index_to_number: dict[int, int]):
@@ -311,14 +363,35 @@ def _sorted_weight_items(weight_map: dict[int, float]):
     return tuple(filtered_items)
 
 
-def _build_mapping_candidates_from_seams(source_weight_items_by_vertex, target_weight_items_by_vertex, matched_pairs, weight_tolerance):
+def _build_mapping_candidates_from_seams(
+    source_weight_items_by_vertex,
+    target_weight_items_by_vertex,
+    matched_pairs,
+    weight_tolerance,
+    allowed_group_pairs,
+):
+    allowed_group_pairs = _allowed_group_pairs_from_matched_seams(
+        source_weight_items_by_vertex,
+        target_weight_items_by_vertex,
+        matched_pairs,
+        allowed_group_pairs,
+    )
+    if not allowed_group_pairs:
+        return []
     candidate_stats = {}
     for source_index, target_index, pair_distance in matched_pairs:
         source_items = source_weight_items_by_vertex.get(source_index, ())
         target_items = target_weight_items_by_vertex.get(target_index, ())
         if not source_items or not target_items:
             continue
-        _accumulate_mapping_candidates(candidate_stats, source_items, target_items, weight_tolerance, pair_distance)
+        _accumulate_mapping_candidates(
+            candidate_stats,
+            source_items,
+            target_items,
+            weight_tolerance,
+            pair_distance,
+            allowed_group_pairs,
+        )
 
     candidates = []
     for (group_a, group_b), stats in candidate_stats.items():
@@ -352,7 +425,28 @@ def _build_mapping_candidates_from_seams(source_weight_items_by_vertex, target_w
     return mappings
 
 
-def _accumulate_mapping_candidates(candidate_stats, source_items, target_items, weight_tolerance, pair_distance):
+def _allowed_group_pairs_from_matched_seams(
+    source_weight_items_by_vertex,
+    target_weight_items_by_vertex,
+    matched_pairs,
+    allowed_group_pairs,
+):
+    pair_counts: dict[tuple[int, int], int] = {}
+    for source_index, target_index, _pair_distance in matched_pairs:
+        for source_group, _source_weight in source_weight_items_by_vertex.get(source_index, ()):
+            for target_group, _target_weight in target_weight_items_by_vertex.get(target_index, ()):
+                pair = (int(source_group), int(target_group))
+                if pair not in allowed_group_pairs:
+                    continue
+                pair_counts[pair] = pair_counts.get(pair, 0) + 1
+    return {
+        pair
+        for pair, count in pair_counts.items()
+        if count >= _MIN_MAPPING_VOTES
+    }
+
+
+def _accumulate_mapping_candidates(candidate_stats, source_items, target_items, weight_tolerance, pair_distance, allowed_group_pairs):
     used_target_indices = set()
     for source_group, source_weight in source_items:
         best_match_index = None
@@ -360,6 +454,8 @@ def _accumulate_mapping_candidates(candidate_stats, source_items, target_items, 
         best_match_group = None
         for target_index, (target_group, target_weight) in enumerate(target_items):
             if target_index in used_target_indices:
+                continue
+            if (int(source_group), int(target_group)) not in allowed_group_pairs:
                 continue
             difference = abs(source_weight - target_weight)
             if difference > weight_tolerance:
@@ -464,27 +560,19 @@ def _build_pair_summaries(aliases: list[SeamAliasRecord]) -> list[str]:
 
 
 def _cell_key(world_co, tolerance):
-    inverse_tolerance = 1.0 / tolerance
-    return (
-        floor(world_co[0] * inverse_tolerance),
-        floor(world_co[1] * inverse_tolerance),
-        floor(world_co[2] * inverse_tolerance),
-    )
+    return _generic_cell_key(world_co, tolerance)
 
 
 def _neighbor_keys(base_key):
-    base_x, base_y, base_z = base_key
-    for offset_x in (-1, 0, 1):
-        for offset_y in (-1, 0, 1):
-            for offset_z in (-1, 0, 1):
-                yield (base_x + offset_x, base_y + offset_y, base_z + offset_z)
+    yield from _generic_neighbor_keys(base_key)
 
 
 def _build_spatial_hash(vertices, tolerance):
-    spatial_hash = {}
-    for vertex_index, world_co in vertices:
-        spatial_hash.setdefault(_cell_key(world_co, tolerance), []).append((vertex_index, world_co))
-    return spatial_hash
+    return _generic_build_spatial_hash(vertices, lambda item: item[1], tolerance)
+
+
+def _expanded_neighbor_cell_keys(cell_keys):
+    return _generic_expanded_neighbor_cell_keys(cell_keys)
 
 
 def _mesh_objects_with_bbox_neighbors(mesh_objects: list, max_gap: float) -> list:
@@ -529,13 +617,18 @@ def _object_bounds_world(mesh_obj):
 
 
 def _transform_point(matrix, point):
+    if _MathutilsVector is not None and isinstance(point, (tuple, list)):
+        try:
+            return matrix @ _MathutilsVector(point)
+        except Exception:
+            return point
     try:
         return matrix @ point
     except TypeError:
+        if _MathutilsVector is None:
+            return point
         try:
-            from mathutils import Vector
-
-            return matrix @ Vector(point)
+            return matrix @ _MathutilsVector(point)
         except Exception:
             return point
 
@@ -559,7 +652,63 @@ def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: f
                 max_gap,
             ):
                 continue
-            yield source_name, source_cache, target_name, target_cache
+            if source_cache["neighbor_cell_keys"].isdisjoint(target_cache["cell_keys"]):
+                continue
+            allowed_group_pairs = _allowed_group_pairs_from_group_clouds(
+                source_cache["group_clouds"],
+                target_cache["group_clouds"],
+            )
+            if not allowed_group_pairs:
+                continue
+            yield source_name, source_cache, target_name, target_cache, allowed_group_pairs
+
+
+def _allowed_group_pairs_from_group_clouds(source_group_clouds: dict[int, dict], target_group_clouds: dict[int, dict]) -> set[tuple[int, int]]:
+    if not source_group_clouds or not target_group_clouds:
+        return set()
+    allowed: set[tuple[int, int]] = set()
+    target_items = sorted(
+        target_group_clouds.items(),
+        key=lambda item: (item[1]["bounds_min"][0], item[1]["bounds_max"][0], int(item[0])),
+    )
+    for source_group, source_cloud in sorted(source_group_clouds.items()):
+        source_max_x = float(source_cloud["bounds_max"][0]) + _GROUP_BBOX_GAP_TOLERANCE
+        for target_group, target_cloud in target_items:
+            if float(target_cloud["bounds_min"][0]) > source_max_x:
+                break
+            if not _bounds_overlap_with_gap(
+                source_cloud["bounds_min"],
+                source_cloud["bounds_max"],
+                target_cloud["bounds_min"],
+                target_cloud["bounds_max"],
+                _GROUP_BBOX_GAP_TOLERANCE,
+            ):
+                continue
+            if source_cloud["neighbor_cell_keys"].isdisjoint(target_cloud["cell_keys"]):
+                continue
+            allowed.add((int(source_group), int(target_group)))
+    return allowed
+
+
+def _pair_vertices_for_allowed_groups(source_cache: dict, target_cache: dict, allowed_group_pairs: set[tuple[int, int]]):
+    source_groups = {int(source_group) for source_group, _target_group in allowed_group_pairs}
+    target_groups = {int(target_group) for _source_group, target_group in allowed_group_pairs}
+    source_vertices = _vertices_for_groups(source_cache["group_clouds"], source_groups)
+    target_vertices = _vertices_for_groups(target_cache["group_clouds"], target_groups)
+    source_spatial_hash = _build_spatial_hash(source_vertices, _MATCH_TOLERANCE)
+    target_spatial_hash = _build_spatial_hash(target_vertices, _MATCH_TOLERANCE)
+    return source_vertices, source_spatial_hash, target_vertices, target_spatial_hash
+
+
+def _vertices_for_groups(group_clouds: dict[int, dict], groups: set[int]):
+    by_vertex: dict[int, tuple[int, tuple[float, float, float]]] = {}
+    for group in groups:
+        cloud = group_clouds.get(int(group))
+        if not cloud:
+            continue
+        for vertex_index, world_co in cloud["points"]:
+            by_vertex.setdefault(int(vertex_index), (int(vertex_index), world_co))
+    return sorted(by_vertex.values(), key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
 
 
 def _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance):
@@ -586,7 +735,17 @@ def _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance):
 
 def _build_vertex_pairs(source_vertices, source_spatial_hash, target_vertices, target_spatial_hash, tolerance):
     source_to_target = _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance)
-    target_to_source = _build_nearest_vertex_map(target_vertices, source_spatial_hash, tolerance)
+    if len(source_to_target) < _MIN_VERTEX_PAIRS:
+        return []
+    candidate_target_indices = {target_index for target_index, _distance in source_to_target.values()}
+    target_candidates = [
+        (target_index, target_world_co)
+        for target_index, target_world_co in target_vertices
+        if target_index in candidate_target_indices
+    ]
+    if len(target_candidates) < _MIN_VERTEX_PAIRS:
+        return []
+    target_to_source = _build_nearest_vertex_map(target_candidates, source_spatial_hash, tolerance)
     matched_pairs = []
     for source_index, (target_index, distance) in source_to_target.items():
         reverse = target_to_source.get(target_index)

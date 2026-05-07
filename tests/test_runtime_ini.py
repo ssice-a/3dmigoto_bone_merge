@@ -39,7 +39,7 @@ class RuntimeIniTests(unittest.TestCase):
             chunk_index=0,
             local_bone_count=3,
             palette_values=(10, 11, 12),
-            file_name="12345678-42-0-LocalToGlobalBoneMap.buf",
+            file_name="12345678-42-0-PartLocalToGlobalBoneMap.buf",
             file_path="",
             resource_suffix="12345678_42_0",
         )
@@ -124,7 +124,7 @@ class RuntimeIniTests(unittest.TestCase):
             chunk_index=0,
             local_bone_count=1,
             palette_values=(1,),
-            file_name="bad-LocalToGlobalBoneMap.buf",
+            file_name="bad-PartLocalToGlobalBoneMap.buf",
             file_path="",
             resource_suffix="bad",
         )

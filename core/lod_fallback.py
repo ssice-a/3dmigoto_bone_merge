@@ -5,19 +5,24 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 
-from ..constants import BMC_EXPORT_PALETTE_PROP
+from ..constants import BI4_MAX_BONE_COUNT, BMC_EXPORT_PALETTE_PROP
+from .export_package import build_export_plan
 
 _WEIGHT_EPSILON = 1.0e-6
 
 
-def preview_lod_fallbacks_for_export(export_collection, manifest: dict) -> dict:
+def preview_lod_fallbacks_for_export(export_collection, manifest: dict, *, use_export_plan: bool = False) -> dict:
     """Build non-mutating fallback suggestions for unmatched LOD globals used by export meshes."""
 
     mapping_entries = list(manifest.get("lod_mapping", []) or [])
     if not mapping_entries:
         return _empty_preview("no_lod_mapping")
 
-    usage = collect_export_global_group_usage(export_collection)
+    usage = (
+        collect_planned_export_global_group_usage(export_collection)
+        if use_export_plan
+        else collect_export_global_group_usage(export_collection)
+    )
     used_globals = set(usage["used_global_bones"])
     unmatched_required = find_unmatched_required_lod_globals(manifest)
     unmatched_used = sorted(used_globals & unmatched_required)
@@ -139,11 +144,33 @@ def apply_lod_fallbacks_to_manifest(manifest: dict, preview: dict) -> dict:
 
 
 def collect_export_global_group_usage(export_collection) -> dict:
+    return _collect_global_group_usage_from_meshes(_iter_mesh_objects_recursive(export_collection))
+
+
+def collect_planned_export_global_group_usage(export_collection) -> dict:
+    plan = build_export_plan(
+        export_collection,
+        _collect_used_global_groups_for_mesh,
+        max_bones_per_part=BI4_MAX_BONE_COUNT,
+    )
+    mesh_objects = []
+    seen_names: set[str] = set()
+    for part in plan.parts:
+        for usage in part.object_usages:
+            name = str(getattr(usage.object_ref, "name", "") or "")
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            mesh_objects.append(usage.object_ref)
+    return _collect_global_group_usage_from_meshes(mesh_objects)
+
+
+def _collect_global_group_usage_from_meshes(mesh_objects) -> dict:
     assignments_by_group: dict[int, list[dict]] = defaultdict(list)
     assignments_by_vertex: dict[tuple[str, int], list[tuple[int, float]]] = defaultdict(list)
     object_names_by_group: dict[int, set[str]] = defaultdict(set)
 
-    for mesh_obj in _iter_mesh_objects_recursive(export_collection):
+    for mesh_obj in mesh_objects:
         group_index_to_global = _build_group_index_to_global_map(mesh_obj)
         if not group_index_to_global:
             continue
@@ -182,6 +209,26 @@ def collect_export_global_group_usage(export_collection) -> dict:
             for (object_name, vertex_index), values in assignments_by_vertex.items()
         },
     }
+
+
+def _collect_used_global_groups_for_mesh(mesh_obj) -> set[int]:
+    return {global_group for global_group, _vertex_index, _weight in _iter_weighted_global_assignments(mesh_obj)}
+
+
+def _iter_weighted_global_assignments(mesh_obj):
+    group_index_to_global = _build_group_index_to_global_map(mesh_obj)
+    if not group_index_to_global:
+        return
+    for vertex in getattr(getattr(mesh_obj, "data", None), "vertices", []) or []:
+        vertex_index = int(getattr(vertex, "index", 0))
+        for group_element in getattr(vertex, "groups", []) or []:
+            global_group = group_index_to_global.get(int(getattr(group_element, "group", -1)))
+            if global_group is None:
+                continue
+            weight = float(getattr(group_element, "weight", 0.0))
+            if weight <= _WEIGHT_EPSILON:
+                continue
+            yield int(global_group), vertex_index, weight
 
 
 def find_unmatched_required_lod_globals(manifest: dict) -> set[int]:

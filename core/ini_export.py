@@ -219,7 +219,7 @@ def _normalize_palette_records(output_directory: str, local_palette_records: lis
             continue
         seen_suffixes.add(suffix)
         palette_values = tuple(int(value) for value in record.palette_values)
-        file_name = record.file_name or f"{suffix}-LocalToGlobalBoneMap.buf"
+        file_name = record.file_name or f"{suffix}-PartLocalToGlobalBoneMap.buf"
         file_path = record.file_path or os.path.join(buffer_dir, file_name)
         if not os.path.exists(file_path):
             write_uint32_buffer(file_path, palette_values)
@@ -448,7 +448,7 @@ def _local_palette_sections(runtime_plan: dict) -> list[str]:
         suffix = str(record.get("resource_suffix", "") or "")
         lines.extend(
             [
-                f"[ResourceLocalToGlobalBoneMap_{suffix}]",
+                f"[ResourcePartLocalToGlobalBoneMap_{suffix}]",
                 "type = Buffer",
                 "format = R32_UINT",
                 f"filename = {record.get('filename')}",
@@ -457,7 +457,7 @@ def _local_palette_sections(runtime_plan: dict) -> list[str]:
                 "; Call this before drawing the exported part that owns this local-to-global bone map.",
                 "run = CustomShader_ExtractCB1",
                 f"x101 = {int(record.get('local_bone_count', 0) or 0)}",
-                f"cs-t2 = ResourceLocalToGlobalBoneMap_{suffix}",
+                f"cs-t2 = ResourcePartLocalToGlobalBoneMap_{suffix}",
                 "run = CustomShader_GatherBones",
                 "vs-t0 = ResourceLocalFakeT0_SRV",
                 "run = CustomShader_RedirectCB1",

@@ -389,7 +389,7 @@ Consume pass:
 ```ini
 run = CustomShader_ExtractCB1
 x101 = <local_bone_count>
-cs-t2 = ResourceLocalToGlobalBoneMap_<part>
+cs-t2 = ResourcePartLocalToGlobalBoneMap_<part>
 run = CustomShader_GatherBones
 vs-t0 = ResourceLocalFakeT0_SRV
 run = CustomShader_RedirectCB1
@@ -448,16 +448,16 @@ pair uint2:
 
 `x100` selects the record. `cs-t2` binds `ResourceMainCaptureBoneMap`. Main capture normally stores direct pairs such as `local 0 -> global_base + 0`, while LOD capture uses the same pair shape in a separate LOD file.
 
-### LocalToGlobalBoneMap
+### PartLocalToGlobalBoneMap
 
 ```text
-Buffer/<region>_partNN-LocalToGlobalBoneMap.buf
-uint LocalToGlobalBoneMap[local_bone_count]
+Buffer/<region>_partNN-PartLocalToGlobalBoneMap.buf
+uint PartLocalToGlobalBoneMap[local_bone_count]
 
-LocalToGlobalBoneMap[part_local_bone] = canonical_global_bone
+PartLocalToGlobalBoneMap[part_local_bone] = canonical_global_bone
 ```
 
-Each consume command list binds the part's local-to-global map as `cs-t2`. `GatherBones` uses it to copy from the global capture store into the local fake `vs-t0`.
+Each consume command list binds the owning IB/part's local-to-global map as `cs-t2`. `GatherBones` uses it to copy from the global capture store into the local fake `vs-t0`. Different IB regions and different parts must be treated as different maps.
 
 ## Blender Interaction Layer
 
@@ -680,7 +680,7 @@ Every exported part writes a complete set of resources based on the region's `ve
 <region>_partNN-Texcoord.buf
 <region>_partNN-Blend.buf
 <region>_partNN-Index.buf
-<region>_partNN-LocalToGlobalBoneMap.buf
+<region>_partNN-PartLocalToGlobalBoneMap.buf
 ```
 
 The IB format is always:
@@ -812,7 +812,7 @@ Final Blender contract before Prepare Export:
 Object name hash: used for auto-placement only.
 Child collection: authoritative export identity.
 Visible vertex-group numbers: canonical global bone indices.
-Prepare Export: localizes evaluated mesh data into part-local indices, writes per-part LocalToGlobalBoneMap files, and materializes the runtime capture/gather resources.
+Prepare Export: localizes evaluated mesh data into part-local indices, writes per-IB/per-part PartLocalToGlobalBoneMap files, and materializes the runtime capture/gather resources.
 ```
 
 ### Import/Export/INI Rules
@@ -1339,7 +1339,7 @@ stride/slot/layout are per candidate import draw
 +8/+16 BLENDINDICES0 R8G8B8A8_UINT or R32G32B32A32_UINT
 ```
 
-`BLENDINDICES0` are source-local palette indices. They are not global bone indices. Import must decode them using the current candidate's `skin_format`, never a project-wide default. Import should keep them as local vertex groups until Apply Global Bone Pool renames or maps them. Export localizes each final part again and writes compact local indices. The per-part `LocalToGlobalBoneMap.buf` records local index -> canonical global bone.
+`BLENDINDICES0` are source-local palette indices. They are not global bone indices. Import must decode them using the current candidate's `skin_format`, never a project-wide default. Import should keep them as local vertex groups until Apply Global Bone Pool renames or maps them. Export localizes each final part again and writes compact local indices. The per-IB/per-part `PartLocalToGlobalBoneMap.buf` records local index -> canonical global bone.
 
 The source `IB` can be `DXGI_FORMAT_R16_UINT`, even if older exported mods wrote `DXGI_FORMAT_R32_UINT`. Import should record the native index format from FrameAnalysis for diagnostics, but BoneMerge export always writes `DXGI_FORMAT_R32_UINT`. This avoids vertex-count limits and keeps automatic part splitting simple.
 
@@ -1503,7 +1503,7 @@ candidate IB list
 imported source models
 canonical global pool built from enabled candidates, with capture-ready records first
 canonical global bone indices
-final export region parts and LocalToGlobalBoneMap semantics
+final export region parts and PartLocalToGlobalBoneMap semantics
 ```
 
 LOD does not change exported VB/IB resources. Exported region parts, their R32 IBs, and their
@@ -1767,7 +1767,7 @@ for pair in LodCaptureBoneMap[record.pair_base : record.pair_base + record.pair_
 The draw/consume path stays unchanged:
 
 ```text
-part local bone -> LocalToGlobalBoneMap -> canonical global bone -> local fake vs-t0
+part local bone -> PartLocalToGlobalBoneMap -> canonical global bone -> local fake vs-t0
 ```
 
 This is the key LOD contract: final replacement geometry still uses the high-detail canonical global bone semantics. LOD only changes which native source matrices fill those global slots before drawing.
@@ -1822,7 +1822,7 @@ Unmodified LOD source IBs are left on the game's original path. Modified/exporte
 5. Draw transparent shadow batches first, then bind white shadow PS resources and draw normal shadow batches.
 ```
 
-The replay host and resource bindings are LOD-stage-specific, but the replacement part resources and part-local `LocalToGlobalBoneMap` files still use canonical high-detail global bone semantics.
+The replay host and resource bindings are LOD-stage-specific, but the replacement part resources and part-local `PartLocalToGlobalBoneMap` files still use canonical high-detail global bone semantics.
 
 ## Replay Scheduling
 
@@ -1963,7 +1963,7 @@ Build the plugin as a vertical slice instead of trying to finish every feature a
 6. Export buffer package:
    R32 IB, true-layout VB writers, per-part palette files, debug export manifest, auto-split for >256 local bones.
 7. Static runtime buffers:
-   MainCaptureBoneMap, LocalToGlobalBoneMap, optional LodCaptureBoneMap, global/local current and previous matrix stores.
+   MainCaptureBoneMap, PartLocalToGlobalBoneMap, optional LodCaptureBoneMap, global/local current and previous matrix stores.
 8. INI generation:
    capture overrides, gather/replay overrides, texture hash overrides, delayed shadow replay plan.
 9. LOD analysis and scatter capture:

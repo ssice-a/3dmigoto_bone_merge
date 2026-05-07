@@ -49,7 +49,8 @@ class FakeObject(dict):
 
 
 class FakeCollection:
-    def __init__(self, objects=None, children=None):
+    def __init__(self, name="ExportRoot", objects=None, children=None):
+        self.name = name
         self.objects = list(objects or [])
         self.children = list(children or [])
 
@@ -122,6 +123,51 @@ class LodFallbackTests(unittest.TestCase):
 
         self.assertEqual(preview["unmatched_used_global_bones"], [])
         self.assertEqual(preview["unused_unmatched_global_bones"], [10])
+
+    def test_export_plan_preview_ignores_non_export_root_meshes(self):
+        export_collection = FakeCollection(
+            name="ExportRoot",
+            objects=[
+                FakeObject(
+                    "helper_not_in_region",
+                    ["10"],
+                    [FakeVertex(0, (0.0, 0.0, 0.0), [(0, 1.0)])],
+                )
+            ],
+            children=[
+                FakeCollection(
+                    name="aaaaaaaa-3-0",
+                    objects=[
+                        FakeObject(
+                            "exported",
+                            ["11"],
+                            [FakeVertex(0, (1.0, 0.0, 0.0), [(0, 1.0)])],
+                        )
+                    ],
+                )
+            ],
+        )
+        manifest = {
+            "lod_mapping": [
+                {"canonical_global_bone": 10, "status": "unmatched", "lod_local_bone": -1},
+                {
+                    "canonical_global_bone": 11,
+                    "lod_record_key": "lod_body-3-0",
+                    "lod_local_bone": 1,
+                    "status": "matched",
+                },
+            ]
+        }
+
+        raw_preview = lod_fallback.preview_lod_fallbacks_for_export(export_collection, manifest)
+        planned_preview = lod_fallback.preview_lod_fallbacks_for_export(
+            export_collection,
+            manifest,
+            use_export_plan=True,
+        )
+
+        self.assertEqual(raw_preview["unmatched_used_global_bones"], [10])
+        self.assertEqual(planned_preview["unmatched_used_global_bones"], [])
 
     def test_apply_fallback_updates_mapping_and_capture_pairs(self):
         manifest = {

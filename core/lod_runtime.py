@@ -707,7 +707,7 @@ def _effective_canonical_palettes(
                 chunk_index=0,
                 local_bone_count=len(palette_values),
                 palette_values=palette_values,
-                file_name=f"{str(part_record.ib_hash).lower()}-{int(part_record.match_index_count)}-0-LocalToGlobalBoneMap.buf",
+                file_name=f"{str(part_record.ib_hash).lower()}-{int(part_record.match_index_count)}-0-PartLocalToGlobalBoneMap.buf",
                 file_path="",
                 resource_suffix=f"{str(part_record.ib_hash).lower()}_{int(part_record.match_index_count)}_0",
             )

@@ -651,7 +651,7 @@ def _store_lod_fallback_preview_on_scene(scene, preview: dict, *, applied: bool 
 
 def _lod_export_blocking_preview(scene, manifest: dict) -> dict:
     export_collection = scene.bmc_export_collection
-    preview = preview_lod_fallbacks_for_export(export_collection, manifest)
+    preview = preview_lod_fallbacks_for_export(export_collection, manifest, use_export_plan=True)
     _store_lod_fallback_preview_on_scene(scene, preview, applied=False)
     return preview
 
@@ -2882,6 +2882,7 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
             return {"CANCELLED"}
         seam_result = None
         seam_warnings: list[str] = []
+        seam_skipped_reason = ""
         try:
             manifest = read_json(manifest_path)
             if not manifest.get("bone_pool_order") or not manifest.get("object_remaps"):
@@ -2894,10 +2895,13 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
                 manifest,
                 meshes_and_remaps,
             )
-            try:
-                seam_result = _merge_candidate_source_seam_groups(context, manifest, meshes_and_remaps)
-            except Exception as seam_exc:
-                seam_warnings.append(f"Seam merge skipped: {seam_exc}")
+            if renamed_groups > 0:
+                try:
+                    seam_result = _merge_candidate_source_seam_groups(context, manifest, meshes_and_remaps)
+                except Exception as seam_exc:
+                    seam_warnings.append(f"Seam merge skipped: {seam_exc}")
+            else:
+                seam_skipped_reason = "unchanged groups"
         except Exception as exc:
             self.report({"ERROR"}, f"Apply Global Bone Pool failed: {exc}")
             return {"CANCELLED"}
@@ -2906,6 +2910,8 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
         message += f"; global-renamed {updated_objects} object(s), {renamed_groups} group(s)"
         if seam_result is not None:
             message += f"; seam-merged {seam_result.updated_objects} object(s), {seam_result.renamed_groups} group(s)"
+        elif seam_skipped_reason:
+            message += f"; seam-skipped {seam_skipped_reason}"
         else:
             message += "; seam-merged 0 object(s), 0 group(s)"
         self.report({"INFO"}, message)
@@ -3056,7 +3062,7 @@ class BMC_OT_apply_lod_fallbacks(bpy.types.Operator):
             return {"CANCELLED"}
         try:
             manifest = read_json(manifest_path)
-            preview = preview_lod_fallbacks_for_export(scene.bmc_export_collection, manifest)
+            preview = preview_lod_fallbacks_for_export(scene.bmc_export_collection, manifest, use_export_plan=True)
             fallbacks = list(preview.get("fallbacks", []) or [])
             if not fallbacks:
                 _store_lod_fallback_preview_on_scene(scene, preview, applied=False)

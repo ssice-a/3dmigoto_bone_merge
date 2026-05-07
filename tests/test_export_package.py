@@ -126,7 +126,7 @@ class ExportPackageTests(unittest.TestCase):
         self.assertEqual(part.region.match_first_index, 0)
         self.assertEqual(part.part_name, "part00")
         self.assertEqual(part.palette_values, (0, 4, 9, 31))
-        self.assertEqual(part.palette_file_name, "640d1c0e-46845-0_part00-LocalToGlobalBoneMap.buf")
+        self.assertEqual(part.palette_file_name, "640d1c0e-46845-0_part00-PartLocalToGlobalBoneMap.buf")
 
     def test_explicit_parts_keep_independent_palettes(self):
         root = FakeCollection(
@@ -299,7 +299,7 @@ class ExportPackageTests(unittest.TestCase):
             self.assertEqual(result["bonestore_ini_path"], "")
             self.assertEqual(result["hlsl_dir"], "")
             buffer_dir = Path(tmpdir) / "Buffer"
-            self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-LocalToGlobalBoneMap.buf").exists())
+            self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-PartLocalToGlobalBoneMap.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Index.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Position.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Blend.buf").exists())

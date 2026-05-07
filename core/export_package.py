@@ -70,7 +70,7 @@ class ExportPartPlan:
 
     @property
     def palette_file_name(self) -> str:
-        return f"{self.file_stem}-LocalToGlobalBoneMap.buf"
+        return f"{self.file_stem}-PartLocalToGlobalBoneMap.buf"
 
 
 @dataclass(frozen=True)

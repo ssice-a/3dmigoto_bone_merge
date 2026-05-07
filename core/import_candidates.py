@@ -942,13 +942,14 @@ def _assign_vertex_groups(
     blend_indices: list[tuple[int, int, int, int]],
     blend_weights: list[tuple[float, float, float, float]],
 ) -> None:
-    vertex_groups = {}
+    assignments: dict[int, dict[float, list[int]]] = {}
     for vertex_index, (index_record, weight_record) in enumerate(zip(blend_indices, blend_weights)):
         for palette_index, weight in zip(index_record, weight_record):
             if weight <= 0.0:
                 continue
-            group = vertex_groups.get(int(palette_index))
-            if group is None:
-                group = imported_object.vertex_groups.new(name=str(int(palette_index)))
-                vertex_groups[int(palette_index)] = group
-            group.add([vertex_index], float(weight), "ADD")
+            assignments.setdefault(int(palette_index), {}).setdefault(float(weight), []).append(vertex_index)
+
+    for palette_index, weights_to_vertices in sorted(assignments.items()):
+        group = imported_object.vertex_groups.new(name=str(int(palette_index)))
+        for weight, vertex_indices in weights_to_vertices.items():
+            group.add(vertex_indices, float(weight), "ADD")

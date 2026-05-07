@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 import os
+import json
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from ..constants import CAPTURE_MANIFEST_FILE_NAME
 from .import_candidates import (
     _load_slot_slice,
     _read_blend_indices,
@@ -36,6 +38,8 @@ _BONE_SAMPLE_TARGET = 24
 _BONE_SAMPLE_TOP_WEIGHT_COUNT = 12
 _MIN_BONE_MATCH_SCORE = 0.01
 _MIN_BONE_MATCH_VOTES = 1
+_LOD_BONE_MATCH_TOLERANCE_SCALES = (2.0, 4.0)
+_LOD_BONE_MATCH_FALLBACK_RATIO = 0.95
 
 
 @dataclass(frozen=True)
@@ -169,7 +173,7 @@ def build_lod_scatter_mapping(
     best_stats = {}
     best_matched_count = 0
     best_tolerance = tolerance
-    for scale in (1.0, 2.0, 4.0):
+    for scale in _LOD_BONE_MATCH_TOLERANCE_SCALES:
         trial_tolerance = tolerance * scale
         stats, matched_count = _vote_lod_to_global(canonical_points, lod_points, trial_tolerance)
         if matched_count > best_matched_count or (matched_count == best_matched_count and len(stats) > len(best_stats)):
@@ -294,7 +298,7 @@ def build_lod_bone_cloud_mapping(
             best_stats = stats
             best_matched_count = matched_count
             best_tolerance = trial_tolerance
-        if matched_count >= max(1, int((canonical_global_count - len(ignored_global_bones)) * 0.98)):
+        if matched_count >= max(1, int((canonical_global_count - len(ignored_global_bones)) * _LOD_BONE_MATCH_FALLBACK_RATIO)):
             break
 
     best_by_global: dict[int, tuple[tuple[str, int], dict]] = {}
@@ -482,21 +486,30 @@ def _score_bone_clouds(
     lod_samples = [sample for samples in lod_clouds.values() for sample in samples]
     lod_hash = _generic_build_spatial_hash(lod_samples, lambda sample: sample.position, tolerance)
     tolerance_squared = tolerance * tolerance
+    inverse_tolerance = 1.0 / max(float(tolerance), 1.0e-6)
+    lod_hash_get = lod_hash.get
+    min_pair_score = _MIN_PAIR_SCORE
     stats: dict[tuple[str, int, int], dict] = {}
 
     for canonical_global, canonical_samples in canonical_clouds.items():
         for canonical_sample in canonical_samples:
             best_by_lod_bone: dict[tuple[str, int], tuple[float, float, float]] = {}
             base_key = _cell_key(canonical_sample.position, tolerance)
+            canonical_x, canonical_y, canonical_z = canonical_sample.position
+            canonical_weight = float(canonical_sample.weight)
             for cell_key in _neighbor_keys(base_key):
-                for lod_sample in lod_hash.get(cell_key, ()):
-                    distance_squared = _distance_squared(canonical_sample.position, lod_sample.position)
+                for lod_sample in lod_hash_get(cell_key, ()):
+                    lod_x, lod_y, lod_z = lod_sample.position
+                    dx = canonical_x - lod_x
+                    dy = canonical_y - lod_y
+                    dz = canonical_z - lod_z
+                    distance_squared = dx * dx + dy * dy + dz * dz
                     if distance_squared > tolerance_squared:
                         continue
                     distance = math.sqrt(distance_squared)
-                    distance_score = 1.0 / (1.0 + distance / max(tolerance, 1.0e-6))
-                    score = float(canonical_sample.weight) * float(lod_sample.weight) * distance_score
-                    if score <= _MIN_PAIR_SCORE:
+                    distance_score = 1.0 / (1.0 + distance * inverse_tolerance)
+                    score = canonical_weight * float(lod_sample.weight) * distance_score
+                    if score <= min_pair_score:
                         continue
                     lod_key = (lod_sample.lod_record_key, lod_sample.lod_local_bone)
                     current = best_by_lod_bone.get(lod_key)
@@ -534,14 +547,43 @@ def _bone_match_stats_accepted(stats: dict) -> bool:
 def _analyze_main_frameanalysis_cached(frameanalysis_dir: str) -> dict:
     normalized_dir = os.path.abspath(frameanalysis_dir)
     log_path = os.path.join(normalized_dir, "log.txt")
-    cache_key = (normalized_dir, _file_fingerprint(log_path))
+    manifest_path = os.path.join(normalized_dir, CAPTURE_MANIFEST_FILE_NAME)
+    cache_key = (normalized_dir, _file_fingerprint(log_path), _file_fingerprint(manifest_path))
     cached = _FRAMEANALYSIS_MANIFEST_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    manifest = analyze_main_frameanalysis(normalized_dir)
+    manifest = _read_existing_frameanalysis_manifest(normalized_dir, log_path, manifest_path)
+    if manifest is None:
+        manifest = analyze_main_frameanalysis(normalized_dir)
     _FRAMEANALYSIS_MANIFEST_CACHE.clear()
     _FRAMEANALYSIS_MANIFEST_CACHE[cache_key] = manifest
     return manifest
+
+
+def _read_existing_frameanalysis_manifest(normalized_dir: str, log_path: str, manifest_path: str) -> dict | None:
+    if not os.path.exists(manifest_path):
+        return None
+    try:
+        manifest_stat = os.stat(manifest_path)
+        log_stat = os.stat(log_path)
+    except OSError:
+        return None
+    if int(manifest_stat.st_mtime_ns) < int(log_stat.st_mtime_ns):
+        return None
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as file_handle:
+            payload = json.load(file_handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not isinstance(payload.get("candidate_ibs"), list) or not isinstance(payload.get("shadow_stage"), dict):
+        return None
+    payload_dir = str(payload.get("frameanalysis_dir", "") or "")
+    if payload_dir and os.path.abspath(payload_dir) != normalized_dir:
+        return None
+    payload["frameanalysis_dir"] = normalized_dir
+    return payload
 
 
 def review_lod_global_pool_coverage(canonical_manifest: dict, lod_capture_records: list[dict]) -> dict:

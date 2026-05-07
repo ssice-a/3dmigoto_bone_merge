@@ -83,6 +83,10 @@ def _write_part_geometry_buffers(buffer_dir: str, part: ExportPartPlan, vertex_l
 
     vb_records: dict[str, dict] = {}
     for slot_name, slot_layout in sorted(normalized_layout.items(), key=lambda item: item[0]):
+        if slot_name == "vb3":
+            # Runtime aliases vb3 to vb0 for this game layout, so exporting a
+            # duplicate position buffer only costs time and disk bandwidth.
+            continue
         role_name = _slot_file_role(slot_name)
         file_name = f"{part.file_stem}-{role_name}.buf"
         file_path = os.path.join(buffer_dir, file_name)

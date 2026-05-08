@@ -75,11 +75,15 @@ class _MeshExportCache:
     matrix_world_applied: bool
     vertex_position_values: list[tuple[float, float, float]] | None
     loop_normal_values: list[tuple[float, float, float]] | None
+    game_position_values: list[tuple[float, float, float]] | None
+    game_packed_normal_values: list[int] | None
     game_position_by_vertex: dict[int, tuple[float, float, float]]
     game_normal_by_loop: dict[int, tuple[float, float, float]]
     top4_by_vertex: dict[int, tuple[tuple[float, float, float, float], tuple[int, int, int, int]]]
+    top4_packed_by_vertex: dict[int, tuple[tuple[int, int, int, int], tuple[int, int, int, int]]]
     uv_layers: dict[str, object | None]
     uv_values_by_layer: dict[str, list[tuple[float, float]] | None]
+    game_uv_values_by_layer: dict[str, list[tuple[float, float]] | None]
     uv_by_layer_loop: dict[tuple[str, int], tuple[float, float]]
     attribute_refs: dict[str, object | None]
     color_attribute_refs: dict[str, object | None]
@@ -130,11 +134,15 @@ class _ExportPartCache:
                 matrix_world_applied=mesh_record.matrix_world_applied,
                 vertex_position_values=None,
                 loop_normal_values=None,
+                game_position_values=None,
+                game_packed_normal_values=None,
                 game_position_by_vertex={},
                 game_normal_by_loop={},
                 top4_by_vertex={},
+                top4_packed_by_vertex={},
                 uv_layers={},
                 uv_values_by_layer={},
+                game_uv_values_by_layer={},
                 uv_by_layer_loop={},
                 attribute_refs={},
                 color_attribute_refs={},
@@ -246,7 +254,7 @@ def _write_part_geometry_buffers(
     timings["prepare_vb"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
-    _write_prepared_vertex_slots(prepared_slots, loop_vertices, export_cache)
+    slot_timings = _write_prepared_vertex_slots(prepared_slots, loop_vertices, export_cache)
     timings["write_vb"] = time.perf_counter() - stage_start
     timings["total"] = time.perf_counter() - total_start
 
@@ -272,6 +280,7 @@ def _write_part_geometry_buffers(
             "vb_slot_count": len(prepared_slots),
         },
         "timings": {name: round(seconds, 3) for name, seconds in timings.items()},
+        "slot_timings": {name: round(seconds, 3) for name, seconds in slot_timings.items()},
     }
 
 
@@ -405,9 +414,11 @@ def _write_prepared_vertex_slots(
     prepared_slots: list[_PreparedVertexSlot],
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
-) -> None:
+) -> dict[str, float]:
+    slot_timings: dict[str, float] = {}
     for slot in prepared_slots:
-        if not _write_fast_prepared_vertex_slot(slot, loop_vertices, export_cache):
+        stage_start = time.perf_counter()
+        if not _write_specialized_vertex_slot(slot, loop_vertices, export_cache):
             for record_index, loop_vertex in enumerate(loop_vertices):
                 _write_vertex_slot_record(slot, record_index, loop_vertex, export_cache)
         directory = os.path.dirname(slot.file_path)
@@ -415,6 +426,8 @@ def _write_prepared_vertex_slots(
             os.makedirs(directory, exist_ok=True)
         with open(slot.file_path, "wb") as file_handle:
             file_handle.write(slot.output)
+        slot_timings[f"{slot.slot_name}:{slot.role_name}"] = time.perf_counter() - stage_start
+    return slot_timings
 
 
 def _write_vertex_slot_record(
@@ -469,6 +482,181 @@ def _write_fast_prepared_vertex_slot(
             else:
                 return False
     return True
+
+
+def _write_specialized_vertex_slot(
+    slot: _PreparedVertexSlot,
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    field_plans = _fast_field_plans(slot)
+    if field_plans is None:
+        return False
+    role_name = str(slot.role_name or "").lower()
+    if role_name == "blend":
+        return _write_blend_slot(slot, field_plans, loop_vertices, export_cache)
+    if role_name == "position":
+        return _write_position_slot(slot, field_plans, loop_vertices, export_cache)
+    if role_name == "texcoord":
+        return _write_texcoord_slot(slot, field_plans, loop_vertices, export_cache)
+    return _write_fast_prepared_vertex_slot(slot, loop_vertices, export_cache)
+
+
+def _write_position_slot(
+    slot: _PreparedVertexSlot,
+    field_plans: list[tuple],
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    if any(plan[0] not in {"position3", "normal_packed", "normal3"} for plan in field_plans):
+        return False
+    position_offset = _single_plan_offset(field_plans, "position3")
+    normal_packed_offset = _single_plan_offset(field_plans, "normal_packed")
+    normal3_offset = _single_plan_offset(field_plans, "normal3")
+    if position_offset is None and normal_packed_offset is None and normal3_offset is None:
+        return False
+    if (
+        int(slot.stride) == 16
+        and position_offset == 0
+        and normal_packed_offset == 12
+        and normal3_offset is None
+    ):
+        return _write_position_packed_normal_slot16(slot, loop_vertices, export_cache)
+    output = slot.output
+    stride = int(slot.stride)
+    pack_into = struct.pack_into
+    current_key = None
+    game_positions: list[tuple[float, float, float]] = []
+    packed_normals: list[int] = []
+    for record_index, loop_vertex in enumerate(loop_vertices):
+        record_base = record_index * stride
+        mesh_key = id(loop_vertex.mesh_obj)
+        if mesh_key != current_key:
+            mesh_cache = export_cache.mesh_cache(loop_vertex)
+            game_positions = _game_position_values(loop_vertex.mesh, mesh_cache)
+            packed_normals = _game_packed_normal_values(loop_vertex.mesh, mesh_cache)
+            current_key = mesh_key
+        if position_offset is not None:
+            position = game_positions[loop_vertex.vertex_index] if loop_vertex.vertex_index < len(game_positions) else _game_position(loop_vertex, export_cache)
+            pack_into("<3f", output, record_base + position_offset, *position)
+        if normal_packed_offset is not None:
+            packed_normal = packed_normals[loop_vertex.loop_index] if loop_vertex.loop_index < len(packed_normals) else int(encode_game_packed_normal(_game_normal(loop_vertex, export_cache)))
+            pack_into("<I", output, record_base + normal_packed_offset, int(packed_normal))
+        if normal3_offset is not None:
+            pack_into("<3f", output, record_base + normal3_offset, *_game_normal(loop_vertex, export_cache))
+    return True
+
+
+def _write_position_packed_normal_slot16(
+    slot: _PreparedVertexSlot,
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    output = slot.output
+    pack_into = struct.pack_into
+    current_key = None
+    game_positions: list[tuple[float, float, float]] = []
+    packed_normals: list[int] = []
+    for record_index, loop_vertex in enumerate(loop_vertices):
+        mesh_key = id(loop_vertex.mesh_obj)
+        if mesh_key != current_key:
+            mesh_cache = export_cache.mesh_cache(loop_vertex)
+            game_positions = _game_position_values(loop_vertex.mesh, mesh_cache)
+            packed_normals = _game_packed_normal_values(loop_vertex.mesh, mesh_cache)
+            current_key = mesh_key
+        position = game_positions[loop_vertex.vertex_index] if loop_vertex.vertex_index < len(game_positions) else _game_position(loop_vertex, export_cache)
+        packed_normal = packed_normals[loop_vertex.loop_index] if loop_vertex.loop_index < len(packed_normals) else int(encode_game_packed_normal(_game_normal(loop_vertex, export_cache)))
+        pack_into("<3fI", output, record_index * 16, float(position[0]), float(position[1]), float(position[2]), int(packed_normal))
+    return True
+
+
+def _write_texcoord_slot(
+    slot: _PreparedVertexSlot,
+    field_plans: list[tuple],
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    uv_plans = [plan for plan in field_plans if plan[0] == "uv"]
+    texcoord_snorm4_plans = [plan for plan in field_plans if plan[0] == "texcoord_snorm4"]
+    if len(uv_plans) + len(texcoord_snorm4_plans) != len(field_plans):
+        return False
+    output = slot.output
+    stride = int(slot.stride)
+    pack_into = struct.pack_into
+    single_uv = len(uv_plans) == 1
+    single_snorm = len(texcoord_snorm4_plans) == 1
+    uv_offset = int(uv_plans[0][1]) if single_uv else -1
+    uv_layer_name = str(uv_plans[0][2]) if single_uv else ""
+    snorm_offset = int(texcoord_snorm4_plans[0][1]) if single_snorm else -1
+    snorm_semantic_index = int(texcoord_snorm4_plans[0][2]) if single_snorm else -1
+    current_key = None
+    mesh_cache = None
+    primary_uv_values: list[tuple[float, float]] | None = None
+    primary_snorm_source: tuple | None = None
+    for record_index, loop_vertex in enumerate(loop_vertices):
+        record_base = record_index * stride
+        mesh_key = id(loop_vertex.mesh_obj)
+        if mesh_key != current_key:
+            mesh_cache = export_cache.mesh_cache(loop_vertex)
+            primary_uv_values = _required_game_uv_values(loop_vertex, uv_layer_name, mesh_cache) if single_uv else None
+            primary_snorm_source = (
+                _texcoord_snorm4_source(loop_vertex.mesh, slot.slot_name, snorm_semantic_index, mesh_cache)
+                if single_snorm
+                else None
+            )
+            current_key = mesh_key
+        if single_uv and primary_uv_values is not None:
+            uv = primary_uv_values[loop_vertex.loop_index] if loop_vertex.loop_index < len(primary_uv_values) else _uv(loop_vertex, uv_layer_name, export_cache)
+            if single_snorm and primary_snorm_source is not None and primary_snorm_source[0] == "zero":
+                if stride == 12 and uv_offset == 0 and snorm_offset == 8:
+                    pack_into("<2fI", output, record_base, float(uv[0]), float(uv[1]), 0)
+                else:
+                    pack_into("<2f", output, record_base + uv_offset, float(uv[0]), float(uv[1]))
+                continue
+            pack_into("<2f", output, record_base + uv_offset, float(uv[0]), float(uv[1]))
+        else:
+            for _kind, field_offset, layer_name in uv_plans:
+                uv = _uv(loop_vertex, str(layer_name), export_cache)
+                pack_into("<2f", output, record_base + int(field_offset), float(uv[0]), float(uv[1]))
+        for _kind, field_offset, semantic_index in texcoord_snorm4_plans:
+            _write_texcoord_snorm4_into(output, record_base + int(field_offset), slot.slot_name, int(semantic_index), loop_vertex, export_cache)
+    return True
+
+
+def _write_blend_slot(
+    slot: _PreparedVertexSlot,
+    field_plans: list[tuple],
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    if any(plan[0] not in {"blend_weights_u16", "blend_indices_u8"} for plan in field_plans):
+        return False
+    weights_offset = _single_plan_offset(field_plans, "blend_weights_u16")
+    indices_offset = _single_plan_offset(field_plans, "blend_indices_u8")
+    if weights_offset is None and indices_offset is None:
+        return False
+    output = slot.output
+    stride = int(slot.stride)
+    pack_into = struct.pack_into
+    combined_offsets = weights_offset == 0 and indices_offset == 8
+    for record_index, loop_vertex in enumerate(loop_vertices):
+        record_base = record_index * stride
+        weights, indices = _local_top4_packed(loop_vertex, export_cache)
+        if combined_offsets:
+            pack_into("<4H4B", output, record_base, *weights, *indices)
+            continue
+        if weights_offset is not None:
+            pack_into("<4H", output, record_base + weights_offset, *weights)
+        if indices_offset is not None:
+            pack_into("<4B", output, record_base + indices_offset, *indices)
+    return True
+
+
+def _single_plan_offset(field_plans: list[tuple], kind: str) -> int | None:
+    offsets = [int(plan[1]) for plan in field_plans if plan[0] == kind]
+    if len(offsets) > 1:
+        return None
+    return offsets[0] if offsets else None
 
 
 def _fast_field_plans(slot: _PreparedVertexSlot) -> list[tuple] | None:
@@ -632,6 +820,11 @@ def _game_position(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> 
     cached = mesh_cache.game_position_by_vertex.get(loop_vertex.vertex_index)
     if cached is not None:
         return cached
+    game_positions = _game_position_values(loop_vertex.mesh, mesh_cache)
+    if loop_vertex.vertex_index < len(game_positions):
+        co = game_positions[loop_vertex.vertex_index]
+        mesh_cache.game_position_by_vertex[loop_vertex.vertex_index] = co
+        return co
     position_values = _vertex_position_values(loop_vertex.mesh, mesh_cache)
     if loop_vertex.vertex_index < len(position_values):
         co = position_values[loop_vertex.vertex_index]
@@ -672,16 +865,10 @@ def _uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCach
     cached = mesh_cache.uv_by_layer_loop.get(cache_key)
     if cached is not None:
         return cached
-    layer = mesh_cache.uv_layers.get(layer_name)
-    if layer_name not in mesh_cache.uv_layers:
-        uv_layers = getattr(loop_vertex.mesh, "uv_layers", None)
-        layer = _resolve_uv_layer(uv_layers, layer_name)
-        mesh_cache.uv_layers[layer_name] = layer
-    if layer is None:
+    uv_values = _game_uv_values(loop_vertex.mesh, layer_name, mesh_cache)
+    if uv_values is None:
         raise ValueError(f"{getattr(loop_vertex.mesh_obj, 'name', '<mesh>')}: missing required UV layer {layer_name}")
-    uv_values = _uv_layer_values(layer, layer_name, mesh_cache)
-    uv = uv_values[loop_vertex.loop_index] if loop_vertex.loop_index < len(uv_values) else getattr(layer.data[loop_vertex.loop_index], "uv", (0.0, 0.0))
-    result = blender_uv_to_game((float(uv[0]), float(uv[1])), flip_v=mesh_cache.uv_flip_v)
+    result = uv_values[loop_vertex.loop_index] if loop_vertex.loop_index < len(uv_values) else (0.0, 0.0)
     mesh_cache.uv_by_layer_loop[cache_key] = result
     return result
 
@@ -739,6 +926,62 @@ def _indexed_uv_layer(uv_layers, index: int):
     except Exception:
         return None
     return values[index] if index < len(values) else None
+
+
+def _game_position_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float, float, float]]:
+    if mesh_cache.game_position_values is not None:
+        return mesh_cache.game_position_values
+    values = []
+    for co in _vertex_position_values(mesh, mesh_cache):
+        position = co
+        if not mesh_cache.matrix_world_applied:
+            position = _transform_point(mesh_cache.mesh_obj, position)
+        if mesh_cache.mirror_flip:
+            position = (-position[0], position[1], position[2])
+        values.append(position)
+    mesh_cache.game_position_values = values
+    return values
+
+
+def _game_packed_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[int]:
+    if mesh_cache.game_packed_normal_values is not None:
+        return mesh_cache.game_packed_normal_values
+    values = []
+    for normal in _loop_normal_values(mesh, mesh_cache):
+        game_normal = normal
+        if not mesh_cache.matrix_world_applied:
+            game_normal = _transform_normal(mesh_cache.mesh_obj, game_normal)
+        if mesh_cache.mirror_flip:
+            game_normal = (-game_normal[0], game_normal[1], game_normal[2])
+        values.append(int(encode_game_packed_normal(game_normal)))
+    mesh_cache.game_packed_normal_values = values
+    return values
+
+
+def _required_game_uv_values(loop_vertex: _LoopVertex, layer_name: str, mesh_cache: _MeshExportCache) -> list[tuple[float, float]]:
+    uv_values = _game_uv_values(loop_vertex.mesh, layer_name, mesh_cache)
+    if uv_values is None:
+        raise ValueError(f"{getattr(loop_vertex.mesh_obj, 'name', '<mesh>')}: missing required UV layer {layer_name}")
+    return uv_values
+
+
+def _game_uv_values(mesh, layer_name: str, mesh_cache: _MeshExportCache) -> list[tuple[float, float]] | None:
+    if layer_name in mesh_cache.game_uv_values_by_layer:
+        return mesh_cache.game_uv_values_by_layer[layer_name]
+    layer = mesh_cache.uv_layers.get(layer_name)
+    if layer_name not in mesh_cache.uv_layers:
+        uv_layers = getattr(mesh, "uv_layers", None)
+        layer = _resolve_uv_layer(uv_layers, layer_name)
+        mesh_cache.uv_layers[layer_name] = layer
+    if layer is None:
+        mesh_cache.game_uv_values_by_layer[layer_name] = None
+        return None
+    uv_values = [
+        blender_uv_to_game((float(uv[0]), float(uv[1])), flip_v=mesh_cache.uv_flip_v)
+        for uv in _uv_layer_values(layer, layer_name, mesh_cache)
+    ]
+    mesh_cache.game_uv_values_by_layer[layer_name] = uv_values
+    return uv_values
 
 
 def _vertex_position_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float, float, float]]:
@@ -898,6 +1141,20 @@ def _local_top4_weights(loop_vertex: _LoopVertex, export_cache: _ExportPartCache
         indices.append(0)
     result = tuple(weights[:4]), tuple(indices[:4])
     mesh_cache.top4_by_vertex[loop_vertex.vertex_index] = result
+    return result
+
+
+def _local_top4_packed(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    cached = mesh_cache.top4_packed_by_vertex.get(loop_vertex.vertex_index)
+    if cached is not None:
+        return cached
+    weights, indices = _local_top4_weights(loop_vertex, export_cache)
+    result = (
+        tuple(_unorm16(value) for value in weights),
+        tuple(_uint8(value) for value in indices),
+    )
+    mesh_cache.top4_packed_by_vertex[loop_vertex.vertex_index] = result
     return result
 
 

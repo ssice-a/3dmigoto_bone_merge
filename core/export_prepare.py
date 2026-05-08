@@ -167,13 +167,17 @@ def _geometry_performance_summary(geometry_records: list[dict]) -> dict:
     loop_vertex_count = 0
     index_count = 0
     vb_slot_count = 0
+    slot_totals: dict[str, float] = {}
     slowest_parts: list[dict] = []
     for record in geometry_records:
         stats = dict(record.get("stats", {}) or {})
         timings = dict(record.get("timings", {}) or {})
+        slot_timings = dict(record.get("slot_timings", {}) or {})
         loop_vertex_count += int(stats.get("loop_vertex_count", 0) or 0)
         index_count += int(stats.get("index_count", 0) or 0)
         vb_slot_count += int(stats.get("vb_slot_count", 0) or 0)
+        for slot_name, seconds in slot_timings.items():
+            slot_totals[str(slot_name)] = slot_totals.get(str(slot_name), 0.0) + float(seconds or 0.0)
         slowest_parts.append(
             {
                 "part": f"{record.get('ib_hash', '')}-{record.get('match_index_count', 0)}-{record.get('match_first_index', 0)}:{record.get('part_name', '')}",
@@ -183,14 +187,17 @@ def _geometry_performance_summary(geometry_records: list[dict]) -> dict:
                 "total_seconds": float(timings.get("total", 0.0) or 0.0),
                 "write_vb_seconds": float(timings.get("write_vb", 0.0) or 0.0),
                 "collect_loops_seconds": float(timings.get("collect_loops", 0.0) or 0.0),
+                "slot_timings": {name: float(value or 0.0) for name, value in slot_timings.items()},
             }
         )
     slowest_parts.sort(key=lambda item: float(item.get("total_seconds", 0.0)), reverse=True)
+    sorted_slot_totals = dict(sorted(slot_totals.items(), key=lambda item: item[1], reverse=True))
     return {
         "part_count": len(geometry_records),
         "loop_vertex_count": loop_vertex_count,
         "index_count": index_count,
         "vb_slot_count": vb_slot_count,
+        "slot_totals": sorted_slot_totals,
         "slowest_parts": slowest_parts[:10],
     }
 
@@ -201,6 +208,7 @@ def _public_geometry_records(geometry_records: list[dict]) -> list[dict]:
         public_record = dict(record)
         public_record.pop("stats", None)
         public_record.pop("timings", None)
+        public_record.pop("slot_timings", None)
         public_records.append(public_record)
     return public_records
 

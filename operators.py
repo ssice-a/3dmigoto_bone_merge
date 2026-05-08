@@ -1717,10 +1717,22 @@ def _print_export_performance_report(result: dict, *, materialize_seconds: float
             f"indices={int(geometry.get('index_count', 0) or 0)} "
             f"vb_slots={int(geometry.get('vb_slot_count', 0) or 0)}"
         )
+        slot_totals = dict(geometry.get("slot_totals", {}) or {})
+        if slot_totals:
+            formatted_slots = " ".join(
+                f"{slot_name}={float(seconds or 0.0):.3f}s"
+                for slot_name, seconds in list(slot_totals.items())[:8]
+            )
+            print(f"[BMC Export] slot totals: {formatted_slots}")
     slowest_parts = list(geometry.get("slowest_parts", []) or [])[:5]
     if slowest_parts:
         print("[BMC Export] Slowest geometry parts:")
         for index, part in enumerate(slowest_parts, start=1):
+            slot_timings = dict(part.get("slot_timings", {}) or {})
+            formatted_slots = " ".join(
+                f"{slot_name}={float(seconds or 0.0):.3f}s"
+                for slot_name, seconds in sorted(slot_timings.items(), key=lambda item: float(item[1] or 0.0), reverse=True)
+            )
             print(
                 "[BMC Export] "
                 f"  {index}. {part.get('part', '')} "
@@ -1728,6 +1740,7 @@ def _print_export_performance_report(result: dict, *, materialize_seconds: float
                 f"write_vb={float(part.get('write_vb_seconds', 0.0) or 0.0):.3f}s "
                 f"collect_loops={float(part.get('collect_loops_seconds', 0.0) or 0.0):.3f}s "
                 f"loops={int(part.get('loop_vertex_count', 0) or 0)} "
+                f"slots=[{formatted_slots}] "
                 f"objects={', '.join(str(name) for name in list(part.get('objects', []) or [])[:4])}"
             )
 

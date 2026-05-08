@@ -43,6 +43,16 @@ def get_vertex_layout_profiles() -> dict:
     return copy.deepcopy(profiles)
 
 
+def get_runtime_shader_filters() -> list[dict]:
+    """Return editable runtime ShaderOverride filter rules."""
+
+    path = _DATA_DIR / "runtime_shader_filters.json"
+    with path.open("r", encoding="utf-8") as file_handle:
+        payload = json.load(file_handle)
+    rules = payload.get("shader_overrides", [])
+    return copy.deepcopy(rules if isinstance(rules, list) else [])
+
+
 def annotate_vertex_layout(layout: dict, vs_hash: str = "") -> dict:
     """Attach known VS/layout facts to a manifest vertex layout payload.
 

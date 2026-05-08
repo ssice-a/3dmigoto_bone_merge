@@ -1643,6 +1643,7 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
                 internal_manifest_dir=None,
                 capture_manifest_path=scene.bmc_manifest_path,
                 generate_ini=generate_ini,
+                filter_residual=bool(getattr(scene, "bmc_filter_residual", True)),
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Export failed: {exc}")

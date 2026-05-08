@@ -74,6 +74,12 @@ filter_index = 200
 allow_duplicate_hash = overrule
 ```
 
+These `filter_index = 200` entries are generated from FrameAnalysis/manifest
+data, not from a static hand-maintained table.
+If the analyzer records explicit shader filter rules with both `hash`/`vs_hash`
+and `filter_index`, those manifest rules are also emitted before editable JSON
+fallback rules.
+
 `filter_index = 200` means only:
 
 ```text
@@ -86,6 +92,12 @@ offline by the replay plan and by the IB/collection classification.
 Do not generate broad VS override tables for visible, outline, material, or
 effect passes outside the verified early shadow window. Visible replacement must
 inherit the game's current pass state through `TextureOverride` branches.
+
+Narrow runtime exclusions that are not part of capture, such as known residual
+/ afterimage VS passes, live in `core/data_types/runtime_shader_filters.json`.
+Those rules are merged after the FrameAnalysis-derived rules. The default
+residual rule writes `filter_index = 204` and is controlled by the exporter UI
+checkbox `过滤残影`.
 
 ## TextureOverride Branch Contract
 
@@ -101,6 +113,21 @@ if vs != 200
   ; visible/outline/material/effect replacement path under current game state.
 endif
 ```
+
+When residual filtering is enabled, the visible branch excludes the additional
+filter index:
+
+```ini
+if vs != 200 && vs != 204
+  ; normal replay path, but not residual/afterimage passes.
+endif
+```
+
+Visible branches may also run `CustomShader_RecordBones` before replay. This is
+the fallback for frames where the game does not issue the usual early shadow
+capture draws before visible/effect draws. In that case, each matching visible
+IB refreshes its own main/LOD capture record from the currently bound `vs-t0`
+and `cb1[5].xy`; only branches with exported geometry then skip and replay.
 
 Avoid many pass-specific `if` branches. The INI should be table-driven by
 static buffers and by export/replay lists.
@@ -388,6 +415,14 @@ latest pass role, because that can drop one of the native shadow passes.
 The final host can draw replacement parts from other IBs because the global
 bone pool is complete by that point.
 
+For LOD shadow replay, the host must be selected from the actual LOD shadow
+capture cluster, not from the main/high-detail shadow stage. When LOD capture
+records contain draw indices, choose the latest valid LOD capture draw in the
+cluster as the scheduling host. The host may be a LOD IB that is not itself an
+exported part; if the generated block binds replacement resources under that
+host, skip the host draw as the scheduling carrier and replay the exported
+canonical parts there.
+
 ## Visible Pass Contract
 
 For `vs != 200`, the replacement path should inherit the current game pass
@@ -579,6 +614,12 @@ main high-detail exported resources. If a canonical main part maps to multiple
 LOD sources, only the strongest resolved LOD source hosts replay; the remaining
 LOD sources are capture-only. This prevents duplicate high-detail draws while
 still allowing all LOD scatter records to fill the shared global pool.
+
+LOD shadow replay is scheduled separately from visible LOD replay. Visible replay
+uses the resolved LOD source for the exported main part. Shadow replay waits
+until the final LOD capture draw in the shadow cluster so that every LOD scatter
+record for that cluster has populated the canonical global pool before any
+replacement shadow part is drawn.
 
 Main and LOD capture maps should remain separate files for clarity:
 

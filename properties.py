@@ -92,6 +92,7 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_ini_path"),
     (bpy.types.Scene, "bmc_export_collection"),
     (bpy.types.Scene, "bmc_export_mode"),
+    (bpy.types.Scene, "bmc_filter_residual"),
     (bpy.types.Scene, "bmc_export_manifest_path"),
     (bpy.types.Scene, "bmc_shadow_host_hash"),
     (bpy.types.Scene, "bmc_shadow_host_match_index_count"),
@@ -317,6 +318,11 @@ def register_addon_properties():
         items=EXPORT_MODE_ITEMS,
         default="BUFFER_ONLY",
         description="Choose whether this export writes only buffers or also regenerates BoneStore.ini.",
+    )
+    bpy.types.Scene.bmc_filter_residual = bpy.props.BoolProperty(
+        name="过滤残影",
+        default=True,
+        description="Mark known residual/afterimage vertex shaders as filter_index 204 and prevent normal visible replay on those passes.",
     )
     bpy.types.Scene.bmc_export_manifest_path = bpy.props.StringProperty(
         name="Export Manifest",

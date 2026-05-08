@@ -164,6 +164,7 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
             "bmc_candidate_index",
             "bmc_export_collection",
             "bmc_export_mode",
+            "bmc_filter_residual",
             "bmc_output_dir",
         ):
             layout.label(text="Bone Merge properties are not registered. Reload the addon.", icon="ERROR")
@@ -235,6 +236,7 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         export_box.prop(scene, "bmc_export_collection", text="Collection")
         export_box.label(text=f"INI: {_export_ini_filename_label(scene.bmc_export_collection)}", icon="TEXT")
         export_box.operator("object.bmc_add_selected_export_objects", icon="ADD", text="Add Selected")
+        export_box.prop(scene, "bmc_filter_residual", text="过滤残影")
         export_box.prop(scene, "bmc_export_mode", text="")
         export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT", text="Export")
 

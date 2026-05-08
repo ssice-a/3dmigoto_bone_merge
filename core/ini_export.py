@@ -8,6 +8,7 @@ import struct
 from pathlib import Path
 
 from ..constants import BONESTORE_INI_FILE_NAME, BUFFER_EXPORT_DIR_NAME
+from .data_types import get_runtime_shader_filters
 from .export_names import ini_filename_from_collection_name
 from .io import ensure_directory, write_uint32_buffer
 from .models import LocalPaletteRecord
@@ -16,6 +17,7 @@ from .texture_marks import marked_texture_bindings, validate_texture_hash
 
 
 _SAFE_SUFFIX_RE = re.compile(r"[^0-9A-Za-z_]+")
+_SHADER_HASH_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 
 _MAIN_CAPTURE_BONE_MAP_FILE = "MainCaptureBoneMap.buf"
 _LOD_CAPTURE_BONE_MAP_FILE = "LodCaptureBoneMap.buf"
@@ -38,6 +40,7 @@ def materialize_bonestore_runtime(
     local_palette_records: list[LocalPaletteRecord],
     geometry_records: list[dict] | None = None,
     texture_mark_payload: dict | None = None,
+    filter_residual: bool = True,
 ) -> dict:
     """Write static runtime buffers and return the normalized runtime plan."""
 
@@ -50,10 +53,14 @@ def materialize_bonestore_runtime(
     geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
     _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
     texture_records, texture_warnings = _materialize_texture_records(normalized_output_dir, texture_mark_payload or {})
+    shader_filter_overrides = _runtime_shader_filter_overrides(
+        capture_manifest,
+        filter_residual=filter_residual,
+    )
     lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
     lod_key_annotations = _build_lod_key_annotations(capture_manifest, geometry_payloads)
     shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
-    lod_shadow_replay_plan = _build_lod_shadow_replay_plan(capture_manifest, geometry_payloads, lod_replay_links)
+    lod_shadow_replay_plan = _build_lod_shadow_replay_plan(capture_manifest, geometry_payloads, lod_replay_links, lod_records)
     if _shadow_plan_needs_white_texture(shadow_replay_plan) or _shadow_plan_needs_white_texture(lod_shadow_replay_plan):
         _write_white_shadow_texture(os.path.join(normalized_output_dir, _WHITE_SHADOW_TEXTURE_FILE))
     _validate_palette_globals(capture_manifest, palette_records)
@@ -88,6 +95,9 @@ def materialize_bonestore_runtime(
         "namespace": "",
         "global_bone_count": _global_bone_count(capture_manifest),
         "shadow_vs_hashes": _runtime_shadow_vs_hashes(capture_manifest),
+        "filter_residual": bool(filter_residual),
+        "shader_filter_overrides": shader_filter_overrides,
+        "visible_replay_excluded_filter_indices": _visible_replay_excluded_filter_indices(shader_filter_overrides),
         "capture_records": capture_records,
         "lod_capture_records": lod_records,
         "lod_replay_links": lod_replay_links,
@@ -222,6 +232,8 @@ def _build_lod_capture_bone_map(capture_manifest: dict) -> tuple[list[dict], lis
                 "ib_hash": str(lod_record.get("lod_ib_hash", "") or "").lower(),
                 "match_first_index": int(lod_record.get("lod_match_first_index", 0) or 0),
                 "match_index_count": int(lod_record.get("lod_match_index_count", 0) or 0),
+                "capture_draw_indices": _int_list(lod_record.get("lod_capture_draw_indices", lod_record.get("capture_draw_indices", []))),
+                "import_draw_index": int(lod_record.get("lod_import_draw_index", lod_record.get("import_draw_index", -1)) or -1),
                 "pair_base": pair_base,
                 "pair_count": len(pairs),
                 "dispatch_rows": len(pairs) * 3,
@@ -445,6 +457,8 @@ def _normalize_shadow_stage(capture_manifest: dict) -> dict:
         "host_match_first_index": int(stage.get("host_match_first_index", 0) or 0),
         "host_match_index_count": int(stage.get("host_match_index_count", 0) or 0),
         "host_draw_index": int(stage.get("host_draw_index", -1) or -1),
+        "stage_draw_start": int(stage.get("stage_draw_start", -1) or -1),
+        "stage_draw_end": int(stage.get("stage_draw_end", -1) or -1),
         "normal_vs_hash": str(stage.get("normal_vs_hash", "") or "").lower(),
         "transparent_vs_hash": str(stage.get("transparent_vs_hash", "") or "").lower(),
     }
@@ -576,14 +590,15 @@ def _build_lod_key_annotations(capture_manifest: dict, geometry_records: list[di
     ]
 
 
-def _build_lod_shadow_replay_plan(capture_manifest: dict, geometry_records: list[dict], lod_replay_links: list[dict]) -> dict:
+def _build_lod_shadow_replay_plan(
+    capture_manifest: dict,
+    geometry_records: list[dict],
+    lod_replay_links: list[dict],
+    lod_capture_records: list[dict],
+) -> dict:
     lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
     stage = _normalize_shadow_stage(lod_snapshot)
-    host_key = (
-        stage["host_ib_hash"],
-        int(stage["host_match_first_index"]),
-        int(stage["host_match_index_count"]),
-    )
+    host_key, host_draw_index, host_source = _select_lod_shadow_host(stage, lod_capture_records)
     if not _is_valid_override_key(host_key) or not geometry_records or not lod_replay_links:
         return {"enabled": False, "reason": "missing_lod_host_or_geometry"}
 
@@ -620,15 +635,45 @@ def _build_lod_shadow_replay_plan(capture_manifest: dict, geometry_records: list
     if not transparent_parts and not normal_parts:
         return {"enabled": False, "reason": "no_lod_exported_shadow_parts"}
 
+    skipped_keys.add(host_key)
     return {
         "enabled": True,
         "host_key": _key_payload(host_key),
-        "host_draw_index": int(stage["host_draw_index"]),
+        "host_draw_index": int(host_draw_index),
+        "host_source": host_source,
         "white_shadow_resource": "ResourceBMCWhiteShadow",
         "transparent_parts": transparent_parts,
         "normal_parts": normal_parts,
         "skip_keys": [_key_payload(key) for key in sorted(skipped_keys)],
     }
+
+
+def _select_lod_shadow_host(stage: dict, lod_capture_records: list[dict]) -> tuple[tuple[str, int, int], int, str]:
+    fallback_key = (
+        str(stage.get("host_ib_hash", "") or "").lower(),
+        int(stage.get("host_match_first_index", 0) or 0),
+        int(stage.get("host_match_index_count", 0) or 0),
+    )
+    fallback_draw = int(stage.get("host_draw_index", -1) or -1)
+    stage_start = int(stage.get("stage_draw_start", -1) or -1)
+    stage_end = int(stage.get("stage_draw_end", -1) or -1)
+    candidates: list[tuple[int, tuple[str, int, int]]] = []
+    for record in lod_capture_records or []:
+        key = _override_key(record)
+        if not _is_valid_override_key(key):
+            continue
+        draw_indices = [
+            int(value)
+            for value in record.get("capture_draw_indices", []) or []
+            if int(value) >= 0 and _draw_index_in_optional_stage_window(int(value), stage_start, stage_end)
+        ]
+        if not draw_indices:
+            continue
+        candidates.append((max(draw_indices), key))
+    if candidates:
+        draw_index, key = max(candidates, key=lambda item: (int(item[0]), item[1]))
+        return key, int(draw_index), "latest_lod_capture_draw"
+    return fallback_key, fallback_draw, "lod_shadow_stage_fallback"
 
 
 def _shadow_roles_by_key(capture_manifest: dict) -> dict[tuple[str, int, int], set[str]]:
@@ -817,16 +862,50 @@ def _capture_unavailable_global_bones(capture_manifest: dict) -> set[int]:
 
 def _shader_override_sections(runtime_plan: dict) -> list[str]:
     lines: list[str] = []
+    seen_sections: set[str] = set()
+    seen_filter_keys: set[tuple[str, int]] = set()
     for vs_hash in runtime_plan.get("shadow_vs_hashes", []) or []:
         safe_hash = str(vs_hash).lower()
         if not safe_hash:
             continue
+        section_name = f"ShaderOverrideBoneStoreVS_{safe_hash}"
+        if section_name in seen_sections:
+            continue
+        seen_sections.add(section_name)
+        seen_filter_keys.add((safe_hash, 200))
         lines.extend(
             [
-                f"[ShaderOverrideBoneStoreVS_{safe_hash}]",
+                f"[{section_name}]",
                 f"hash = {safe_hash}",
                 "filter_index = 200",
                 "allow_duplicate_hash = overrule",
+                "",
+            ]
+        )
+    for rule in runtime_plan.get("shader_filter_overrides", []) or []:
+        safe_hash = str(rule.get("hash", "") or "").lower()
+        if not safe_hash:
+            continue
+        filter_index = int(rule.get("filter_index", -1) or -1)
+        if filter_index < 0:
+            continue
+        if (safe_hash, filter_index) in seen_filter_keys:
+            continue
+        seen_filter_keys.add((safe_hash, filter_index))
+        section_name = str(rule.get("section_name", "") or "").strip()
+        if not section_name:
+            section_prefix = str(rule.get("section_prefix", "") or "ShaderOverrideBMCFilter")
+            section_name = f"{_safe_suffix(section_prefix)}_{safe_hash}"
+        section_name = _safe_suffix(section_name)
+        if section_name in seen_sections:
+            continue
+        seen_sections.add(section_name)
+        lines.extend(
+            [
+                f"[{section_name}]",
+                f"hash = {safe_hash}",
+                f"filter_index = {filter_index}",
+                f"allow_duplicate_hash = {rule.get('allow_duplicate_hash', 'overrule')}",
                 "",
             ]
         )
@@ -1201,7 +1280,10 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
         if geometry_records:
             if grouped_records.get("main") or grouped_records.get("lod"):
                 lines.append("")
-            lines.extend(_visible_replay_lines(geometry_records))
+            lines.extend(_visible_replay_lines(geometry_records, runtime_plan, grouped_records))
+        elif grouped_records.get("main") or grouped_records.get("lod"):
+            lines.append("")
+            lines.extend(_visible_capture_only_lines(grouped_records, runtime_plan))
         lines.append("")
     if lines and lines[-1] == "":
         lines.pop()
@@ -1280,16 +1362,62 @@ def _hash_label(key: tuple[str, int, int]) -> str:
     return str(key[0])
 
 
-def _visible_replay_lines(geometry_records: list[dict]) -> list[str]:
+def _visible_replay_lines(geometry_records: list[dict], runtime_plan: dict, grouped_records: dict) -> list[str]:
     lines = [
-        "if vs != 200",
+        _visible_replay_condition(runtime_plan),
         "  handling = skip",
         "  run = CustomShader_ExtractCB1",
     ]
+    lines.extend(_visible_capture_record_lines(grouped_records, indent="  "))
     for record in geometry_records:
         lines.extend(_replay_part_lines(record, indent="  "))
     lines.append("endif")
     return lines
+
+
+def _visible_capture_only_lines(grouped_records: dict, runtime_plan: dict) -> list[str]:
+    lines = [
+        _visible_replay_condition(runtime_plan),
+        "  run = CustomShader_ExtractCB1",
+    ]
+    lines.extend(_visible_capture_record_lines(grouped_records, indent="  "))
+    lines.append("endif")
+    return lines
+
+
+def _visible_capture_record_lines(grouped_records: dict, *, indent: str) -> list[str]:
+    lines: list[str] = []
+    for record_index in grouped_records.get("main", []) or []:
+        lines.extend(
+            [
+                f"{indent}; visible fallback main bone capture",
+                f"{indent}x100 = {record_index}",
+                f"{indent}cs-t2 = ResourceMainCaptureBoneMap",
+                f"{indent}run = CustomShader_RecordBones",
+            ]
+        )
+    for record_index in grouped_records.get("lod", []) or []:
+        lines.extend(
+            [
+                f"{indent}; visible fallback LOD bone capture",
+                f"{indent}x100 = {record_index}",
+                f"{indent}cs-t2 = ResourceLodCaptureBoneMap",
+                f"{indent}run = CustomShader_RecordBones",
+            ]
+        )
+    return lines
+
+
+def _visible_replay_condition(runtime_plan: dict) -> str:
+    excluded_indices = [200]
+    for value in runtime_plan.get("visible_replay_excluded_filter_indices", []) or []:
+        try:
+            filter_index = int(value)
+        except (TypeError, ValueError):
+            continue
+        if filter_index not in excluded_indices:
+            excluded_indices.append(filter_index)
+    return "if " + " && ".join(f"vs != {filter_index}" for filter_index in excluded_indices)
 
 
 def _shadow_host_replay_lines(shadow_plan: dict, parts_by_suffix: dict[str, dict], *, indent: str) -> list[str]:
@@ -1498,6 +1626,113 @@ def _runtime_shadow_vs_hashes(capture_manifest: dict) -> list[str]:
     return hashes
 
 
+def _runtime_shader_filter_overrides(capture_manifest: dict, *, filter_residual: bool) -> list[dict]:
+    rules: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+
+    for payload in _manifest_shader_filter_payloads(capture_manifest):
+        rule = _normalize_shader_filter_rule(payload, source="manifest")
+        if not rule:
+            continue
+        key = (str(rule["hash"]), int(rule["filter_index"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        rules.append(rule)
+
+    for payload in get_runtime_shader_filters():
+        if not _shader_filter_rule_enabled(payload, filter_residual=filter_residual):
+            continue
+        rule = _normalize_shader_filter_rule(payload, source="runtime_shader_filters.json")
+        if not rule:
+            continue
+        key = (str(rule["hash"]), int(rule["filter_index"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        rules.append(rule)
+
+    return rules
+
+
+def _manifest_shader_filter_payloads(capture_manifest: dict) -> list[dict]:
+    payloads: list[dict] = []
+
+    def add_many(values) -> None:
+        if isinstance(values, dict):
+            if values.get("hash") or values.get("vs_hash"):
+                payloads.append(dict(values))
+                return
+            values = values.get("shader_overrides", []) or values.get("filters", [])
+        for value in values or []:
+            if isinstance(value, dict):
+                payloads.append(dict(value))
+
+    for key in ("shader_filter_overrides", "runtime_shader_filters", "shader_overrides"):
+        add_many(capture_manifest.get(key, []))
+    runtime_stage = capture_manifest.get("runtime_stage", {})
+    if isinstance(runtime_stage, dict):
+        for key in ("shader_filter_overrides", "runtime_shader_filters", "shader_overrides"):
+            add_many(runtime_stage.get(key, []))
+    return payloads
+
+
+def _normalize_shader_filter_rule(payload: dict, *, source: str) -> dict:
+    safe_hash = str(payload.get("hash", "") or payload.get("vs_hash", "") or "").strip().lower()
+    if not _SHADER_HASH_RE.fullmatch(safe_hash):
+        return {}
+    try:
+        filter_index = int(payload.get("filter_index", -1))
+    except (TypeError, ValueError):
+        return {}
+    if filter_index < 0:
+        return {}
+
+    section_prefix = str(payload.get("section_prefix", "") or "ShaderOverrideBMCFilter")
+    section_name = str(payload.get("section_name", "") or "").strip()
+    if not section_name:
+        section_name = f"{_safe_suffix(section_prefix)}_{safe_hash}"
+
+    return {
+        "id": str(payload.get("id", "") or ""),
+        "hash": safe_hash,
+        "filter_index": filter_index,
+        "section_prefix": _safe_suffix(section_prefix),
+        "section_name": _safe_suffix(section_name),
+        "allow_duplicate_hash": str(payload.get("allow_duplicate_hash", "") or "overrule"),
+        "exclude_from_visible_replay": _truthy(payload.get("exclude_from_visible_replay", False)),
+        "source": source,
+    }
+
+
+def _shader_filter_rule_enabled(payload: dict, *, filter_residual: bool) -> bool:
+    if "enabled" in payload and not _truthy(payload.get("enabled")):
+        return False
+    enabled_by = str(payload.get("enabled_by", "") or "").strip()
+    if not enabled_by:
+        return True
+    if enabled_by == "filter_residual":
+        return bool(filter_residual)
+    return True
+
+
+def _visible_replay_excluded_filter_indices(shader_filter_overrides: list[dict]) -> list[int]:
+    indices: list[int] = []
+    for rule in shader_filter_overrides:
+        if not bool(rule.get("exclude_from_visible_replay", False)):
+            continue
+        filter_index = int(rule.get("filter_index", -1) or -1)
+        if filter_index >= 0 and filter_index not in indices:
+            indices.append(filter_index)
+    return indices
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
+
+
 def _global_bone_count(capture_manifest: dict) -> int:
     count = 0
     for record in capture_manifest.get("bone_pool_order", []) or []:
@@ -1513,6 +1748,26 @@ def _used_local_indices(pool_record: dict) -> list[int]:
         return sorted({int(value) for value in raw_indices if int(value) >= 0})
     count = int(pool_record.get("local_bone_count", 0) or 0)
     return list(range(max(0, count)))
+
+
+def _int_list(values) -> list[int]:
+    if isinstance(values, (str, bytes)) or not hasattr(values, "__iter__"):
+        values = [values]
+    result: list[int] = []
+    for value in values or []:
+        try:
+            result.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _draw_index_in_optional_stage_window(draw_index: int, stage_start: int, stage_end: int) -> bool:
+    if stage_start >= 0 and draw_index < stage_start:
+        return False
+    if stage_end >= 0 and draw_index > stage_end:
+        return False
+    return True
 
 
 def _override_key(record: dict) -> tuple[str, int, int]:

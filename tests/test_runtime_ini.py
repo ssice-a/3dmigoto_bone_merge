@@ -320,6 +320,130 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("; replay aaaaaaaa_10_0_part00", lod_section)
         self.assertIn("; Blender objects: shadow_body", lod_section)
 
+    def test_lod_shadow_replay_uses_latest_lod_capture_host(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
+            "lod_manifest_snapshot": {
+                "shadow_stage": {
+                    "shadow_vs_hashes": ["2222222222222222"],
+                    "stage_draw_start": 30,
+                    "stage_draw_end": 39,
+                    "host_ib_hash": "mmmmmmmm",
+                    "host_match_first_index": 0,
+                    "host_match_index_count": 99,
+                    "host_draw_index": 219,
+                }
+            },
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 10,
+                    "ib_hash": "aaaaaaaa",
+                    "first_index": 0,
+                    "index_count": 10,
+                    "pass_role": "normal_shadow",
+                }
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-exported",
+                    "lod_ib_hash": "bbbbbbbb",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 20,
+                    "lod_capture_draw_indices": [31],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                },
+                {
+                    "lod_record_key": "lod-host",
+                    "lod_ib_hash": "cccccccc",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 30,
+                    "lod_capture_draw_indices": [39],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                },
+            ],
+            "lod_links": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-exported",
+                            "lod_ib_hash": "bbbbbbbb",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 20,
+                            "mapped_global_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="main",
+            ib_hash="aaaaaaaa",
+            match_index_count=10,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="aaaaaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_10_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("aaaaaaaa", 10, 0, 6, object_names=["shadow_body"])],
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertTrue(runtime["lod_shadow_replay_plan"]["enabled"])
+        self.assertEqual(
+            {"ib_hash": "cccccccc", "match_first_index": 0, "match_index_count": 30},
+            runtime["lod_shadow_replay_plan"]["host_key"],
+        )
+        self.assertEqual(39, runtime["lod_shadow_replay_plan"]["host_draw_index"])
+        self.assertEqual("latest_lod_capture_draw", runtime["lod_shadow_replay_plan"]["host_source"])
+        self.assertEqual(
+            [
+                {"ib_hash": "bbbbbbbb", "match_first_index": 0, "match_index_count": 20},
+                {"ib_hash": "cccccccc", "match_first_index": 0, "match_index_count": 30},
+            ],
+            runtime["lod_shadow_replay_plan"]["skip_keys"],
+        )
+        host_section = ini_text[
+            ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]") :
+            ini_text.index("[Present]")
+        ]
+        exported_lod_section = ini_text[
+            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_0_LOD]") :
+            ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]")
+        ]
+        self.assertIn("hash = cccccccc", host_section)
+        self.assertIn("  x100 = 1", host_section)
+        self.assertIn("  cs-t2 = ResourceLodCaptureBoneMap", host_section)
+        self.assertIn("  handling = skip", host_section)
+        self.assertIn("; delayed normal shadow replay", host_section)
+        self.assertIn("; replay aaaaaaaa_10_0_part00", host_section)
+        self.assertIn("  handling = skip", exported_lod_section)
+        self.assertNotIn("; delayed normal shadow replay", exported_lod_section)
+
     def test_generated_ini_uses_single_lifecycle_commandlist_only(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
@@ -428,11 +552,144 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("[ResourcePart_12345678_42_0_part00_Index]", ini_text)
         self.assertIn("if vs != 200", ini_text)
         self.assertIn("  handling = skip", ini_text)
+        self.assertIn("  ; visible fallback main bone capture", ini_text)
+        self.assertIn("  cs-t2 = ResourceMainCaptureBoneMap", ini_text)
+        self.assertIn("  run = CustomShader_RecordBones", ini_text)
         self.assertIn("  x101 = 2", ini_text)
         self.assertIn("  run = CustomShader_GatherLocalBones", ini_text)
         self.assertIn("  vs-t0 = ResourceLocalBonePool_SRV", ini_text)
         self.assertIn("  vb3 = ResourcePart_12345678_42_0_part00_Position", ini_text)
         self.assertIn("  drawindexedinstanced = 6,INSTANCE_COUNT,0,0,FIRST_INSTANCE", ini_text)
+
+    def test_visible_capture_only_sources_refresh_pool_without_replay(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "12345678",
+                    "match_first_index": 0,
+                    "match_index_count": 42,
+                    "global_bone_base": 0,
+                    "local_bone_count": 2,
+                    "used_local_bone_indices": [0, 1],
+                    "bone_capture_available": True,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [])
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        section = ini_text[ini_text.index("[TextureOverride_BMC_12345678_42_0]") :]
+        self.assertIn("if vs != 200", section)
+        self.assertIn("  ; visible fallback main bone capture", section)
+        self.assertIn("  x100 = 0", section)
+        self.assertIn("  cs-t2 = ResourceMainCaptureBoneMap", section)
+        self.assertIn("  run = CustomShader_RecordBones", section)
+        self.assertNotIn("  handling = skip", section)
+        self.assertNotIn("  drawindexedinstanced", section)
+
+    def test_residual_filter_rules_can_exclude_visible_replay(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "12345678",
+                    "match_first_index": 0,
+                    "match_index_count": 42,
+                    "global_bone_base": 0,
+                    "local_bone_count": 2,
+                    "used_local_bone_indices": [0, 1],
+                    "bone_capture_available": True,
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="part",
+            ib_hash="12345678",
+            match_index_count=42,
+            chunk_index=0,
+            local_bone_count=2,
+            palette_values=(0, 1),
+            file_name="12345678-42-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="Buffer/12345678-42-0_part00-PartLocalToGlobalBoneMap.buf",
+            resource_suffix="12345678_42_0_part00",
+            match_first_index=0,
+        )
+        geometry = [_geometry_record("12345678", 42, 0, 6)]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette], geometry)
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertIn("[ShaderOverrideBMCResidualVS_0ba16985f9f74f8d]", ini_text)
+        self.assertIn("filter_index = 204", ini_text)
+        self.assertIn("if vs != 200 && vs != 204", ini_text)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                geometry,
+                filter_residual=False,
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertNotIn("ShaderOverrideBMCResidualVS", ini_text)
+        self.assertIn("if vs != 200", ini_text)
+        self.assertNotIn("vs != 204", ini_text)
+
+    def test_manifest_shader_filter_rules_are_kept_with_filter_index(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
+            "shader_filter_overrides": [
+                {
+                    "section_prefix": "ShaderOverrideAutoVS",
+                    "hash": "bbbbbbbbbbbbbbbb",
+                    "filter_index": 205,
+                    "exclude_from_visible_replay": True,
+                }
+            ],
+            "bone_pool_order": [
+                {
+                    "ib_hash": "12345678",
+                    "match_first_index": 0,
+                    "match_index_count": 42,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="part",
+            ib_hash="12345678",
+            match_index_count=42,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="12345678-42-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="Buffer/12345678-42-0_part00-PartLocalToGlobalBoneMap.buf",
+            resource_suffix="12345678_42_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("12345678", 42, 0, 6)],
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertIn("[ShaderOverrideAutoVS_bbbbbbbbbbbbbbbb]", ini_text)
+        self.assertIn("hash = bbbbbbbbbbbbbbbb", ini_text)
+        self.assertIn("filter_index = 205", ini_text)
+        self.assertIn("if vs != 200 && vs != 205 && vs != 204", ini_text)
 
     def test_shadow_replay_uses_late_host_and_white_resource_for_normal_parts(self):
         manifest = {

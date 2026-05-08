@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 import bpy
 
@@ -1624,9 +1625,12 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
+        export_start = time.perf_counter()
         try:
             source_collection = _ensure_export_collection(context)
+            materialize_start = time.perf_counter()
             part_materialize_result = _materialize_auto_export_part_collections(source_collection)
+            materialize_seconds = time.perf_counter() - materialize_start
             generate_ini = str(getattr(scene, "bmc_export_mode", "BUFFER_ONLY") or "BUFFER_ONLY") == "BUFFER_AND_INI"
             manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
             if manifest_path and os.path.exists(manifest_path):
@@ -1656,6 +1660,16 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
             pass
         mode_label = "buffers + INI" if generate_ini else "buffers"
         message = f"Exported {mode_label}: {result['objects']} object(s), {result['palettes']} palette(s) to {result['output_dir']}"
+        timings = dict(result.get("timings", {}) or {})
+        if timings:
+            total_seconds = time.perf_counter() - export_start
+            message += (
+                f"; time {total_seconds:.1f}s"
+                f" (parts {materialize_seconds:.1f}s,"
+                f" plan {float(timings.get('plan', 0.0)):.1f}s,"
+                f" buffers {float(timings.get('geometry', 0.0)):.1f}s,"
+                f" runtime {float(timings.get('runtime', 0.0)):.1f}s)"
+            )
         if int(part_materialize_result.get("parts", 0) or 0) > 0:
             message += (
                 f"; auto-parted {int(part_materialize_result.get('regions', 0) or 0)} region(s) "

@@ -30,8 +30,13 @@ class _MeshExportCache:
     mesh: object
     group_index_to_global: dict[int, int]
     mirror_flip: bool
+    matrix_world_applied: bool
+    owned_mesh: object | None
+    game_position_by_vertex: dict[int, tuple[float, float, float]]
+    game_normal_by_loop: dict[int, tuple[float, float, float]]
     top4_by_vertex: dict[int, tuple[tuple[float, float, float, float], tuple[int, int, int, int]]]
     uv_layers: dict[str, object | None]
+    uv_by_layer_loop: dict[tuple[str, int], tuple[float, float]]
     attribute_refs: dict[str, object | None]
     color_attribute_refs: dict[str, object | None]
 
@@ -59,19 +64,43 @@ class _ExportPartCache:
         key = id(mesh_obj)
         cache = self.mesh_caches.get(key)
         if cache is None:
-            mesh = getattr(mesh_obj, "data", None)
+            mesh, matrix_world_applied, owned_mesh = _evaluated_export_mesh(mesh_obj)
             cache = _MeshExportCache(
                 mesh_obj=mesh_obj,
                 mesh=mesh,
                 group_index_to_global=_group_index_to_global(mesh_obj),
                 mirror_flip=_object_mirror_flip(mesh_obj, self.mirror_flip_default),
+                matrix_world_applied=matrix_world_applied,
+                owned_mesh=owned_mesh,
+                game_position_by_vertex={},
+                game_normal_by_loop={},
                 top4_by_vertex={},
                 uv_layers={},
+                uv_by_layer_loop={},
                 attribute_refs={},
                 color_attribute_refs={},
             )
             self.mesh_caches[key] = cache
         return cache
+
+    def release(self) -> None:
+        for cache in self.mesh_caches.values():
+            if cache.owned_mesh is not None:
+                _release_owned_mesh(cache.owned_mesh)
+                cache.owned_mesh = None
+
+
+@dataclass
+class _PreparedVertexSlot:
+    slot_name: str
+    slot_layout: dict
+    role_name: str
+    file_name: str
+    file_path: str
+    stride: int
+    fields: list[dict]
+    field_offsets: list[tuple[dict, int]]
+    output: bytearray
 
 
 def write_part_geometry_buffers(
@@ -106,53 +135,58 @@ def _write_part_geometry_buffers(
 ) -> dict:
     layout = _resolve_part_layout(part, vertex_layout_table)
     normalized_layout = _normalize_vertex_layout(layout)
-    loop_vertices, indices = _collect_part_loop_vertices(part)
-    if not loop_vertices:
-        raise ValueError(f"{part.region.key}/{part.part_name}: no triangles to export")
     export_cache = _ExportPartCache.from_part(
         part,
         mirror_flip_default=mirror_flip_default,
     )
+    try:
+        loop_vertices, indices = _collect_part_loop_vertices(part, export_cache)
+        if not loop_vertices:
+            raise ValueError(f"{part.region.key}/{part.part_name}: no triangles to export")
 
-    ib_file_name = f"{part.file_stem}-Index.buf"
-    ib_file_path = os.path.join(buffer_dir, ib_file_name)
-    write_r32_index_buffer(ib_file_path, indices)
+        ib_file_name = f"{part.file_stem}-Index.buf"
+        ib_file_path = os.path.join(buffer_dir, ib_file_name)
+        write_r32_index_buffer(ib_file_path, indices)
 
-    vb_records: dict[str, dict] = {}
-    for slot_name, slot_layout in sorted(normalized_layout.items(), key=lambda item: item[0]):
-        if slot_name == "vb3":
-            # Runtime aliases vb3 to vb0 for this game layout, so exporting a
-            # duplicate position buffer only costs time and disk bandwidth.
-            continue
-        role_name = _slot_file_role(slot_name)
-        file_name = f"{part.file_stem}-{role_name}.buf"
-        file_path = os.path.join(buffer_dir, file_name)
-        _write_vertex_slot_buffer(file_path, slot_name, slot_layout, loop_vertices, export_cache)
-        vb_records[slot_name] = {
-            "role": role_name,
-            "file_name": file_name,
-            "file_path": file_path,
-            "stride": int(slot_layout["stride"]),
-            "vertex_count": len(loop_vertices),
-            "fields": list(slot_layout["fields"]),
+        vb_records: dict[str, dict] = {}
+        prepared_slots: list[_PreparedVertexSlot] = []
+        for slot_name, slot_layout in sorted(normalized_layout.items(), key=lambda item: item[0]):
+            if slot_name == "vb3":
+                # Runtime aliases vb3 to vb0 for this game layout, so exporting a
+                # duplicate position buffer only costs time and disk bandwidth.
+                continue
+            role_name = _slot_file_role(slot_name)
+            file_name = f"{part.file_stem}-{role_name}.buf"
+            file_path = os.path.join(buffer_dir, file_name)
+            prepared_slots.append(_prepare_vertex_slot(slot_name, slot_layout, role_name, file_name, file_path, len(loop_vertices)))
+            vb_records[slot_name] = {
+                "role": role_name,
+                "file_name": file_name,
+                "file_path": file_path,
+                "stride": int(slot_layout["stride"]),
+                "vertex_count": len(loop_vertices),
+                "fields": list(slot_layout["fields"]),
+            }
+        _write_prepared_vertex_slots(prepared_slots, loop_vertices, export_cache)
+
+        return {
+            "region_collection": part.region.collection_name,
+            "part_name": part.part_name,
+            "object_names": [usage.name for usage in part.object_usages],
+            "ib_hash": part.region.ib_hash,
+            "match_first_index": int(part.region.match_first_index),
+            "match_index_count": int(part.region.match_index_count),
+            "part_index": int(part.part_index),
+            "index_buffer": {
+                "file_name": ib_file_name,
+                "file_path": ib_file_path,
+                "format": "DXGI_FORMAT_R32_UINT",
+                "index_count": len(indices),
+            },
+            "vertex_buffers": vb_records,
         }
-
-    return {
-        "region_collection": part.region.collection_name,
-        "part_name": part.part_name,
-        "object_names": [usage.name for usage in part.object_usages],
-        "ib_hash": part.region.ib_hash,
-        "match_first_index": int(part.region.match_first_index),
-        "match_index_count": int(part.region.match_index_count),
-        "part_index": int(part.part_index),
-        "index_buffer": {
-            "file_name": ib_file_name,
-            "file_path": ib_file_path,
-            "format": "DXGI_FORMAT_R32_UINT",
-            "index_count": len(indices),
-        },
-        "vertex_buffers": vb_records,
-    }
+    finally:
+        export_cache.release()
 
 
 def _resolve_part_layout(part: ExportPartPlan, vertex_layout_table: dict) -> dict:
@@ -216,12 +250,12 @@ def _normalize_vertex_layout(layout: dict) -> dict[str, dict]:
     return normalized
 
 
-def _collect_part_loop_vertices(part: ExportPartPlan) -> tuple[list[_LoopVertex], list[int]]:
+def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartCache) -> tuple[list[_LoopVertex], list[int]]:
     loop_vertices: list[_LoopVertex] = []
     indices: list[int] = []
     next_index = 0
     for mesh_obj in part.mesh_objects:
-        mesh = getattr(mesh_obj, "data", None)
+        mesh = export_cache.object_mesh_cache(mesh_obj).mesh
         if mesh is None:
             continue
         for polygon in getattr(mesh, "polygons", []) or []:
@@ -252,30 +286,64 @@ def _collect_part_loop_vertices(part: ExportPartPlan) -> tuple[list[_LoopVertex]
     return loop_vertices, indices
 
 
-def _write_vertex_slot_buffer(
-    file_path: str,
+def _prepare_vertex_slot(
     slot_name: str,
     slot_layout: dict,
+    role_name: str,
+    file_name: str,
+    file_path: str,
+    vertex_count: int,
+) -> _PreparedVertexSlot:
+    stride = int(slot_layout["stride"])
+    fields = list(slot_layout["fields"])
+    field_offsets: list[tuple[dict, int]] = []
+    for field in fields:
+        offset = int(field["aligned_byte_offset"])
+        if offset < 0:
+            raise ValueError(f"{slot_name}: field {field['semantic']} has negative offset")
+        field_offsets.append((field, offset))
+    return _PreparedVertexSlot(
+        slot_name=slot_name,
+        slot_layout=slot_layout,
+        role_name=role_name,
+        file_name=file_name,
+        file_path=file_path,
+        stride=stride,
+        fields=fields,
+        field_offsets=field_offsets,
+        output=bytearray(vertex_count * stride),
+    )
+
+
+def _write_prepared_vertex_slots(
+    prepared_slots: list[_PreparedVertexSlot],
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
 ) -> None:
-    directory = os.path.dirname(file_path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    stride = int(slot_layout["stride"])
-    output = bytearray(len(loop_vertices) * stride)
-    fields = list(slot_layout["fields"])
     for record_index, loop_vertex in enumerate(loop_vertices):
-        record_base = record_index * stride
-        for field in fields:
-            field_bytes = _field_bytes(slot_name, slot_layout, field, loop_vertex, export_cache)
-            offset = int(field["aligned_byte_offset"])
-            end_offset = offset + len(field_bytes)
-            if offset < 0 or end_offset > stride:
-                raise ValueError(f"{slot_name}: field {field['semantic']} exceeds stride {stride}")
-            output[record_base + offset:record_base + end_offset] = field_bytes
-    with open(file_path, "wb") as file_handle:
-        file_handle.write(output)
+        for slot in prepared_slots:
+            _write_vertex_slot_record(slot, record_index, loop_vertex, export_cache)
+    for slot in prepared_slots:
+        directory = os.path.dirname(slot.file_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(slot.file_path, "wb") as file_handle:
+            file_handle.write(slot.output)
+
+
+def _write_vertex_slot_record(
+    slot: _PreparedVertexSlot,
+    record_index: int,
+    loop_vertex: _LoopVertex,
+    export_cache: _ExportPartCache,
+) -> None:
+    record_base = record_index * slot.stride
+    for field, offset in slot.field_offsets:
+        field_bytes = _field_bytes(slot.slot_name, slot.slot_layout, field, loop_vertex, export_cache)
+        end_offset = offset + len(field_bytes)
+        if end_offset > slot.stride:
+            raise ValueError(f"{slot.slot_name}: field {field['semantic']} exceeds stride {slot.stride}")
+        slot.output[record_base + offset:record_base + end_offset] = field_bytes
 
 
 def _field_bytes(
@@ -309,25 +377,42 @@ def _field_bytes(
 
 
 def _game_position(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[float, float, float]:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    cached = mesh_cache.game_position_by_vertex.get(loop_vertex.vertex_index)
+    if cached is not None:
+        return cached
     vertex = getattr(loop_vertex.mesh, "vertices")[loop_vertex.vertex_index]
     co = _vector3(getattr(vertex, "co", (0.0, 0.0, 0.0)))
-    co = _transform_point(loop_vertex.mesh_obj, co)
-    if export_cache.mesh_cache(loop_vertex).mirror_flip:
+    if not mesh_cache.matrix_world_applied:
+        co = _transform_point(loop_vertex.mesh_obj, co)
+    if mesh_cache.mirror_flip:
         co = (-co[0], co[1], co[2])
+    mesh_cache.game_position_by_vertex[loop_vertex.vertex_index] = co
     return co
 
 
 def _game_normal(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[float, float, float]:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    cached = mesh_cache.game_normal_by_loop.get(loop_vertex.loop_index)
+    if cached is not None:
+        return cached
     loop = getattr(loop_vertex.mesh, "loops", [])[loop_vertex.loop_index]
     normal = _vector3(getattr(loop, "normal", None) or getattr(loop_vertex.polygon, "normal", None) or (0.0, 0.0, 1.0))
-    normal = _transform_normal(loop_vertex.mesh_obj, normal)
-    if export_cache.mesh_cache(loop_vertex).mirror_flip:
+    if not mesh_cache.matrix_world_applied:
+        normal = _transform_normal(loop_vertex.mesh_obj, normal)
+    if mesh_cache.mirror_flip:
         normal = (-normal[0], normal[1], normal[2])
-    return _normalize3(normal)
+    normal = _normalize3(normal)
+    mesh_cache.game_normal_by_loop[loop_vertex.loop_index] = normal
+    return normal
 
 
 def _uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCache) -> tuple[float, float]:
     mesh_cache = export_cache.mesh_cache(loop_vertex)
+    cache_key = (layer_name, loop_vertex.loop_index)
+    cached = mesh_cache.uv_by_layer_loop.get(cache_key)
+    if cached is not None:
+        return cached
     layer = mesh_cache.uv_layers.get(layer_name)
     if layer_name not in mesh_cache.uv_layers:
         uv_layers = getattr(loop_vertex.mesh, "uv_layers", None)
@@ -342,7 +427,9 @@ def _uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCach
     if layer is None:
         raise ValueError(f"{getattr(loop_vertex.mesh_obj, 'name', '<mesh>')}: missing required UV layer {layer_name}")
     uv = getattr(layer.data[loop_vertex.loop_index], "uv", (0.0, 0.0))
-    return (float(uv[0]), float(uv[1]))
+    result = (float(uv[0]), float(uv[1]))
+    mesh_cache.uv_by_layer_loop[cache_key] = result
+    return result
 
 
 def _optional_uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCache) -> tuple[float, float] | None:
@@ -570,6 +657,77 @@ def _object_mirror_flip(obj, default: bool) -> bool:
     if value is None:
         return bool(default)
     return bool(value)
+
+
+def _evaluated_export_mesh(mesh_obj) -> tuple[object | None, bool, object | None]:
+    original_mesh = getattr(mesh_obj, "data", None)
+    try:
+        import bpy  # type: ignore
+    except Exception:
+        return original_mesh, False, None
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated_obj = mesh_obj.evaluated_get(depsgraph)
+    except Exception:
+        return original_mesh, False, None
+
+    try:
+        mesh_copy = bpy.data.meshes.new_from_object(
+            evaluated_obj,
+            preserve_all_data_layers=True,
+            depsgraph=depsgraph,
+        )
+    except TypeError:
+        try:
+            mesh_copy = bpy.data.meshes.new_from_object(evaluated_obj, depsgraph=depsgraph)
+        except Exception:
+            return original_mesh, False, None
+    except Exception:
+        return original_mesh, False, None
+    if mesh_copy is None:
+        return original_mesh, False, None
+
+    try:
+        mesh_copy.transform(evaluated_obj.matrix_world)
+        mesh_copy.update()
+        _triangulate_mesh_copy(mesh_copy)
+        mesh_copy.update()
+        calc_loop_triangles = getattr(mesh_copy, "calc_loop_triangles", None)
+        if callable(calc_loop_triangles):
+            calc_loop_triangles()
+    except Exception:
+        _release_owned_mesh(mesh_copy)
+        return original_mesh, False, None
+    return mesh_copy, True, mesh_copy
+
+
+def _triangulate_mesh_copy(mesh) -> None:
+    polygons = getattr(mesh, "polygons", []) or []
+    if not any(int(getattr(polygon, "loop_total", len(getattr(polygon, "loop_indices", []) or [])) or 0) != 3 for polygon in polygons):
+        return
+    try:
+        import bmesh  # type: ignore
+    except Exception:
+        return
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bmesh.ops.triangulate(bm, faces=list(bm.faces))
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+
+
+def _release_owned_mesh(mesh) -> None:
+    try:
+        import bpy  # type: ignore
+    except Exception:
+        return
+    try:
+        bpy.data.meshes.remove(mesh)
+    except Exception:
+        pass
 
 
 def _split_semantic(semantic: str) -> tuple[str, int]:

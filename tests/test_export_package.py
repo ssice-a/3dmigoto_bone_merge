@@ -41,6 +41,14 @@ class FakeObject:
         self._props[key] = value
 
 
+class FakeMatrix:
+    def __init__(self, offset):
+        self.offset = tuple(offset)
+
+    def __matmul__(self, value):
+        return tuple(float(value[index]) + float(self.offset[index]) for index in range(3))
+
+
 class FakeVertexGroup:
     def __init__(self, name: str, index: int):
         self.name = name
@@ -551,6 +559,49 @@ class ExportPackageTests(unittest.TestCase):
             position_path = Path(tmpdir) / "640d1c0e-3-0_part00-Position.buf"
             values = struct.unpack("<9f", position_path.read_bytes())
             self.assertEqual(values[:3], (-1.0, 2.0, 3.0))
+
+    def test_export_position_applies_object_matrix_before_game_mirror(self):
+        target = FakeObject(
+            "ExternalBody",
+            [0],
+            positions=[(1.0, 2.0, 3.0), (4.0, 5.0, 6.0), (7.0, 8.0, 9.0)],
+            triangles=[(0, 1, 2)],
+        )
+        target.matrix_world = FakeMatrix((10.0, 20.0, 30.0))
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb0": {
+                        "slot": "vb0",
+                        "stride": 12,
+                        "elements": [
+                            {
+                                "semantic_name": "POSITION",
+                                "semantic_index": 0,
+                                "format": "R32G32B32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                mirror_flip_default=True,
+            )
+            position_path = Path(tmpdir) / "640d1c0e-3-0_part00-Position.buf"
+            values = struct.unpack("<9f", position_path.read_bytes())
+            self.assertEqual(values[:3], (-11.0, 22.0, 33.0))
 
 
 if __name__ == "__main__":

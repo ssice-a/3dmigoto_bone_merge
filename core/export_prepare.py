@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from ..constants import (
     BI4_MAX_BONE_COUNT,
@@ -35,24 +36,42 @@ def prepare_export_collection(
     if source_collection is None:
         raise ValueError("Export source collection is not set")
     _ = build_collection
+    total_start = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    stage_start = time.perf_counter()
 
     normalized_output_dir = ensure_directory(output_dir or context.scene.bmc_output_dir or context.scene.bmc_frameanalysis_dir)
     buffer_dir = ensure_directory(os.path.join(normalized_output_dir, BUFFER_EXPORT_DIR_NAME))
     hlsl_dir = export_required_hlsl(normalized_output_dir) if generate_ini else ""
+    timings["setup"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     export_plan = build_export_plan(
         source_collection,
         _collect_used_numeric_vertex_groups,
         max_bones_per_part=BI4_MAX_BONE_COUNT,
     )
+    timings["plan"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     capture_manifest = _read_capture_manifest_for_export(normalized_output_dir, capture_manifest_path)
+    timings["capture_manifest"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     palette_records = write_part_palette_files(buffer_dir, export_plan)
+    timings["palettes"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     geometry_records = write_part_geometry_buffers(
         buffer_dir,
         export_plan.parts,
         dict(capture_manifest.get("vertex_layout_table", {}) or {}),
         mirror_flip_default=bool(getattr(context.scene, "bmc_mirror_flip", True)),
     )
+    timings["geometry"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     local_palette_records = [_local_palette_record_from_export_record(record) for record in palette_records]
     texture_mark_payload = _read_texture_marks_for_export(context, source_collection)
     object_records = []
@@ -92,6 +111,9 @@ def prepare_export_collection(
     }
     manifest_dir = ensure_directory(internal_manifest_dir or normalized_output_dir)
     manifest_path = write_json(os.path.join(manifest_dir, EXPORT_MANIFEST_FILE_NAME), manifest)
+    timings["manifest"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     bonestore_ini_path = regenerate_bonestore_runtime_files(
         output_dir=normalized_output_dir,
         capture_manifest_path=capture_manifest_path,
@@ -99,6 +121,8 @@ def prepare_export_collection(
         local_palette_records=local_palette_records,
         write_ini=generate_ini,
     )
+    timings["runtime"] = time.perf_counter() - stage_start
+    timings["total"] = time.perf_counter() - total_start
     return {
         "manifest_path": manifest_path,
         "bonestore_ini_path": bonestore_ini_path,
@@ -108,6 +132,7 @@ def prepare_export_collection(
         "hlsl_dir": hlsl_dir,
         "objects": len(object_records),
         "palettes": len(palette_records),
+        "timings": {name: round(seconds, 3) for name, seconds in timings.items()},
     }
 
 

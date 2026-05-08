@@ -68,6 +68,7 @@ def prepare_export_collection(
         export_plan.parts,
         dict(capture_manifest.get("vertex_layout_table", {}) or {}),
         mirror_flip_default=bool(getattr(context.scene, "bmc_mirror_flip", True)),
+        uv_flip_v_default=bool(getattr(context.scene, "bmc_uv_flip_v", True)),
     )
     timings["geometry"] = time.perf_counter() - stage_start
 
@@ -101,8 +102,15 @@ def prepare_export_collection(
         "palettes": palette_records,
         "geometry_buffers": geometry_records,
         "texture_marks": texture_mark_payload,
+        "export_options": {
+            "mirror_flip": bool(getattr(context.scene, "bmc_mirror_flip", True)),
+            "uv_flip_v": bool(getattr(context.scene, "bmc_uv_flip_v", True)),
+        },
         "objects": object_records,
         "warnings": list(export_plan.warnings),
+        "performance": {
+            "geometry": _geometry_performance_summary(geometry_records),
+        },
         "note": (
             "Export Root Collection child collections are final IB regions. "
             "Each region exports one implicit part00 or explicit partNN collections. "
@@ -123,6 +131,11 @@ def prepare_export_collection(
     )
     timings["runtime"] = time.perf_counter() - stage_start
     timings["total"] = time.perf_counter() - total_start
+    _write_export_performance_manifest(
+        manifest_path,
+        timings={name: round(seconds, 3) for name, seconds in timings.items()},
+        geometry_summary=_geometry_performance_summary(geometry_records),
+    )
     return {
         "manifest_path": manifest_path,
         "bonestore_ini_path": bonestore_ini_path,
@@ -153,6 +166,54 @@ def _collect_used_numeric_vertex_groups(mesh_obj) -> set[int]:
     if not used_groups:
         raise ValueError(f"{mesh_obj.name}: no weighted numeric vertex groups found")
     return used_groups
+
+
+def _geometry_performance_summary(geometry_records: list[dict]) -> dict:
+    loop_vertex_count = 0
+    index_count = 0
+    vb_slot_count = 0
+    slowest_parts: list[dict] = []
+    for record in geometry_records:
+        stats = dict(record.get("stats", {}) or {})
+        timings = dict(record.get("timings", {}) or {})
+        loop_vertex_count += int(stats.get("loop_vertex_count", 0) or 0)
+        index_count += int(stats.get("index_count", 0) or 0)
+        vb_slot_count += int(stats.get("vb_slot_count", 0) or 0)
+        slowest_parts.append(
+            {
+                "part": f"{record.get('ib_hash', '')}-{record.get('match_index_count', 0)}-{record.get('match_first_index', 0)}:{record.get('part_name', '')}",
+                "objects": list(record.get("object_names", []) or []),
+                "loop_vertex_count": int(stats.get("loop_vertex_count", 0) or 0),
+                "vb_slot_count": int(stats.get("vb_slot_count", 0) or 0),
+                "total_seconds": float(timings.get("total", 0.0) or 0.0),
+                "write_vb_seconds": float(timings.get("write_vb", 0.0) or 0.0),
+                "collect_loops_seconds": float(timings.get("collect_loops", 0.0) or 0.0),
+            }
+        )
+    slowest_parts.sort(key=lambda item: float(item.get("total_seconds", 0.0)), reverse=True)
+    return {
+        "part_count": len(geometry_records),
+        "loop_vertex_count": loop_vertex_count,
+        "index_count": index_count,
+        "vb_slot_count": vb_slot_count,
+        "slowest_parts": slowest_parts[:10],
+    }
+
+
+def _write_export_performance_manifest(manifest_path: str, *, timings: dict, geometry_summary: dict) -> None:
+    if not manifest_path or not os.path.exists(manifest_path):
+        return
+    try:
+        export_manifest = read_json(manifest_path)
+    except Exception:
+        return
+    if not isinstance(export_manifest, dict):
+        return
+    performance = dict(export_manifest.get("performance", {}) or {})
+    performance["timings"] = dict(timings)
+    performance["geometry"] = dict(geometry_summary)
+    export_manifest["performance"] = performance
+    write_json(manifest_path, export_manifest)
 
 
 def regenerate_bonestore_runtime_files(

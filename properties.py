@@ -108,6 +108,7 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_candidate_index"),
     (bpy.types.Scene, "bmc_candidate_add_hash"),
     (bpy.types.Scene, "bmc_mirror_flip"),
+    (bpy.types.Scene, "bmc_uv_flip_v"),
     (bpy.types.Scene, "bmc_lod_mapping_items"),
     (bpy.types.Scene, "bmc_lod_mapping_index"),
     (bpy.types.Scene, "bmc_lod_fallback_items"),
@@ -392,6 +393,11 @@ def register_addon_properties():
         name="Mirror Flip",
         default=True,
         description="Mirror imported geometry on the X axis. This matches the default game-to-Blender import orientation.",
+    )
+    bpy.types.Scene.bmc_uv_flip_v = bpy.props.BoolProperty(
+        name="Flip UV V",
+        default=True,
+        description="Flip UV V on import and flip it back on export so Blender view matches the game texture orientation.",
     )
     bpy.types.Scene.bmc_lod_mapping_items = bpy.props.CollectionProperty(type=BMC_LodMappingItem)
     bpy.types.Scene.bmc_lod_mapping_index = bpy.props.IntProperty(name="LOD Mapping Index", default=0, min=0)

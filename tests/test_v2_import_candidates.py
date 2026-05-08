@@ -16,6 +16,7 @@ if str(PACKAGE_PARENT) not in sys.path:
 
 main_analyze = importlib.import_module(f"{PACKAGE_DIR.name}.core.main_analyze")
 import_candidates = importlib.import_module(f"{PACKAGE_DIR.name}.core.import_candidates")
+uv_transform = importlib.import_module(f"{PACKAGE_DIR.name}.core.uv_transform")
 
 
 SAMPLE_FRAMEANALYSIS = Path(r"E:\XXMI\EFMI\FrameAnalysis-2026-05-05-225007")
@@ -23,6 +24,17 @@ MAIN_FRAMEANALYSIS = Path(r"E:\XXMI\EFMI\FrameAnalysis-2026-05-05-222451")
 
 
 class SyntheticCandidateImportTests(unittest.TestCase):
+    def test_uv_v_transform_is_symmetric_between_import_and_export(self):
+        game_uv = (0.125, 0.75)
+        blender_uv = uv_transform.game_uv_to_blender(game_uv)
+        self.assertEqual(blender_uv, (0.125, 0.25))
+        self.assertEqual(uv_transform.blender_uv_to_game(blender_uv), game_uv)
+
+    def test_uv_v_transform_can_be_disabled(self):
+        uv = (0.125, 0.75)
+        self.assertEqual(uv_transform.game_uv_to_blender(uv, flip_v=False), uv)
+        self.assertEqual(uv_transform.blender_uv_to_game(uv, flip_v=False), uv)
+
     def test_bone_pool_order_places_capture_ready_candidates_before_mapping_only_candidates(self):
         candidates = [
             {

@@ -159,6 +159,7 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
             "bmc_frameanalysis_dir",
             "bmc_lod_frameanalysis_dir",
             "bmc_mirror_flip",
+            "bmc_uv_flip_v",
             "bmc_candidate_items",
             "bmc_candidate_index",
             "bmc_export_collection",
@@ -172,6 +173,7 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         scan_box.label(text="Main Analyze", icon="VIEWZOOM")
         scan_box.prop(scene, "bmc_frameanalysis_dir")
         scan_box.prop(scene, "bmc_mirror_flip")
+        scan_box.prop(scene, "bmc_uv_flip_v")
         scan_actions = scan_box.row(align=True)
         scan_actions.operator("object.bmc_analyze_main_frameanalysis", icon="VIEWZOOM")
         scan_actions.operator("object.bmc_import_selected_candidates", icon="IMPORT")

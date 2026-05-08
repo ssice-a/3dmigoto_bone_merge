@@ -12,6 +12,7 @@ from typing import Iterable
 
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
 from .texcoord_attrs import snorm_byte_to_color_component, texcoord_color_attr_names
+from .uv_transform import DEFAULT_UV_FLIP_V, game_uv_to_blender
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
 
 
@@ -169,6 +170,7 @@ def import_selected_candidates(
     target_collection,
     *,
     mirror_flip: bool = DEFAULT_MIRROR_FLIP,
+    uv_flip_v: bool = DEFAULT_UV_FLIP_V,
 ):
     """Create Blender mesh objects for selected candidate display names."""
 
@@ -191,6 +193,7 @@ def import_selected_candidates(
             draw_indices=list(candidate.get("draw_indices", []) or []),
             shadow_draw_indices=list(candidate.get("shadow_draw_indices", []) or []),
             mirror_flip=mirror_flip,
+            uv_flip_v=uv_flip_v,
         )
         imported_objects.append(imported_object)
 
@@ -211,6 +214,7 @@ def create_blender_object_from_geometry(
     draw_indices: list[int],
     shadow_draw_indices: list[int],
     mirror_flip: bool = DEFAULT_MIRROR_FLIP,
+    uv_flip_v: bool = DEFAULT_UV_FLIP_V,
 ):
     mesh = bpy_module.data.meshes.new(geometry.display_name)
     imported_object = bpy_module.data.objects.new(geometry.display_name, mesh)
@@ -226,9 +230,9 @@ def create_blender_object_from_geometry(
         polygon.use_smooth = True
 
     if geometry.uv0 is not None:
-        _apply_uv_layer(mesh, "UV0", geometry.uv0)
+        _apply_uv_layer(mesh, "UV0", geometry.uv0, uv_flip_v=uv_flip_v)
     if geometry.uv1 is not None:
-        _apply_uv_layer(mesh, "UV1", geometry.uv1)
+        _apply_uv_layer(mesh, "UV1", geometry.uv1, uv_flip_v=uv_flip_v)
     _apply_custom_normals(mesh, blender_normals)
     _store_int_attribute(mesh, "bmc_orig_vertex_id", geometry.original_vertex_ids)
     _store_uint32_split_attributes(mesh, "bmc_normal_packed", geometry.normal_packed)
@@ -261,6 +265,7 @@ def create_blender_object_from_geometry(
     imported_object["bmc_shadow_draw_indices"] = ",".join(str(value) for value in shadow_draw_indices)
     imported_object["bmc_mirror_flip"] = bool(mirror_flip)
     imported_object["modimp_mirror_flip"] = bool(mirror_flip)
+    imported_object["bmc_uv_flip_v"] = bool(uv_flip_v)
     imported_object["bmc_uv0_present"] = geometry.uv0 is not None
     imported_object["bmc_uv1_present"] = geometry.uv1 is not None
     imported_object["bmc_vertex_layout_json"] = json.dumps(
@@ -845,12 +850,13 @@ def _normalize_vector(vector: tuple[float, float, float]) -> tuple[float, float,
     return (vector[0] / length, vector[1] / length, vector[2] / length)
 
 
-def _apply_uv_layer(mesh, layer_name: str, values: list[tuple[float, float]]) -> None:
+def _apply_uv_layer(mesh, layer_name: str, values: list[tuple[float, float]], *, uv_flip_v: bool = DEFAULT_UV_FLIP_V) -> None:
     uv_layer = mesh.uv_layers.new(name=layer_name)
     flat_uvs: list[float] = []
     for loop in mesh.loops:
         vertex_index = int(loop.vertex_index)
         uv = values[vertex_index] if vertex_index < len(values) else (0.0, 0.0)
+        uv = game_uv_to_blender(uv, flip_v=uv_flip_v)
         flat_uvs.extend([float(uv[0]), float(uv[1])])
     if _foreach_set(uv_layer.data, "uv", flat_uvs):
         mesh.uv_layers.active = mesh.uv_layers.get("UV0")
@@ -859,7 +865,7 @@ def _apply_uv_layer(mesh, layer_name: str, values: list[tuple[float, float]]) ->
         for loop_index in polygon.loop_indices:
             vertex_index = mesh.loops[loop_index].vertex_index
             if vertex_index < len(values):
-                uv_layer.data[loop_index].uv = values[vertex_index]
+                uv_layer.data[loop_index].uv = game_uv_to_blender(values[vertex_index], flip_v=uv_flip_v)
     mesh.uv_layers.active = mesh.uv_layers.get("UV0")
 
 

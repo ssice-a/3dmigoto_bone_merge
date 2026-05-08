@@ -2191,6 +2191,7 @@ class BMC_OT_import_selected_candidates(bpy.types.Operator):
                 selected_names,
                 target_collection,
                 mirror_flip=bool(getattr(scene, "bmc_mirror_flip", True)),
+                uv_flip_v=bool(getattr(scene, "bmc_uv_flip_v", True)),
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Import Selected IBs failed: {exc}")

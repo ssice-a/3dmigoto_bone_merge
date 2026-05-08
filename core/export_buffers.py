@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 
 from .texcoord_attrs import (
@@ -12,6 +13,7 @@ from .texcoord_attrs import (
     texcoord_component_attr_names,
 )
 from .export_package import ExportPartPlan, write_r32_index_buffer
+from .uv_transform import DEFAULT_UV_FLIP_V, blender_uv_to_game
 from .vertex_format import encode_game_packed_normal, pack_vertex_format
 
 
@@ -25,13 +27,51 @@ class _LoopVertex:
 
 
 @dataclass
+class _EvaluatedMeshRecord:
+    mesh: object | None
+    matrix_world_applied: bool
+    owned_mesh: object | None
+
+
+class _EvaluatedMeshStore:
+    def __init__(self) -> None:
+        self.records: dict[int, _EvaluatedMeshRecord] = {}
+        self.evaluated_count = 0
+        self.fallback_count = 0
+
+    def record(self, mesh_obj) -> _EvaluatedMeshRecord:
+        key = id(mesh_obj)
+        cached = self.records.get(key)
+        if cached is not None:
+            return cached
+        mesh, matrix_world_applied, owned_mesh = _evaluated_export_mesh(mesh_obj)
+        cached = _EvaluatedMeshRecord(
+            mesh=mesh,
+            matrix_world_applied=matrix_world_applied,
+            owned_mesh=owned_mesh,
+        )
+        if owned_mesh is not None:
+            self.evaluated_count += 1
+        else:
+            self.fallback_count += 1
+        self.records[key] = cached
+        return cached
+
+    def release(self) -> None:
+        for record in self.records.values():
+            if record.owned_mesh is not None:
+                _release_owned_mesh(record.owned_mesh)
+                record.owned_mesh = None
+
+
+@dataclass
 class _MeshExportCache:
     mesh_obj: object
     mesh: object
     group_index_to_global: dict[int, int]
     mirror_flip: bool
+    uv_flip_v: bool
     matrix_world_applied: bool
-    owned_mesh: object | None
     game_position_by_vertex: dict[int, tuple[float, float, float]]
     game_normal_by_loop: dict[int, tuple[float, float, float]]
     top4_by_vertex: dict[int, tuple[tuple[float, float, float, float], tuple[int, int, int, int]]]
@@ -45,14 +85,25 @@ class _MeshExportCache:
 class _ExportPartCache:
     part: ExportPartPlan
     mirror_flip_default: bool
+    uv_flip_v_default: bool
+    mesh_store: _EvaluatedMeshStore
     palette_to_local: dict[int, int]
     mesh_caches: dict[int, _MeshExportCache]
 
     @classmethod
-    def from_part(cls, part: ExportPartPlan, *, mirror_flip_default: bool = True) -> "_ExportPartCache":
+    def from_part(
+        cls,
+        part: ExportPartPlan,
+        *,
+        mesh_store: _EvaluatedMeshStore,
+        mirror_flip_default: bool = True,
+        uv_flip_v_default: bool = DEFAULT_UV_FLIP_V,
+    ) -> "_ExportPartCache":
         return cls(
             part=part,
             mirror_flip_default=bool(mirror_flip_default),
+            uv_flip_v_default=bool(uv_flip_v_default),
+            mesh_store=mesh_store,
             palette_to_local={int(global_bone): local_index for local_index, global_bone in enumerate(part.palette_values)},
             mesh_caches={},
         )
@@ -64,14 +115,14 @@ class _ExportPartCache:
         key = id(mesh_obj)
         cache = self.mesh_caches.get(key)
         if cache is None:
-            mesh, matrix_world_applied, owned_mesh = _evaluated_export_mesh(mesh_obj)
+            mesh_record = self.mesh_store.record(mesh_obj)
             cache = _MeshExportCache(
                 mesh_obj=mesh_obj,
-                mesh=mesh,
+                mesh=mesh_record.mesh,
                 group_index_to_global=_group_index_to_global(mesh_obj),
                 mirror_flip=_object_mirror_flip(mesh_obj, self.mirror_flip_default),
-                matrix_world_applied=matrix_world_applied,
-                owned_mesh=owned_mesh,
+                uv_flip_v=self.uv_flip_v_default,
+                matrix_world_applied=mesh_record.matrix_world_applied,
                 game_position_by_vertex={},
                 game_normal_by_loop={},
                 top4_by_vertex={},
@@ -82,12 +133,6 @@ class _ExportPartCache:
             )
             self.mesh_caches[key] = cache
         return cache
-
-    def release(self) -> None:
-        for cache in self.mesh_caches.values():
-            if cache.owned_mesh is not None:
-                _release_owned_mesh(cache.owned_mesh)
-                cache.owned_mesh = None
 
 
 @dataclass
@@ -109,20 +154,27 @@ def write_part_geometry_buffers(
     vertex_layout_table: dict,
     *,
     mirror_flip_default: bool = True,
+    uv_flip_v_default: bool = DEFAULT_UV_FLIP_V,
 ) -> list[dict]:
     """Write IB/VB buffers for every export part and return manifest records."""
 
     os.makedirs(buffer_dir, exist_ok=True)
     records: list[dict] = []
-    for part in parts:
-        records.append(
-            _write_part_geometry_buffers(
-                buffer_dir,
-                part,
-                vertex_layout_table,
-                mirror_flip_default=mirror_flip_default,
+    mesh_store = _EvaluatedMeshStore()
+    try:
+        for part in parts:
+            records.append(
+                _write_part_geometry_buffers(
+                    buffer_dir,
+                    part,
+                    vertex_layout_table,
+                    mesh_store=mesh_store,
+                    mirror_flip_default=mirror_flip_default,
+                    uv_flip_v_default=uv_flip_v_default,
+                )
             )
-        )
+    finally:
+        mesh_store.release()
     return records
 
 
@@ -131,62 +183,87 @@ def _write_part_geometry_buffers(
     part: ExportPartPlan,
     vertex_layout_table: dict,
     *,
+    mesh_store: _EvaluatedMeshStore,
     mirror_flip_default: bool = True,
+    uv_flip_v_default: bool = DEFAULT_UV_FLIP_V,
 ) -> dict:
+    total_start = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    stage_start = time.perf_counter()
     layout = _resolve_part_layout(part, vertex_layout_table)
     normalized_layout = _normalize_vertex_layout(layout)
+    timings["layout"] = time.perf_counter() - stage_start
+
     export_cache = _ExportPartCache.from_part(
         part,
+        mesh_store=mesh_store,
         mirror_flip_default=mirror_flip_default,
+        uv_flip_v_default=uv_flip_v_default,
     )
-    try:
-        loop_vertices, indices = _collect_part_loop_vertices(part, export_cache)
-        if not loop_vertices:
-            raise ValueError(f"{part.region.key}/{part.part_name}: no triangles to export")
 
-        ib_file_name = f"{part.file_stem}-Index.buf"
-        ib_file_path = os.path.join(buffer_dir, ib_file_name)
-        write_r32_index_buffer(ib_file_path, indices)
+    stage_start = time.perf_counter()
+    loop_vertices, indices = _collect_part_loop_vertices(part, export_cache)
+    timings["collect_loops"] = time.perf_counter() - stage_start
+    if not loop_vertices:
+        raise ValueError(f"{part.region.key}/{part.part_name}: no triangles to export")
 
-        vb_records: dict[str, dict] = {}
-        prepared_slots: list[_PreparedVertexSlot] = []
-        for slot_name, slot_layout in sorted(normalized_layout.items(), key=lambda item: item[0]):
-            if slot_name == "vb3":
-                # Runtime aliases vb3 to vb0 for this game layout, so exporting a
-                # duplicate position buffer only costs time and disk bandwidth.
-                continue
-            role_name = _slot_file_role(slot_name)
-            file_name = f"{part.file_stem}-{role_name}.buf"
-            file_path = os.path.join(buffer_dir, file_name)
-            prepared_slots.append(_prepare_vertex_slot(slot_name, slot_layout, role_name, file_name, file_path, len(loop_vertices)))
-            vb_records[slot_name] = {
-                "role": role_name,
-                "file_name": file_name,
-                "file_path": file_path,
-                "stride": int(slot_layout["stride"]),
-                "vertex_count": len(loop_vertices),
-                "fields": list(slot_layout["fields"]),
-            }
-        _write_prepared_vertex_slots(prepared_slots, loop_vertices, export_cache)
+    stage_start = time.perf_counter()
+    ib_file_name = f"{part.file_stem}-Index.buf"
+    ib_file_path = os.path.join(buffer_dir, ib_file_name)
+    write_r32_index_buffer(ib_file_path, indices)
+    timings["write_ib"] = time.perf_counter() - stage_start
 
-        return {
-            "region_collection": part.region.collection_name,
-            "part_name": part.part_name,
-            "object_names": [usage.name for usage in part.object_usages],
-            "ib_hash": part.region.ib_hash,
-            "match_first_index": int(part.region.match_first_index),
-            "match_index_count": int(part.region.match_index_count),
-            "part_index": int(part.part_index),
-            "index_buffer": {
-                "file_name": ib_file_name,
-                "file_path": ib_file_path,
-                "format": "DXGI_FORMAT_R32_UINT",
-                "index_count": len(indices),
-            },
-            "vertex_buffers": vb_records,
+    stage_start = time.perf_counter()
+    vb_records: dict[str, dict] = {}
+    prepared_slots: list[_PreparedVertexSlot] = []
+    for slot_name, slot_layout in sorted(normalized_layout.items(), key=lambda item: item[0]):
+        if slot_name == "vb3":
+            # Runtime aliases vb3 to vb0 for this game layout, so exporting a
+            # duplicate position buffer only costs time and disk bandwidth.
+            continue
+        role_name = _slot_file_role(slot_name)
+        file_name = f"{part.file_stem}-{role_name}.buf"
+        file_path = os.path.join(buffer_dir, file_name)
+        prepared_slots.append(_prepare_vertex_slot(slot_name, slot_layout, role_name, file_name, file_path, len(loop_vertices)))
+        vb_records[slot_name] = {
+            "role": role_name,
+            "file_name": file_name,
+            "file_path": file_path,
+            "stride": int(slot_layout["stride"]),
+            "vertex_count": len(loop_vertices),
+            "fields": list(slot_layout["fields"]),
         }
-    finally:
-        export_cache.release()
+    timings["prepare_vb"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    _write_prepared_vertex_slots(prepared_slots, loop_vertices, export_cache)
+    timings["write_vb"] = time.perf_counter() - stage_start
+    timings["total"] = time.perf_counter() - total_start
+
+    return {
+        "region_collection": part.region.collection_name,
+        "part_name": part.part_name,
+        "object_names": [usage.name for usage in part.object_usages],
+        "ib_hash": part.region.ib_hash,
+        "match_first_index": int(part.region.match_first_index),
+        "match_index_count": int(part.region.match_index_count),
+        "part_index": int(part.part_index),
+        "index_buffer": {
+            "file_name": ib_file_name,
+            "file_path": ib_file_path,
+            "format": "DXGI_FORMAT_R32_UINT",
+            "index_count": len(indices),
+        },
+        "vertex_buffers": vb_records,
+        "stats": {
+            "mesh_object_count": len(part.mesh_objects),
+            "loop_vertex_count": len(loop_vertices),
+            "index_count": len(indices),
+            "vb_slot_count": len(prepared_slots),
+        },
+        "timings": {name: round(seconds, 3) for name, seconds in timings.items()},
+    }
 
 
 def _resolve_part_layout(part: ExportPartPlan, vertex_layout_table: dict) -> dict:
@@ -416,20 +493,69 @@ def _uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCach
     layer = mesh_cache.uv_layers.get(layer_name)
     if layer_name not in mesh_cache.uv_layers:
         uv_layers = getattr(loop_vertex.mesh, "uv_layers", None)
-        layer = None
-        if uv_layers is not None:
-            getter = getattr(uv_layers, "get", None)
-            if callable(getter):
-                layer = getter(layer_name)
-            elif isinstance(uv_layers, dict):
-                layer = uv_layers.get(layer_name)
+        layer = _resolve_uv_layer(uv_layers, layer_name)
         mesh_cache.uv_layers[layer_name] = layer
     if layer is None:
         raise ValueError(f"{getattr(loop_vertex.mesh_obj, 'name', '<mesh>')}: missing required UV layer {layer_name}")
     uv = getattr(layer.data[loop_vertex.loop_index], "uv", (0.0, 0.0))
-    result = (float(uv[0]), float(uv[1]))
+    result = blender_uv_to_game((float(uv[0]), float(uv[1])), flip_v=mesh_cache.uv_flip_v)
     mesh_cache.uv_by_layer_loop[cache_key] = result
     return result
+
+
+def _resolve_uv_layer(uv_layers, layer_name: str):
+    if uv_layers is None:
+        return None
+    normalized = str(layer_name or "").upper()
+    if normalized == "UV0":
+        return _active_uv_layer(uv_layers) or _named_uv_layer(uv_layers, layer_name) or _indexed_uv_layer(uv_layers, 0)
+    if normalized == "UV1":
+        return (
+            _named_uv_layer(uv_layers, layer_name)
+            or _indexed_uv_layer(uv_layers, 1)
+            or _active_uv_layer(uv_layers)
+            or _indexed_uv_layer(uv_layers, 0)
+        )
+    return _named_uv_layer(uv_layers, layer_name)
+
+
+def _named_uv_layer(uv_layers, layer_name: str):
+    getter = getattr(uv_layers, "get", None)
+    if callable(getter):
+        layer = getter(layer_name)
+        if layer is not None:
+            return layer
+    if isinstance(uv_layers, dict):
+        return uv_layers.get(layer_name)
+    return None
+
+
+def _active_uv_layer(uv_layers):
+    for attribute_name in ("active_render", "active"):
+        layer = getattr(uv_layers, attribute_name, None)
+        if layer is not None:
+            return layer
+    active_index = getattr(uv_layers, "active_index", None)
+    if active_index is not None:
+        return _indexed_uv_layer(uv_layers, int(active_index))
+    return None
+
+
+def _indexed_uv_layer(uv_layers, index: int):
+    if index < 0:
+        return None
+    if isinstance(uv_layers, dict):
+        values = list(uv_layers.values())
+        return values[index] if index < len(values) else None
+    try:
+        return uv_layers[index]
+    except Exception:
+        pass
+    try:
+        values = list(uv_layers)
+    except Exception:
+        return None
+    return values[index] if index < len(values) else None
 
 
 def _optional_uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCache) -> tuple[float, float] | None:

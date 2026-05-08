@@ -108,6 +108,31 @@ class FakeAttribute:
         self.data = [FakeAttributeValue(value) for value in values]
 
 
+class FakeUVValue:
+    def __init__(self, uv):
+        self.uv = tuple(uv)
+
+
+class FakeUVLayer:
+    def __init__(self, values):
+        self.data = [FakeUVValue(value) for value in values]
+
+
+class FakeUVLayers:
+    def __init__(self, layers, active_name: str | None = None):
+        self._layers = dict(layers)
+        self.active = self._layers.get(active_name) if active_name else None
+
+    def get(self, name):
+        return self._layers.get(name)
+
+    def __getitem__(self, index):
+        return list(self._layers.values())[index]
+
+    def __iter__(self):
+        return iter(self._layers.values())
+
+
 class FakeCollection:
     def __init__(self, name: str, objects=None, children=None):
         self.name = name
@@ -119,6 +144,8 @@ class FakeScene:
     def __init__(self, output_dir: str):
         self.bmc_output_dir = output_dir
         self.bmc_frameanalysis_dir = output_dir
+        self.bmc_mirror_flip = True
+        self.bmc_uv_flip_v = True
 
 
 class FakeContext:
@@ -602,6 +629,103 @@ class ExportPackageTests(unittest.TestCase):
             position_path = Path(tmpdir) / "640d1c0e-3-0_part00-Position.buf"
             values = struct.unpack("<9f", position_path.read_bytes())
             self.assertEqual(values[:3], (-11.0, 22.0, 33.0))
+
+    def test_external_mesh_texcoord0_uses_primary_uv_when_layer_is_not_named_uv0(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        target.data.uv_layers = FakeUVLayers(
+            {
+                "UVMap": FakeUVLayer([(0.25, 0.75), (0.5, 0.5), (0.75, 0.25)]),
+            },
+            active_name="UVMap",
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 8,
+                        "elements": [
+                            {
+                                "semantic_name": "TEXCOORD",
+                                "semantic_index": 0,
+                                "format": "R32G32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                mirror_flip_default=False,
+            )
+            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            values = struct.unpack("<6f", texcoord_path.read_bytes())
+            self.assertEqual(values, (0.25, 0.25, 0.5, 0.5, 0.75, 0.75))
+
+    def test_external_mesh_texcoord0_can_disable_uv_v_flip(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        target.data.uv_layers = FakeUVLayers(
+            {
+                "UVMap": FakeUVLayer([(0.25, 0.75), (0.5, 0.5), (0.75, 0.25)]),
+            },
+            active_name="UVMap",
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 8,
+                        "elements": [
+                            {
+                                "semantic_name": "TEXCOORD",
+                                "semantic_index": 0,
+                                "format": "R32G32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                mirror_flip_default=False,
+                uv_flip_v_default=False,
+            )
+            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            values = struct.unpack("<6f", texcoord_path.read_bytes())
+            self.assertEqual(values, (0.25, 0.75, 0.5, 0.5, 0.75, 0.25))
 
 
 if __name__ == "__main__":

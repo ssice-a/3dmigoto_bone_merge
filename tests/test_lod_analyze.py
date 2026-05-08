@@ -12,6 +12,10 @@ if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
 lod_analyze = importlib.import_module(f"{PACKAGE_DIR.name}.core.lod_analyze")
+main_analyze = importlib.import_module(f"{PACKAGE_DIR.name}.core.main_analyze")
+
+MAIN_FRAMEANALYSIS = Path(r"E:\XXMI\EFMI\FrameAnalysis-2026-05-05-222451")
+LOD_FRAMEANALYSIS = Path(r"E:\XXMI\EFMI\FrameAnalysis-2026-05-05-225007")
 
 
 class LodAnalyzeTests(unittest.TestCase):
@@ -250,6 +254,41 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual(review["ignored_lod_global_bone_count"], 3)
         self.assertEqual(review["missing_global_bone_count"], 0)
         self.assertEqual(review["ignored_by_record"][0]["source_key"], "dynamic1-10-0")
+
+
+@unittest.skipUnless(
+    MAIN_FRAMEANALYSIS.exists() and LOD_FRAMEANALYSIS.exists(),
+    "main/LOD FrameAnalysis folders are not available",
+)
+class RealLodAnalyzeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.main_manifest = main_analyze.analyze_main_frameanalysis(str(MAIN_FRAMEANALYSIS))
+        cls.lod_result = lod_analyze.analyze_lod_for_manifest(cls.main_manifest, str(LOD_FRAMEANALYSIS))
+
+    def test_transparent_tail_lod_capture_maps_cb71_local19_to_38b8_local27(self):
+        mapping = next(
+            entry
+            for entry in self.lod_result["lod_mapping"]
+            if int(entry.get("canonical_global_bone", -1)) == 405
+        )
+        self.assertEqual(mapping["status"], "matched")
+        self.assertEqual(mapping["lod_record_key"], "38b8d614-7560-0")
+        self.assertEqual(mapping["lod_local_bone"], 27)
+
+        capture_record = next(
+            record
+            for record in self.lod_result["lod_capture_records"]
+            if record.get("lod_record_key") == "38b8d614-7560-0"
+        )
+        self.assertIn(39, capture_record["lod_capture_draw_indices"])
+        self.assertTrue(
+            any(
+                int(pair.get("lod_local_bone", -1)) == 27
+                and int(pair.get("canonical_global_bone", -1)) == 405
+                for pair in capture_record["scatter_pairs"]
+            )
+        )
 
 
 if __name__ == "__main__":

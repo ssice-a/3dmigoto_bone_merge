@@ -50,7 +50,12 @@ careful priority/duplicate behavior.
 
 ## ShaderOverride Contract
 
-Only the two analyzed early shadow-stage VS hashes are marked:
+Only VS hashes proven to belong to the analyzed early shadow/capture window are
+marked. The analyzer still records the primary normal/transparent VS pair for
+replay ordering, but the capture filter can include extra VS hashes from the
+same shadow window when those draws have skinned IB input and `vs-t0` bone data
+available. This covers transparent tail/hair style parts whose shadow pass uses
+a third VS.
 
 ```ini
 [ShaderOverride_BMC_ShadowVS_A]
@@ -60,6 +65,11 @@ allow_duplicate_hash = overrule
 
 [ShaderOverride_BMC_ShadowVS_B]
 hash = <normal_or_transparent_shadow_vs_hash_b>
+filter_index = 200
+allow_duplicate_hash = overrule
+
+[ShaderOverride_BMC_ShadowVS_Extra]
+hash = <extra_capture_ready_shadow_window_vs_hash>
 filter_index = 200
 allow_duplicate_hash = overrule
 ```
@@ -74,8 +84,8 @@ It must not encode normal shadow versus transparent shadow. Those are separated
 offline by the replay plan and by the IB/collection classification.
 
 Do not generate broad VS override tables for visible, outline, material, or
-effect passes. Visible replacement must inherit the game's current pass state
-through `TextureOverride` branches.
+effect passes outside the verified early shadow window. Visible replacement must
+inherit the game's current pass state through `TextureOverride` branches.
 
 ## TextureOverride Branch Contract
 

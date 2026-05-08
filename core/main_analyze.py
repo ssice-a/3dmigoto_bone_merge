@@ -43,6 +43,7 @@ _CB1_RE = re.compile(r"^cb1\[(?P<row>\d+)\]\.(?P<component>[xyzw]):\s*(?P<value>
 _VERTEX_DATA_RE = re.compile(
     r"^vb(?P<slot>\d+)\[(?P<vertex>\d+)\]\+(?P<offset>\d+)\s+[^:]+:\s*(?P<values>.+)$"
 )
+ANALYZER_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -145,13 +146,22 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
         visible_anchor=visible_anchor,
         warnings=warnings,
     )
-    shadow_vs_hashes = list(discovery["shadow_vs_hashes"])
-    if not shadow_vs_hashes:
+    role_vs_hashes = list(discovery["shadow_vs_hashes"])
+    if not role_vs_hashes:
         raise ValueError("Could not infer shadow VS hash pair from FrameAnalysis")
-    normal_vs_hash = shadow_vs_hashes[0]
-    transparent_vs_hash = shadow_vs_hashes[1] if len(shadow_vs_hashes) > 1 else ""
+    normal_vs_hash = role_vs_hashes[0]
+    transparent_vs_hash = role_vs_hashes[1] if len(role_vs_hashes) > 1 else ""
     stage_draw_start = int(discovery.get("stage_draw_start", 0) or 0)
     stage_draw_end = int(discovery.get("stage_draw_end", 0) or 0)
+    shadow_vs_hashes = _expand_shadow_capture_vs_hashes(
+        files_by_draw=files_by_draw,
+        draw_states=draw_states,
+        all_ib_dumps=all_ib_dumps,
+        key_index=key_index,
+        seed_vs_hashes=role_vs_hashes,
+        stage_draw_start=stage_draw_start,
+        stage_draw_end=stage_draw_end,
+    )
 
     shadow_hits = [
         dump_file
@@ -228,6 +238,7 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
     bone_pool_order = build_bone_pool_order(candidates)
     payload = {
         "schema_version": 1,
+        "analyzer_version": ANALYZER_VERSION,
         "frameanalysis_dir": normalized_frameanalysis_dir,
         "target": {
             "visible_anchor_ibs": [f"{key[0]}-{key[2]}-{key[1]}" for key in visible_anchor.get("anchor_keys", [])],
@@ -237,6 +248,7 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
         },
         "shadow_stage": {
             "shadow_vs_hashes": shadow_vs_hashes,
+            "role_vs_hashes": role_vs_hashes,
             "stage_draw_start": int(stage_draw_start or min(shadow_draw_indices)),
             "stage_draw_end": int(stage_draw_end or max(shadow_draw_indices)),
             "normal_vs_hash": normal_vs_hash,
@@ -289,6 +301,62 @@ def _draw_in_stage_window(draw_index: int, stage_draw_start: int, stage_draw_end
     if stage_draw_start <= 0 or stage_draw_end <= 0:
         return True
     return int(stage_draw_start) <= int(draw_index) <= int(stage_draw_end)
+
+
+def _expand_shadow_capture_vs_hashes(
+    *,
+    files_by_draw: dict[int, list[DumpFile]],
+    draw_states: dict[int, DrawState],
+    all_ib_dumps: list[DumpFile],
+    key_index: dict[tuple[str, int, int], list[DumpFile]],
+    seed_vs_hashes: list[str],
+    stage_draw_start: int,
+    stage_draw_end: int,
+) -> list[str]:
+    """Return every VS that can capture bones inside the inferred early shadow window."""
+
+    expanded: list[str] = []
+    seen: set[str] = set()
+
+    def add(vs_hash: str) -> None:
+        normalized = str(vs_hash or "").strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            expanded.append(normalized)
+
+    for vs_hash in seed_vs_hashes:
+        add(vs_hash)
+
+    candidate_local_bone_cache: dict[tuple[str, int, int], int] = {}
+    for dump_file in sorted(all_ib_dumps, key=lambda item: item.draw_index):
+        if not _draw_in_stage_window(dump_file.draw_index, stage_draw_start, stage_draw_end):
+            continue
+        draw_state = draw_states.get(dump_file.draw_index)
+        if draw_state is not None and int(draw_state.rt_count) != 0:
+            continue
+        draw_files = files_by_draw.get(dump_file.draw_index, [])
+        if not _draw_has_vs_t0(draw_files):
+            continue
+        key = _candidate_key_from_ib_dump(dump_file)
+        if key[2] <= 0:
+            continue
+        local_bone_count = candidate_local_bone_cache.get(key)
+        if local_bone_count is None:
+            local_warnings: list[dict] = []
+            local_bone_count = _infer_candidate_local_bone_count(
+                files_by_draw,
+                key_index.get(key, []),
+                local_warnings,
+            )
+            candidate_local_bone_cache[key] = int(local_bone_count)
+        if int(local_bone_count) <= 0:
+            continue
+        add(_state_vs_hash(draw_states, dump_file))
+    return expanded
+
+
+def _draw_has_vs_t0(draw_files: list[DumpFile]) -> bool:
+    return any(dump_file.slot == "vs-t0" and dump_file.extension == "buf" for dump_file in draw_files)
 
 
 def _discover_visible_anchor_keys(

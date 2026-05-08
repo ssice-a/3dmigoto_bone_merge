@@ -20,7 +20,7 @@ from .import_candidates import (
     _skin_slot_from_candidate,
     _validate_skin_format,
 )
-from .main_analyze import analyze_main_frameanalysis
+from .main_analyze import ANALYZER_VERSION, analyze_main_frameanalysis
 from .main_analyze import _parse_buffer_header
 from .spatial_index import (
     build_spatial_hash as _generic_build_spatial_hash,
@@ -578,6 +578,8 @@ def _read_existing_frameanalysis_manifest(normalized_dir: str, log_path: str, ma
     if not isinstance(payload, dict):
         return None
     if not isinstance(payload.get("candidate_ibs"), list) or not isinstance(payload.get("shadow_stage"), dict):
+        return None
+    if int(payload.get("analyzer_version", 0) or 0) < ANALYZER_VERSION:
         return None
     payload_dir = str(payload.get("frameanalysis_dir", "") or "")
     if payload_dir and os.path.abspath(payload_dir) != normalized_dir:
@@ -1275,6 +1277,7 @@ def _lod_record_payload(candidate: dict, source_key: str) -> dict:
 def _lod_manifest_snapshot(lod_manifest: dict) -> dict:
     return {
         "schema_version": int(lod_manifest.get("schema_version", 1) or 1),
+        "analyzer_version": int(lod_manifest.get("analyzer_version", 0) or 0),
         "frameanalysis_dir": str(lod_manifest.get("frameanalysis_dir", "") or ""),
         "shadow_stage": dict(lod_manifest.get("shadow_stage", {}) or {}),
         "candidate_ibs": list(lod_manifest.get("candidate_ibs", []) or []),

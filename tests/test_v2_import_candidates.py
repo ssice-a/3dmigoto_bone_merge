@@ -409,6 +409,26 @@ class RealFrameAnalysisImportTests(unittest.TestCase):
         self.fail(f"candidate not found: {display_name}")
 
 
+@unittest.skipUnless(SAMPLE_FRAMEANALYSIS.exists(), "sample FrameAnalysis folder is not available")
+class RealFrameAnalysisAutoShadowWindowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = main_analyze.analyze_main_frameanalysis(str(SAMPLE_FRAMEANALYSIS))
+
+    def test_shadow_capture_vs_set_expands_inside_shadow_window(self):
+        candidate = self._candidate("38b8d614-7560-0")
+        self.assertTrue(candidate["shadow_capture_ready"])
+        self.assertIn(39, candidate["shadow_draw_indices"])
+        self.assertIn(103, candidate["shadow_draw_indices"])
+        self.assertIn("6733250da4e23fd6", self.manifest["shadow_stage"]["shadow_vs_hashes"])
+
+    def _candidate(self, display_name: str) -> dict:
+        for candidate in self.manifest["candidate_ibs"]:
+            if candidate.get("display_name") == display_name:
+                return candidate
+        self.fail(f"candidate not found: {display_name}")
+
+
 @unittest.skipUnless(MAIN_FRAMEANALYSIS.exists(), "main FrameAnalysis folder is not available")
 class MainFrameAnalysisAnalyzeTests(unittest.TestCase):
     @classmethod

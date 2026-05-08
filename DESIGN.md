@@ -146,7 +146,7 @@ The global store placement should be deterministic after validation:
 
 The stable manifest order is based on the user-confirmed Candidate IB list's `match_index_count`, sorted from large to small. The scanner must not depend on fixed VS hashes. Shader hashes are frame-local evidence only.
 
-Analyze should use the g-buffer/display stage as the strongest anchor for locating the target character and then walk back to the early shadow/capture stage to discover the two current shadow VS hashes. This makes the scan resilient when game updates change shader hashes: as long as the visible mesh IBs can be found in g-buffer/display draws and matched back to early shadow draws, the shadow VS pair can be rediscovered.
+Analyze should use the g-buffer/display stage as the strongest anchor for locating the target character and then walk back to the early shadow/capture stage to discover the current shadow window. The primary normal/transparent shadow VS pair is retained for replay ordering, but the actual capture VS set is expanded from all skinned, `vs-t0` backed IB draws inside that window. This makes the scan resilient when game updates change shader hashes and also handles transparent tail/hair style parts that use a third shadow VS.
 
 Transparent parts may not have a g-buffer pass, so g-buffer is not the only source of import candidates. Import candidates can still be discovered from the whole frame as unique IB/VB geometry. The g-buffer anchor is used to resolve the character and the shadow VS pair; the editable Candidate IB list remains the final user-confirmed source for import and global-pool building.
 
@@ -884,7 +884,7 @@ Purpose:
 ```text
 find visible/g-buffer anchors for the target character
 walk back to the early shadow/capture region from those anchors
-rediscover the current frame's two shadow VS hashes without hardcoding them
+rediscover the current frame's shadow capture VS set without hardcoding it
 find unique importable IB/VB geometry across the frame
 mark which candidates have matching early-shadow capture data
 collect draw metadata needed for import, texture marking, and pool building
@@ -897,16 +897,17 @@ Suggested discovery:
 1. Parse FrameAnalysis log and dumped draw files.
 2. Find visible/g-buffer-like draws for the target character by output/RT evidence and IB/VB mesh identity.
 3. Use those visible IB slices to locate the earlier matching shadow/capture draws.
-4. Identify the two shadow VS hashes from that early shadow/capture region.
-5. Traverse all FrameAnalysis draws and merge unique importable IB/VB geometry into candidate entries.
-6. For each candidate, choose one import source draw, preferring the strongest visible/material draw and falling back to any valid dump with complete VB0-VB3/IB data.
-7. For each candidate, separately record whether it has matching early-shadow hits under the discovered shadow VS pair.
-8. Fill the Candidate IB list.
+4. Identify the early shadow/capture window and its primary normal/transparent VS pair.
+5. Expand the capture VS set with every skinned IB draw in that window that has usable `vs-t0` bone input.
+6. Traverse all FrameAnalysis draws and merge unique importable IB/VB geometry into candidate entries.
+7. For each candidate, choose one import source draw, preferring the strongest visible/material draw and falling back to any valid dump with complete VB0-VB3/IB data.
+8. For each candidate, separately record whether it has matching early-shadow hits under the expanded capture VS set.
+9. Fill the Candidate IB list.
 ```
 
 G-buffer/display draws are the most stable anchor for resolving the target character and finding the current shadow VS pair, because they expose visible material geometry without requiring shader hashes to stay constant across updates. They are not the only import source: transparent objects may not have a g-buffer pass, and some valid meshes may only be available through other material/effect passes. The final import set is therefore the editable Candidate IB list, not "every draw that used a particular VS".
 
-The two shadow VS hashes discovered during Analyze are frame-local filters for capture and delayed shadow replay. They must not become persistent identity. If a game update changes them, a fresh Analyze should rediscover them from the current FrameAnalysis by matching g-buffer/display IBs back to the early shadow/capture stage.
+The shadow VS hashes discovered during Analyze are frame-local filters for capture and delayed shadow replay. They must not become persistent identity. If a game update changes them, a fresh Analyze should rediscover them from the current FrameAnalysis by matching g-buffer/display IBs back to the early shadow/capture stage and then expanding the capture set from the whole shadow window.
 
 For vertex/index payloads, raw `.buf` dumps are the source of truth. Expanded text dumps and shader disassembly are layout evidence, but actual import data must be sliced from `.buf` with the draw's recorded offset, stride, index count, vertex count, and IA format. This is important because a shared backing buffer can contain many parts, and a deduped or expanded view can appear correct while starting from the wrong byte range.
 

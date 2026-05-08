@@ -1675,6 +1675,7 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
                 f"; auto-parted {int(part_materialize_result.get('regions', 0) or 0)} region(s) "
                 f"into {int(part_materialize_result.get('parts', 0) or 0)} part collection(s)"
             )
+        _print_export_performance_report(result, materialize_seconds=materialize_seconds)
         self.report({"INFO"}, message)
         if int(part_materialize_result.get("parts", 0) or 0) > 0:
             self.report(
@@ -1688,6 +1689,47 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         if materialize_warnings:
             self.report({"WARNING"}, " | ".join(str(item) for item in materialize_warnings[:3]))
         return {"FINISHED"}
+
+
+def _print_export_performance_report(result: dict, *, materialize_seconds: float) -> None:
+    timings = dict(result.get("timings", {}) or {})
+    performance = dict(result.get("performance", {}) or {})
+    geometry = dict(performance.get("geometry", {}) or {})
+    print("[BMC Export] Performance report")
+    if timings:
+        print(
+            "[BMC Export] "
+            f"total={float(timings.get('total', 0.0)):.3f}s "
+            f"auto_part={float(materialize_seconds):.3f}s "
+            f"setup={float(timings.get('setup', 0.0)):.3f}s "
+            f"plan={float(timings.get('plan', 0.0)):.3f}s "
+            f"capture_manifest={float(timings.get('capture_manifest', 0.0)):.3f}s "
+            f"palettes={float(timings.get('palettes', 0.0)):.3f}s "
+            f"geometry={float(timings.get('geometry', 0.0)):.3f}s "
+            f"manifest={float(timings.get('manifest', 0.0)):.3f}s "
+            f"runtime={float(timings.get('runtime', 0.0)):.3f}s"
+        )
+    if geometry:
+        print(
+            "[BMC Export] "
+            f"geometry parts={int(geometry.get('part_count', 0) or 0)} "
+            f"loops={int(geometry.get('loop_vertex_count', 0) or 0)} "
+            f"indices={int(geometry.get('index_count', 0) or 0)} "
+            f"vb_slots={int(geometry.get('vb_slot_count', 0) or 0)}"
+        )
+    slowest_parts = list(geometry.get("slowest_parts", []) or [])[:5]
+    if slowest_parts:
+        print("[BMC Export] Slowest geometry parts:")
+        for index, part in enumerate(slowest_parts, start=1):
+            print(
+                "[BMC Export] "
+                f"  {index}. {part.get('part', '')} "
+                f"total={float(part.get('total_seconds', 0.0) or 0.0):.3f}s "
+                f"write_vb={float(part.get('write_vb_seconds', 0.0) or 0.0):.3f}s "
+                f"collect_loops={float(part.get('collect_loops_seconds', 0.0) or 0.0):.3f}s "
+                f"loops={int(part.get('loop_vertex_count', 0) or 0)} "
+                f"objects={', '.join(str(name) for name in list(part.get('objects', []) or [])[:4])}"
+            )
 
 
 class BMC_OT_candidate_add_hash(bpy.types.Operator):

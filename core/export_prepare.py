@@ -100,7 +100,7 @@ def prepare_export_collection(
         "buffer_dir": buffer_dir,
         "bonestore_namespace": "",
         "palettes": palette_records,
-        "geometry_buffers": geometry_records,
+        "geometry_buffers": _public_geometry_records(geometry_records),
         "texture_marks": texture_mark_payload,
         "export_options": {
             "mirror_flip": bool(getattr(context.scene, "bmc_mirror_flip", True)),
@@ -108,9 +108,6 @@ def prepare_export_collection(
         },
         "objects": object_records,
         "warnings": list(export_plan.warnings),
-        "performance": {
-            "geometry": _geometry_performance_summary(geometry_records),
-        },
         "note": (
             "Export Root Collection child collections are final IB regions. "
             "Each region exports one implicit part00 or explicit partNN collections. "
@@ -131,11 +128,6 @@ def prepare_export_collection(
     )
     timings["runtime"] = time.perf_counter() - stage_start
     timings["total"] = time.perf_counter() - total_start
-    _write_export_performance_manifest(
-        manifest_path,
-        timings={name: round(seconds, 3) for name, seconds in timings.items()},
-        geometry_summary=_geometry_performance_summary(geometry_records),
-    )
     return {
         "manifest_path": manifest_path,
         "bonestore_ini_path": bonestore_ini_path,
@@ -146,6 +138,9 @@ def prepare_export_collection(
         "objects": len(object_records),
         "palettes": len(palette_records),
         "timings": {name: round(seconds, 3) for name, seconds in timings.items()},
+        "performance": {
+            "geometry": _geometry_performance_summary(geometry_records),
+        },
     }
 
 
@@ -200,20 +195,14 @@ def _geometry_performance_summary(geometry_records: list[dict]) -> dict:
     }
 
 
-def _write_export_performance_manifest(manifest_path: str, *, timings: dict, geometry_summary: dict) -> None:
-    if not manifest_path or not os.path.exists(manifest_path):
-        return
-    try:
-        export_manifest = read_json(manifest_path)
-    except Exception:
-        return
-    if not isinstance(export_manifest, dict):
-        return
-    performance = dict(export_manifest.get("performance", {}) or {})
-    performance["timings"] = dict(timings)
-    performance["geometry"] = dict(geometry_summary)
-    export_manifest["performance"] = performance
-    write_json(manifest_path, export_manifest)
+def _public_geometry_records(geometry_records: list[dict]) -> list[dict]:
+    public_records: list[dict] = []
+    for record in geometry_records:
+        public_record = dict(record)
+        public_record.pop("stats", None)
+        public_record.pop("timings", None)
+        public_records.append(public_record)
+    return public_records
 
 
 def regenerate_bonestore_runtime_files(

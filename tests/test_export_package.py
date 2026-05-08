@@ -381,6 +381,10 @@ class ExportPackageTests(unittest.TestCase):
 
             export_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertIn("runtime", export_manifest)
+            self.assertNotIn("performance", export_manifest)
+            self.assertIn("performance", result)
+            self.assertNotIn("timings", export_manifest["geometry_buffers"][0])
+            self.assertNotIn("stats", export_manifest["geometry_buffers"][0])
             self.assertIn("main_capture_bone_map", export_manifest["runtime"]["buffers"])
             self.assertEqual(
                 struct.unpack("<3I", (buffer_dir / "640d1c0e-46845-0_part00-Index.buf").read_bytes()),

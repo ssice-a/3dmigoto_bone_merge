@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import struct
 import time
 from dataclasses import dataclass
 
@@ -72,13 +73,17 @@ class _MeshExportCache:
     mirror_flip: bool
     uv_flip_v: bool
     matrix_world_applied: bool
+    vertex_position_values: list[tuple[float, float, float]] | None
+    loop_normal_values: list[tuple[float, float, float]] | None
     game_position_by_vertex: dict[int, tuple[float, float, float]]
     game_normal_by_loop: dict[int, tuple[float, float, float]]
     top4_by_vertex: dict[int, tuple[tuple[float, float, float, float], tuple[int, int, int, int]]]
     uv_layers: dict[str, object | None]
+    uv_values_by_layer: dict[str, list[tuple[float, float]] | None]
     uv_by_layer_loop: dict[tuple[str, int], tuple[float, float]]
     attribute_refs: dict[str, object | None]
     color_attribute_refs: dict[str, object | None]
+    texcoord_snorm4_sources: dict[tuple[str, int], tuple]
 
 
 @dataclass
@@ -123,13 +128,17 @@ class _ExportPartCache:
                 mirror_flip=_object_mirror_flip(mesh_obj, self.mirror_flip_default),
                 uv_flip_v=self.uv_flip_v_default,
                 matrix_world_applied=mesh_record.matrix_world_applied,
+                vertex_position_values=None,
+                loop_normal_values=None,
                 game_position_by_vertex={},
                 game_normal_by_loop={},
                 top4_by_vertex={},
                 uv_layers={},
+                uv_values_by_layer={},
                 uv_by_layer_loop={},
                 attribute_refs={},
                 color_attribute_refs={},
+                texcoord_snorm4_sources={},
             )
             self.mesh_caches[key] = cache
         return cache
@@ -397,10 +406,10 @@ def _write_prepared_vertex_slots(
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
 ) -> None:
-    for record_index, loop_vertex in enumerate(loop_vertices):
-        for slot in prepared_slots:
-            _write_vertex_slot_record(slot, record_index, loop_vertex, export_cache)
     for slot in prepared_slots:
+        if not _write_fast_prepared_vertex_slot(slot, loop_vertices, export_cache):
+            for record_index, loop_vertex in enumerate(loop_vertices):
+                _write_vertex_slot_record(slot, record_index, loop_vertex, export_cache)
         directory = os.path.dirname(slot.file_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -421,6 +430,171 @@ def _write_vertex_slot_record(
         if end_offset > slot.stride:
             raise ValueError(f"{slot.slot_name}: field {field['semantic']} exceeds stride {slot.stride}")
         slot.output[record_base + offset:record_base + end_offset] = field_bytes
+
+
+def _write_fast_prepared_vertex_slot(
+    slot: _PreparedVertexSlot,
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    field_plans = _fast_field_plans(slot)
+    if field_plans is None:
+        return False
+
+    output = slot.output
+    stride = int(slot.stride)
+    pack_into = struct.pack_into
+    for record_index, loop_vertex in enumerate(loop_vertices):
+        record_base = record_index * stride
+        for plan in field_plans:
+            kind = plan[0]
+            offset = record_base + int(plan[1])
+            if kind == "position3":
+                pack_into("<3f", output, offset, *_game_position(loop_vertex, export_cache))
+            elif kind == "normal_packed":
+                pack_into("<I", output, offset, int(encode_game_packed_normal(_game_normal(loop_vertex, export_cache))))
+            elif kind == "normal3":
+                pack_into("<3f", output, offset, *_game_normal(loop_vertex, export_cache))
+            elif kind == "uv":
+                uv = _uv(loop_vertex, str(plan[2]), export_cache)
+                pack_into("<2f", output, offset, float(uv[0]), float(uv[1]))
+            elif kind == "texcoord_snorm4":
+                _write_texcoord_snorm4_into(output, offset, slot.slot_name, int(plan[2]), loop_vertex, export_cache)
+            elif kind == "blend_weights_u16":
+                weights, _indices = _local_top4_weights(loop_vertex, export_cache)
+                pack_into("<4H", output, offset, *(_unorm16(value) for value in weights))
+            elif kind == "blend_indices_u8":
+                _weights, indices = _local_top4_weights(loop_vertex, export_cache)
+                pack_into("<4B", output, offset, *(_uint8(value) for value in indices))
+            else:
+                return False
+    return True
+
+
+def _fast_field_plans(slot: _PreparedVertexSlot) -> list[tuple] | None:
+    plans: list[tuple] = []
+    for field, offset in slot.field_offsets:
+        semantic_name = str(field["semantic_name"]).upper()
+        semantic_index = int(field["semantic_index"])
+        fmt = _normalize_format(str(field["format"]))
+        if semantic_name == "POSITION" and semantic_index == 0 and fmt == "R32G32B32_FLOAT":
+            plans.append(("position3", offset))
+        elif semantic_name == "NORMAL" and semantic_index == 0 and fmt == "R32_FLOAT":
+            plans.append(("normal_packed", offset))
+        elif semantic_name == "NORMAL" and semantic_index == 0 and fmt == "R32G32B32_FLOAT":
+            plans.append(("normal3", offset))
+        elif semantic_name == "TEXCOORD" and semantic_index in {0, 1} and fmt == "R32G32_FLOAT":
+            plans.append(("uv", offset, f"UV{semantic_index}"))
+        elif semantic_name == "TEXCOORD" and fmt == "R8G8B8A8_SNORM":
+            plans.append(("texcoord_snorm4", offset, semantic_index))
+        elif semantic_name == "BLENDWEIGHTS" and semantic_index == 0 and fmt == "R16G16B16A16_UNORM":
+            plans.append(("blend_weights_u16", offset))
+        elif semantic_name == "BLENDINDICES" and semantic_index == 0 and fmt == "R8G8B8A8_UINT":
+            plans.append(("blend_indices_u8", offset))
+        else:
+            return None
+    return plans
+
+
+def _unorm16(value: float) -> int:
+    return max(0, min(65535, round(max(0.0, min(1.0, float(value))) * 65535)))
+
+
+def _uint8(value: int) -> int:
+    return max(0, min(255, int(round(float(value)))))
+
+
+def _write_texcoord_snorm4_into(
+    output: bytearray,
+    offset: int,
+    slot_name: str,
+    semantic_index: int,
+    loop_vertex: _LoopVertex,
+    export_cache: _ExportPartCache,
+) -> None:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    source = _texcoord_snorm4_source(loop_vertex.mesh, slot_name, semantic_index, mesh_cache)
+    kind = source[0]
+    if kind == "zero":
+        struct.pack_into("<I", output, offset, 0)
+        return
+    if kind == "point":
+        attribute_data = source[1]
+        vertex_index = int(loop_vertex.vertex_index)
+        for component, data in enumerate(attribute_data):
+            output[offset + component] = _raw_byte_from_attribute_data(data, vertex_index)
+        return
+    if kind == "color":
+        attribute, use_loop_index = source[1], bool(source[2])
+        data = getattr(attribute, "data", [])
+        data_index = int(loop_vertex.loop_index if use_loop_index else loop_vertex.vertex_index)
+        values = _color_values_from_item(data[data_index]) if data_index < len(data) else None
+        if values is None:
+            struct.pack_into("<I", output, offset, 0)
+            return
+        for component, value in enumerate(values[:4]):
+            output[offset + component] = color_component_to_raw_byte(value)
+        return
+    struct.pack_into("<I", output, offset, 0)
+
+
+def _texcoord_snorm4_source(mesh, slot_name: str, semantic_index: int, mesh_cache: _MeshExportCache) -> tuple:
+    key = (str(slot_name), int(semantic_index))
+    if key in mesh_cache.texcoord_snorm4_sources:
+        return mesh_cache.texcoord_snorm4_sources[key]
+
+    component_data = []
+    for component in range(4):
+        attribute = _point_attribute(mesh, texcoord_component_attr_names(slot_name, semantic_index, component), mesh_cache)
+        if attribute is None:
+            component_data = []
+            break
+        component_data.append(getattr(attribute, "data", []))
+    if len(component_data) == 4:
+        source = ("point", tuple(component_data))
+    else:
+        color_attribute = _color_attribute(mesh, texcoord_color_attr_names(slot_name, semantic_index), mesh_cache)
+        if color_attribute is None:
+            source = ("zero",)
+        else:
+            data = getattr(color_attribute, "data", [])
+            domain = str(getattr(color_attribute, "domain", "") or "").upper()
+            use_loop_index = domain == "CORNER" or len(data) == len(getattr(mesh, "loops", []) or [])
+            source = ("color", color_attribute, use_loop_index)
+
+    mesh_cache.texcoord_snorm4_sources[key] = source
+    return source
+
+
+def _point_attribute(mesh, names: tuple[str, ...], mesh_cache: _MeshExportCache):
+    for name in names:
+        attribute = mesh_cache.attribute_refs.get(name)
+        if name not in mesh_cache.attribute_refs:
+            attributes = getattr(mesh, "attributes", None)
+            attribute = None
+            if attributes is not None:
+                getter = getattr(attributes, "get", None)
+                if callable(getter):
+                    attribute = getter(name)
+                elif isinstance(attributes, dict):
+                    attribute = attributes.get(name)
+            mesh_cache.attribute_refs[name] = attribute
+        if attribute is not None:
+            return attribute
+    return None
+
+
+def _raw_byte_from_attribute_data(data, index: int) -> int:
+    if index >= len(data):
+        return 0
+    item = data[index]
+    if hasattr(item, "value"):
+        return int(getattr(item, "value")) & 0xFF
+    if hasattr(item, "vector"):
+        vector = getattr(item, "vector")
+        if vector:
+            return int(vector[0]) & 0xFF
+    return 0
 
 
 def _field_bytes(
@@ -458,8 +632,12 @@ def _game_position(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> 
     cached = mesh_cache.game_position_by_vertex.get(loop_vertex.vertex_index)
     if cached is not None:
         return cached
-    vertex = getattr(loop_vertex.mesh, "vertices")[loop_vertex.vertex_index]
-    co = _vector3(getattr(vertex, "co", (0.0, 0.0, 0.0)))
+    position_values = _vertex_position_values(loop_vertex.mesh, mesh_cache)
+    if loop_vertex.vertex_index < len(position_values):
+        co = position_values[loop_vertex.vertex_index]
+    else:
+        vertex = getattr(loop_vertex.mesh, "vertices")[loop_vertex.vertex_index]
+        co = _vector3(getattr(vertex, "co", (0.0, 0.0, 0.0)))
     if not mesh_cache.matrix_world_applied:
         co = _transform_point(loop_vertex.mesh_obj, co)
     if mesh_cache.mirror_flip:
@@ -473,8 +651,12 @@ def _game_normal(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tu
     cached = mesh_cache.game_normal_by_loop.get(loop_vertex.loop_index)
     if cached is not None:
         return cached
-    loop = getattr(loop_vertex.mesh, "loops", [])[loop_vertex.loop_index]
-    normal = _vector3(getattr(loop, "normal", None) or getattr(loop_vertex.polygon, "normal", None) or (0.0, 0.0, 1.0))
+    normal_values = _loop_normal_values(loop_vertex.mesh, mesh_cache)
+    if loop_vertex.loop_index < len(normal_values):
+        normal = normal_values[loop_vertex.loop_index]
+    else:
+        loop = getattr(loop_vertex.mesh, "loops", [])[loop_vertex.loop_index]
+        normal = _vector3(getattr(loop, "normal", None) or getattr(loop_vertex.polygon, "normal", None) or (0.0, 0.0, 1.0))
     if not mesh_cache.matrix_world_applied:
         normal = _transform_normal(loop_vertex.mesh_obj, normal)
     if mesh_cache.mirror_flip:
@@ -497,7 +679,8 @@ def _uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCach
         mesh_cache.uv_layers[layer_name] = layer
     if layer is None:
         raise ValueError(f"{getattr(loop_vertex.mesh_obj, 'name', '<mesh>')}: missing required UV layer {layer_name}")
-    uv = getattr(layer.data[loop_vertex.loop_index], "uv", (0.0, 0.0))
+    uv_values = _uv_layer_values(layer, layer_name, mesh_cache)
+    uv = uv_values[loop_vertex.loop_index] if loop_vertex.loop_index < len(uv_values) else getattr(layer.data[loop_vertex.loop_index], "uv", (0.0, 0.0))
     result = blender_uv_to_game((float(uv[0]), float(uv[1])), flip_v=mesh_cache.uv_flip_v)
     mesh_cache.uv_by_layer_loop[cache_key] = result
     return result
@@ -556,6 +739,51 @@ def _indexed_uv_layer(uv_layers, index: int):
     except Exception:
         return None
     return values[index] if index < len(values) else None
+
+
+def _vertex_position_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float, float, float]]:
+    if mesh_cache.vertex_position_values is None:
+        mesh_cache.vertex_position_values = _float_tuple_values(getattr(mesh, "vertices", []) or [], "co", 3)
+    return mesh_cache.vertex_position_values
+
+
+def _loop_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float, float, float]]:
+    if mesh_cache.loop_normal_values is None:
+        mesh_cache.loop_normal_values = _float_tuple_values(getattr(mesh, "loops", []) or [], "normal", 3)
+    return mesh_cache.loop_normal_values
+
+
+def _uv_layer_values(layer, layer_name: str, mesh_cache: _MeshExportCache) -> list[tuple[float, float]]:
+    if layer_name not in mesh_cache.uv_values_by_layer:
+        mesh_cache.uv_values_by_layer[layer_name] = _float_tuple_values(getattr(layer, "data", []) or [], "uv", 2)
+    return mesh_cache.uv_values_by_layer[layer_name] or []
+
+
+def _float_tuple_values(collection, attribute_name: str, component_count: int) -> list[tuple]:
+    count = len(collection)
+    if count <= 0:
+        return []
+    flat_values = [0.0] * (count * component_count)
+    foreach_get = getattr(collection, "foreach_get", None)
+    if callable(foreach_get):
+        try:
+            foreach_get(attribute_name, flat_values)
+            return [
+                tuple(float(flat_values[index + component]) for component in range(component_count))
+                for index in range(0, len(flat_values), component_count)
+            ]
+        except Exception:
+            pass
+
+    values = []
+    fallback = (0.0,) * component_count
+    for item in collection:
+        raw_value = getattr(item, attribute_name, fallback)
+        try:
+            values.append(tuple(float(raw_value[component]) for component in range(component_count)))
+        except Exception:
+            values.append(tuple(float(fallback[component]) for component in range(component_count)))
+    return values
 
 
 def _optional_uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCache) -> tuple[float, float] | None:

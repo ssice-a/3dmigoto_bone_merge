@@ -4,10 +4,20 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass
 
+from .spatial_index import build_spatial_hash, cell_key
+from .texcoord_attrs import (
+    color_component_to_raw_byte,
+    texcoord_color_attr_names,
+    texcoord_component_attr_names,
+)
 from .export_package import ExportPartPlan, write_r32_index_buffer
 from .vertex_format import encode_game_packed_normal, pack_vertex_format
+
+
+_IB_IDENTITY_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)[-_](?P<first>\d+)")
 
 
 @dataclass(frozen=True)
@@ -28,54 +38,111 @@ class _MeshExportCache:
     top4_by_vertex: dict[int, tuple[tuple[float, float, float, float], tuple[int, int, int, int]]]
     uv_layers: dict[str, object | None]
     attribute_refs: dict[str, object | None]
+    color_attribute_refs: dict[str, object | None]
+
+
+@dataclass(frozen=True)
+class _SourceTexcoordSample:
+    position: tuple[float, float, float]
+    values: tuple[float | int, ...]
+
+
+@dataclass
+class _TexcoordSourceIndex:
+    cell_size: float
+    samples: list[_SourceTexcoordSample]
+    spatial_hash: dict[tuple[int, int, int], list[_SourceTexcoordSample]]
+
+    def nearest_values(self, position: tuple[float, float, float]) -> tuple[float | int, ...] | None:
+        if not self.samples:
+            return None
+        base_cell = cell_key(position, self.cell_size)
+        best_sample = None
+        best_distance = float("inf")
+        for radius in range(0, 5):
+            found = False
+            for x_offset in range(-radius, radius + 1):
+                for y_offset in range(-radius, radius + 1):
+                    for z_offset in range(-radius, radius + 1):
+                        if max(abs(x_offset), abs(y_offset), abs(z_offset)) != radius:
+                            continue
+                        cell_samples = self.spatial_hash.get(
+                            (
+                                base_cell[0] + x_offset,
+                                base_cell[1] + y_offset,
+                                base_cell[2] + z_offset,
+                            ),
+                            [],
+                        )
+                        if cell_samples:
+                            found = True
+                        for sample in cell_samples:
+                            distance = _distance_squared(position, sample.position)
+                            if distance < best_distance:
+                                best_distance = distance
+                                best_sample = sample
+            if found and best_sample is not None:
+                return best_sample.values
+        return best_sample.values if best_sample is not None else None
 
 
 @dataclass
 class _ExportPartCache:
+    part: ExportPartPlan
+    source_collection: object | None
     palette_to_local: dict[int, int]
     mesh_caches: dict[int, _MeshExportCache]
+    texcoord_source_indices: dict[tuple[str, int, str], _TexcoordSourceIndex | None]
 
     @classmethod
-    def from_part(cls, part: ExportPartPlan) -> "_ExportPartCache":
+    def from_part(cls, part: ExportPartPlan, source_collection=None) -> "_ExportPartCache":
         return cls(
+            part=part,
+            source_collection=source_collection,
             palette_to_local={int(global_bone): local_index for local_index, global_bone in enumerate(part.palette_values)},
             mesh_caches={},
+            texcoord_source_indices={},
         )
 
     def mesh_cache(self, loop_vertex: _LoopVertex) -> _MeshExportCache:
-        key = id(loop_vertex.mesh_obj)
+        return self.object_mesh_cache(loop_vertex.mesh_obj)
+
+    def object_mesh_cache(self, mesh_obj) -> _MeshExportCache:
+        key = id(mesh_obj)
         cache = self.mesh_caches.get(key)
         if cache is None:
+            mesh = getattr(mesh_obj, "data", None)
             cache = _MeshExportCache(
-                mesh_obj=loop_vertex.mesh_obj,
-                mesh=loop_vertex.mesh,
-                group_index_to_global=_group_index_to_global(loop_vertex.mesh_obj),
-                mirror_flip=bool(_object_get(loop_vertex.mesh_obj, "bmc_mirror_flip", False)),
+                mesh_obj=mesh_obj,
+                mesh=mesh,
+                group_index_to_global=_group_index_to_global(mesh_obj),
+                mirror_flip=bool(_object_get(mesh_obj, "bmc_mirror_flip", False)),
                 top4_by_vertex={},
                 uv_layers={},
                 attribute_refs={},
+                color_attribute_refs={},
             )
             self.mesh_caches[key] = cache
         return cache
 
 
-def write_part_geometry_buffers(buffer_dir: str, parts: tuple[ExportPartPlan, ...], vertex_layout_table: dict) -> list[dict]:
+def write_part_geometry_buffers(buffer_dir: str, parts: tuple[ExportPartPlan, ...], vertex_layout_table: dict, source_collection=None) -> list[dict]:
     """Write IB/VB buffers for every export part and return manifest records."""
 
     os.makedirs(buffer_dir, exist_ok=True)
     records: list[dict] = []
     for part in parts:
-        records.append(_write_part_geometry_buffers(buffer_dir, part, vertex_layout_table))
+        records.append(_write_part_geometry_buffers(buffer_dir, part, vertex_layout_table, source_collection=source_collection))
     return records
 
 
-def _write_part_geometry_buffers(buffer_dir: str, part: ExportPartPlan, vertex_layout_table: dict) -> dict:
+def _write_part_geometry_buffers(buffer_dir: str, part: ExportPartPlan, vertex_layout_table: dict, source_collection=None) -> dict:
     layout = _resolve_part_layout(part, vertex_layout_table)
     normalized_layout = _normalize_vertex_layout(layout)
     loop_vertices, indices = _collect_part_loop_vertices(part)
     if not loop_vertices:
         raise ValueError(f"{part.region.key}/{part.part_name}: no triangles to export")
-    export_cache = _ExportPartCache.from_part(part)
+    export_cache = _ExportPartCache.from_part(part, source_collection=source_collection)
 
     ib_file_name = f"{part.file_stem}-Index.buf"
     ib_file_path = os.path.join(buffer_dir, ib_file_name)
@@ -231,7 +298,7 @@ def _write_vertex_slot_buffer(
     for record_index, loop_vertex in enumerate(loop_vertices):
         record_base = record_index * stride
         for field in fields:
-            field_bytes = _field_bytes(slot_name, field, loop_vertex, export_cache)
+            field_bytes = _field_bytes(slot_name, slot_layout, field, loop_vertex, export_cache)
             offset = int(field["aligned_byte_offset"])
             end_offset = offset + len(field_bytes)
             if offset < 0 or end_offset > stride:
@@ -241,7 +308,13 @@ def _write_vertex_slot_buffer(
         file_handle.write(output)
 
 
-def _field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> bytes:
+def _field_bytes(
+    slot_name: str,
+    slot_layout: dict,
+    field: dict,
+    loop_vertex: _LoopVertex,
+    export_cache: _ExportPartCache,
+) -> bytes:
     semantic_name = str(field["semantic_name"]).upper()
     semantic_index = int(field["semantic_index"])
     fmt = str(field["format"]).upper()
@@ -255,7 +328,7 @@ def _field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex, export_c
     if semantic_name == "TEXCOORD" and semantic_index in {0, 1} and _normalize_format(fmt) == "R32G32_FLOAT":
         return pack_vertex_format(fmt, _uv(loop_vertex, f"UV{semantic_index}", export_cache))
     if semantic_name == "TEXCOORD":
-        return _texcoord_field_bytes(slot_name, field, loop_vertex, export_cache)
+        return _texcoord_field_bytes(slot_name, slot_layout, field, loop_vertex, export_cache)
     if semantic_name == "BLENDWEIGHTS" and semantic_index == 0:
         weights, _indices = _local_top4_weights(loop_vertex, export_cache)
         return pack_vertex_format(fmt, weights)
@@ -270,6 +343,15 @@ def _game_position(loop_vertex: _LoopVertex) -> tuple[float, float, float]:
     co = _vector3(getattr(vertex, "co", (0.0, 0.0, 0.0)))
     co = _transform_point(loop_vertex.mesh_obj, co)
     if bool(_object_get(loop_vertex.mesh_obj, "bmc_mirror_flip", False)):
+        co = (-co[0], co[1], co[2])
+    return co
+
+
+def _game_vertex_position(mesh_obj, mesh, vertex_index: int) -> tuple[float, float, float]:
+    vertex = getattr(mesh, "vertices")[int(vertex_index)]
+    co = _vector3(getattr(vertex, "co", (0.0, 0.0, 0.0)))
+    co = _transform_point(mesh_obj, co)
+    if bool(_object_get(mesh_obj, "bmc_mirror_flip", False)):
         co = (-co[0], co[1], co[2])
     return co
 
@@ -302,26 +384,90 @@ def _uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCach
     return (float(uv[0]), float(uv[1]))
 
 
-def _texcoord_field_bytes(slot_name: str, field: dict, loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> bytes:
+def _optional_uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCache) -> tuple[float, float] | None:
+    try:
+        return _uv(loop_vertex, layer_name, export_cache)
+    except ValueError:
+        return None
+
+
+def _texcoord_field_bytes(
+    slot_name: str,
+    slot_layout: dict,
+    field: dict,
+    loop_vertex: _LoopVertex,
+    export_cache: _ExportPartCache,
+) -> bytes:
     fmt = _normalize_format(str(field["format"]))
     semantic_index = int(field["semantic_index"])
     component_count = _format_component_count(fmt)
     values = [
         _point_attribute_value(
             loop_vertex.mesh,
-            _texcoord_attr_names(slot_name, semantic_index, component),
+            texcoord_component_attr_names(slot_name, semantic_index, component),
             loop_vertex.vertex_index,
             export_cache.mesh_cache(loop_vertex),
         )
         for component in range(component_count)
     ]
-    if any(value is None for value in values):
-        raise ValueError(
-            f"{getattr(loop_vertex.mesh_obj, 'name', '<mesh>')}: missing raw TEXCOORD{semantic_index} attributes for {slot_name}"
-        )
     if fmt == "R8G8B8A8_SNORM":
-        return bytes((int(value) & 0xFF) for value in values)
-    return pack_vertex_format(fmt, [float(value) for value in values])
+        if not any(value is None for value in values):
+            return bytes((int(value) & 0xFF) for value in values)
+        color_bytes = _texcoord_color_bytes(slot_name, semantic_index, loop_vertex, export_cache)
+        if color_bytes is not None:
+            return color_bytes
+        source_values = _source_texcoord_values(slot_name, field, loop_vertex, export_cache)
+        if source_values is not None:
+            return bytes((int(value) & 0xFF) for value in source_values)
+        return _default_texcoord_field_bytes(slot_layout, field, loop_vertex, export_cache)
+    elif not any(value is None for value in values):
+        return pack_vertex_format(fmt, [float(value) for value in values])
+
+    source_values = _source_texcoord_values(slot_name, field, loop_vertex, export_cache)
+    if source_values is not None:
+        return pack_vertex_format(fmt, [float(value) for value in source_values])
+    return _default_texcoord_field_bytes(slot_layout, field, loop_vertex, export_cache)
+
+
+def _default_texcoord_field_bytes(
+    slot_layout: dict,
+    field: dict,
+    loop_vertex: _LoopVertex,
+    export_cache: _ExportPartCache,
+) -> bytes:
+    fmt = _normalize_format(str(field["format"]))
+    if fmt == "R8G8B8A8_SNORM":
+        return b"\x00\x00\x00\x00"
+    if fmt == "R32G32_FLOAT":
+        uv_layer = _aliased_texcoord_uv_layer(slot_layout, field)
+        uv = _optional_uv(loop_vertex, uv_layer, export_cache) if uv_layer else None
+        if uv is None:
+            uv = _optional_uv(loop_vertex, "UV1", export_cache)
+        if uv is None:
+            uv = _optional_uv(loop_vertex, "UV0", export_cache)
+        return pack_vertex_format(fmt, uv if uv is not None else (0.0, 0.0))
+    if fmt == "R32G32B32_FLOAT":
+        return pack_vertex_format(fmt, _game_position(loop_vertex))
+    return pack_vertex_format(fmt, [0.0] * _format_component_count(fmt))
+
+
+def _aliased_texcoord_uv_layer(slot_layout: dict, field: dict) -> str:
+    field_offset = int(field.get("aligned_byte_offset", 0) or 0)
+    field_format = _normalize_format(str(field.get("format", "") or ""))
+    for other in list(slot_layout.get("fields", []) or []):
+        if other is field:
+            continue
+        if str(other.get("semantic_name", "") or "").upper() != "TEXCOORD":
+            continue
+        other_index = int(other.get("semantic_index", -1) or -1)
+        if other_index not in {0, 1}:
+            continue
+        if int(other.get("aligned_byte_offset", -1) or -1) != field_offset:
+            continue
+        if _normalize_format(str(other.get("format", "") or "")) != field_format:
+            continue
+        return f"UV{other_index}"
+    return ""
 
 
 def _local_top4_weights(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[tuple[float, float, float, float], tuple[int, int, int, int]]:
@@ -370,12 +516,258 @@ def _group_index_to_global(mesh_obj) -> dict[int, int]:
     return mapping
 
 
-def _texcoord_attr_names(slot_name: str, semantic_index: int, component: int) -> tuple[str, ...]:
-    slot_index = int(slot_name[2:]) if slot_name.startswith("vb") and slot_name[2:].isdigit() else -1
-    names = [f"bmc_vb{slot_index}_texcoord{semantic_index}_{component}"]
-    if semantic_index == 4:
-        names.append(f"bmc_texcoord4_raw_{component}")
-    return tuple(names)
+def _texcoord_color_bytes(
+    slot_name: str,
+    semantic_index: int,
+    loop_vertex: _LoopVertex,
+    export_cache: _ExportPartCache,
+) -> bytes | None:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    attribute = _color_attribute(loop_vertex.mesh, texcoord_color_attr_names(slot_name, semantic_index), mesh_cache)
+    if attribute is None:
+        return None
+    data = getattr(attribute, "data", [])
+    domain = str(getattr(attribute, "domain", "") or "").upper()
+    if domain == "CORNER" or len(data) == len(getattr(loop_vertex.mesh, "loops", []) or []):
+        data_index = loop_vertex.loop_index
+    else:
+        data_index = loop_vertex.vertex_index
+    if data_index >= len(data):
+        return None
+    values = _color_values_from_item(data[data_index])
+    if values is None:
+        return None
+    return bytes(color_component_to_raw_byte(value) for value in values[:4])
+
+
+def _source_texcoord_values(
+    slot_name: str,
+    field: dict,
+    loop_vertex: _LoopVertex,
+    export_cache: _ExportPartCache,
+) -> tuple[float | int, ...] | None:
+    source_collection = export_cache.source_collection
+    if source_collection is None:
+        return None
+    fmt = _normalize_format(str(field["format"]))
+    semantic_index = int(field["semantic_index"])
+    key = (str(slot_name).lower(), semantic_index, fmt)
+    if key not in export_cache.texcoord_source_indices:
+        export_cache.texcoord_source_indices[key] = _build_source_texcoord_index(
+            export_cache.part,
+            source_collection,
+            slot_name,
+            field,
+            export_cache,
+        )
+    source_index = export_cache.texcoord_source_indices.get(key)
+    if source_index is None:
+        return None
+    return source_index.nearest_values(_game_position(loop_vertex))
+
+
+def _build_source_texcoord_index(
+    part: ExportPartPlan,
+    source_collection,
+    slot_name: str,
+    field: dict,
+    export_cache: _ExportPartCache,
+) -> _TexcoordSourceIndex | None:
+    fmt = _normalize_format(str(field["format"]))
+    semantic_index = int(field["semantic_index"])
+    component_count = _format_component_count(fmt)
+    samples: list[_SourceTexcoordSample] = []
+    seen_objects: set[int] = set()
+    for mesh_obj in _iter_mesh_objects_recursive(source_collection):
+        if id(mesh_obj) in seen_objects:
+            continue
+        seen_objects.add(id(mesh_obj))
+        if not _source_object_matches_region(mesh_obj, part.region):
+            continue
+        mesh = getattr(mesh_obj, "data", None)
+        vertices = getattr(mesh, "vertices", None)
+        if mesh is None or vertices is None:
+            continue
+        mesh_cache = export_cache.object_mesh_cache(mesh_obj)
+        for vertex_index in range(len(vertices)):
+            values = _texcoord_values_from_mesh(
+                mesh,
+                slot_name,
+                semantic_index,
+                component_count,
+                vertex_index,
+                mesh_cache,
+            )
+            if values is None and fmt == "R8G8B8A8_SNORM":
+                values = _texcoord_color_values_from_mesh(
+                    mesh,
+                    slot_name,
+                    semantic_index,
+                    vertex_index,
+                    mesh_cache,
+                )
+            if values is None:
+                continue
+            samples.append(
+                _SourceTexcoordSample(
+                    position=_game_vertex_position(mesh_obj, mesh, vertex_index),
+                    values=tuple(values[:component_count]),
+                )
+            )
+    if not samples:
+        return None
+    cell_size = _source_cell_size(samples)
+    return _TexcoordSourceIndex(
+        cell_size=cell_size,
+        samples=samples,
+        spatial_hash=build_spatial_hash(samples, lambda sample: sample.position, cell_size),
+    )
+
+
+def _texcoord_values_from_mesh(
+    mesh,
+    slot_name: str,
+    semantic_index: int,
+    component_count: int,
+    vertex_index: int,
+    mesh_cache: _MeshExportCache,
+) -> tuple[float | int, ...] | None:
+    values = [
+        _point_attribute_value(
+            mesh,
+            texcoord_component_attr_names(slot_name, semantic_index, component),
+            vertex_index,
+            mesh_cache,
+        )
+        for component in range(component_count)
+    ]
+    if any(value is None for value in values):
+        return None
+    return tuple(value for value in values)
+
+
+def _texcoord_color_values_from_mesh(
+    mesh,
+    slot_name: str,
+    semantic_index: int,
+    vertex_index: int,
+    mesh_cache: _MeshExportCache,
+) -> tuple[int, int, int, int] | None:
+    attribute = _color_attribute(mesh, texcoord_color_attr_names(slot_name, semantic_index), mesh_cache)
+    if attribute is None:
+        return None
+    data = getattr(attribute, "data", [])
+    if vertex_index >= len(data):
+        return None
+    values = _color_values_from_item(data[vertex_index])
+    if values is None:
+        return None
+    return tuple(color_component_to_raw_byte(value) for value in values[:4])
+
+
+def _color_attribute(mesh, names: tuple[str, ...], mesh_cache: _MeshExportCache):
+    for name in names:
+        attribute = mesh_cache.color_attribute_refs.get(name)
+        if name not in mesh_cache.color_attribute_refs:
+            attribute = None
+            color_attributes = getattr(mesh, "color_attributes", None)
+            if color_attributes is not None:
+                getter = getattr(color_attributes, "get", None)
+                if callable(getter):
+                    attribute = getter(name)
+            if attribute is None:
+                attributes = getattr(mesh, "attributes", None)
+                getter = getattr(attributes, "get", None) if attributes is not None else None
+                if callable(getter):
+                    attribute = getter(name)
+            mesh_cache.color_attribute_refs[name] = attribute
+        if attribute is not None:
+            return attribute
+    return None
+
+
+def _color_values_from_item(item) -> tuple[float, float, float, float] | None:
+    value = getattr(item, "color", None)
+    if value is None:
+        value = getattr(item, "vector", None)
+    if value is None:
+        return None
+    if len(value) < 4:
+        return None
+    return (float(value[0]), float(value[1]), float(value[2]), float(value[3]))
+
+
+def _iter_mesh_objects_recursive(collection):
+    if collection is None:
+        return
+    seen: set[int] = set()
+
+    def walk(current_collection):
+        for obj in getattr(current_collection, "objects", []) or []:
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            if str(getattr(obj, "type", "") or "") == "MESH":
+                yield obj
+        for child in getattr(current_collection, "children", []) or []:
+            yield from walk(child)
+
+    yield from walk(collection)
+
+
+def _source_object_matches_region(mesh_obj, region) -> bool:
+    ib_hash, index_count, first_index = _object_ib_identity(mesh_obj)
+    if ib_hash != str(region.ib_hash).lower():
+        return False
+    if index_count is not None and int(index_count) != int(region.match_index_count):
+        return False
+    if first_index is not None and int(first_index) != int(region.match_first_index):
+        return False
+    return True
+
+
+def _object_ib_identity(mesh_obj) -> tuple[str, int | None, int | None]:
+    ib_hash = str(
+        _object_get(mesh_obj, "bmc_source_ib_hash", "")
+        or _object_get(mesh_obj, "merge_ib_hash", "")
+        or ""
+    ).strip().lower()
+    index_count = _object_int(mesh_obj, "bmc_match_index_count")
+    if index_count is None:
+        index_count = _object_int(mesh_obj, "merge_match_index_count")
+    first_index = _object_int(mesh_obj, "bmc_match_first_index")
+    name_match = _IB_IDENTITY_RE.search(str(getattr(mesh_obj, "name", "") or ""))
+    if name_match:
+        if not ib_hash:
+            ib_hash = name_match.group("hash").lower()
+        if index_count is None:
+            index_count = int(name_match.group("count"))
+        if first_index is None:
+            first_index = int(name_match.group("first"))
+    return ib_hash, index_count, first_index
+
+
+def _object_int(mesh_obj, key: str) -> int | None:
+    value = _object_get(mesh_obj, key, None)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _source_cell_size(samples: list[_SourceTexcoordSample]) -> float:
+    if not samples:
+        return 0.05
+    min_x = min(sample.position[0] for sample in samples)
+    min_y = min(sample.position[1] for sample in samples)
+    min_z = min(sample.position[2] for sample in samples)
+    max_x = max(sample.position[0] for sample in samples)
+    max_y = max(sample.position[1] for sample in samples)
+    max_z = max(sample.position[2] for sample in samples)
+    diagonal = math.sqrt((max_x - min_x) ** 2 + (max_y - min_y) ** 2 + (max_z - min_z) ** 2)
+    return max(0.02, min(0.20, diagonal / 64.0 if diagonal > 0.0 else 0.05))
 
 
 def _point_attribute_value(mesh, names: tuple[str, ...], vertex_index: int, mesh_cache: _MeshExportCache):
@@ -485,6 +877,13 @@ def _normalize3(value: tuple[float, float, float]) -> tuple[float, float, float]
     if length <= 1e-12:
         return (0.0, 0.0, 1.0)
     return (value[0] / length, value[1] / length, value[2] / length)
+
+
+def _distance_squared(left: tuple[float, float, float], right: tuple[float, float, float]) -> float:
+    dx = float(left[0]) - float(right[0])
+    dy = float(left[1]) - float(right[1])
+    dz = float(left[2]) - float(right[2])
+    return dx * dx + dy * dy + dz * dz
 
 
 def _reverse_triangle_winding(triangle: tuple[int, int, int]) -> tuple[int, int, int]:

@@ -15,6 +15,7 @@ if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
 export_package = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_package")
+export_buffers = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_buffers")
 export_prepare = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_prepare")
 
 
@@ -35,6 +36,9 @@ class FakeObject:
 
     def get(self, key, default=None):
         return self._props.get(key, default)
+
+    def __setitem__(self, key, value):
+        self._props[key] = value
 
 
 class FakeVertexGroup:
@@ -84,6 +88,16 @@ class FakeMeshData:
                 loop_indices.append(len(self.loops))
                 self.loops.append(FakeLoop(vertex_index))
             self.polygons.append(FakePolygon(loop_indices))
+
+
+class FakeAttributeValue:
+    def __init__(self, value):
+        self.value = value
+
+
+class FakeAttribute:
+    def __init__(self, values):
+        self.data = [FakeAttributeValue(value) for value in values]
 
 
 class FakeCollection:
@@ -402,6 +416,104 @@ class ExportPackageTests(unittest.TestCase):
             export_manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
             self.assertEqual(export_manifest["ini_file_name"], "LXi Final Export.ini")
             self.assertEqual(export_manifest["runtime"]["ini_file_name"], "LXi Final Export.ini")
+
+    def test_texcoord4_missing_on_export_mesh_inherits_from_source_ib_object(self):
+        source = FakeObject(
+            "640d1c0e-3-0-source",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[],
+        )
+        source["bmc_source_ib_hash"] = "640d1c0e"
+        source["bmc_match_index_count"] = 3
+        source["bmc_match_first_index"] = 0
+        for component, values in enumerate(([1, 5, 9], [2, 6, 10], [3, 7, 11], [4, 8, 12])):
+            source.data.attributes[f"bmc_vb1_texcoord4_{component}"] = FakeAttribute(values)
+
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            objects=[source],
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 4,
+                        "elements": [
+                            {
+                                "semantic_name": "TEXCOORD",
+                                "semantic_index": 4,
+                                "format": "R8G8B8A8_SNORM",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                source_collection=root,
+            )
+            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            self.assertEqual(
+                texcoord_path.read_bytes(),
+                bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            )
+
+    def test_texcoord4_missing_without_source_uses_neutral_packed_default(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 4,
+                        "elements": [
+                            {
+                                "semantic_name": "TEXCOORD",
+                                "semantic_index": 4,
+                                "format": "R8G8B8A8_SNORM",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                source_collection=root,
+            )
+            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            self.assertEqual(texcoord_path.read_bytes(), bytes([0] * 12))
 
 
 if __name__ == "__main__":

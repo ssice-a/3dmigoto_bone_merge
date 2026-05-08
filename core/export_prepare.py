@@ -51,6 +51,7 @@ def prepare_export_collection(
         buffer_dir,
         export_plan.parts,
         dict(capture_manifest.get("vertex_layout_table", {}) or {}),
+        source_collection=source_collection,
     )
     local_palette_records = [_local_palette_record_from_export_record(record) for record in palette_records]
     texture_mark_payload = _read_texture_marks_for_export(context, source_collection)

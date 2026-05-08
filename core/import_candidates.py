@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
+from .texcoord_attrs import snorm_byte_to_color_component, texcoord_color_attr_names
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
 
 
@@ -922,6 +923,43 @@ def _store_texcoord_semantic_attributes(mesh, records: list[dict]) -> None:
                 _store_int_attribute(mesh, attr_name, [int(value) for value in component_values])
             else:
                 _store_float_attribute(mesh, attr_name, [float(value) for value in component_values])
+        if storage == "sint8_raw" and component_count == 4:
+            _store_snorm_byte_color_attribute(
+                mesh,
+                texcoord_color_attr_names(f"vb{slot_index}", semantic_index)[0],
+                values,
+            )
+
+
+def _store_snorm_byte_color_attribute(mesh, name: str, values: list[tuple[int, ...]]) -> None:
+    color_attributes = getattr(mesh, "color_attributes", None)
+    if color_attributes is None:
+        return
+    getter = getattr(color_attributes, "get", None)
+    attribute = getter(name) if callable(getter) else None
+    if attribute is None:
+        creator = getattr(color_attributes, "new", None)
+        if not callable(creator):
+            return
+        try:
+            attribute = creator(name=name, type="BYTE_COLOR", domain="POINT")
+        except Exception:
+            try:
+                attribute = creator(name=name, type="FLOAT_COLOR", domain="POINT")
+            except Exception:
+                return
+    colors: list[float] = []
+    for record in values:
+        components = [int(record[index]) if index < len(record) else 0 for index in range(4)]
+        colors.extend(snorm_byte_to_color_component(component) for component in components)
+    data = getattr(attribute, "data", [])
+    if _foreach_set(data, "color", colors):
+        return
+    for item, offset in zip(data, range(0, len(colors), 4)):
+        try:
+            item.color = tuple(colors[offset:offset + 4])
+        except Exception:
+            continue
 
 
 def _semantic_metadata(record: dict) -> dict:

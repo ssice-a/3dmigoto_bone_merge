@@ -1407,7 +1407,7 @@ Export UV0 from the primary UV layer.
 Export UV1 from the second UV layer only when the target layout truly contains TEXCOORD1.
 Export normals from Blender custom split normals, then octahedral-encode them for NORMAL0.
 Keep packed non-UV auxiliary fields such as TEXCOORD4 as custom/raw attributes. Packed `R8G8B8A8_SNORM` TEXCOORD fields may also be edited through generated color attributes; export converts the color bytes back to the original packed stream.
-If a required raw auxiliary attribute is missing on an edited/external mesh, export first inherits it from the source object of the same IB collection by nearest source vertex. If no same-IB source data exists, export writes a deterministic profile default: packed `R8G8B8A8_SNORM` uses `(0, 0, 0, 0)`, aliased/coordinate-like `R32G32_FLOAT` uses the aliased UV layer or the available UV fallback, and `R32G32B32_FLOAT` uses the exported position.
+If a required raw auxiliary attribute is missing on an edited/external mesh, export does not inherit it from a source mesh by nearest vertex because external meshes may be unrelated to the original topology. Instead, export writes a deterministic layout default: packed `R8G8B8A8_SNORM` uses `(0, 0, 0, 0)`, aliased/coordinate-like `R32G32_FLOAT` uses the aliased UV layer or the available UV fallback, and `R32G32B32_FLOAT` uses the exported position.
 ```
 
 Shape key and morph handling should be reused from `E:/vscode/mod_importer` wherever possible. BoneMerge should not invent a separate shape-key interpretation. The user-facing rule remains: the mesh visible in Blender is the mesh that is written.

@@ -417,7 +417,7 @@ class ExportPackageTests(unittest.TestCase):
             self.assertEqual(export_manifest["ini_file_name"], "LXi Final Export.ini")
             self.assertEqual(export_manifest["runtime"]["ini_file_name"], "LXi Final Export.ini")
 
-    def test_texcoord4_missing_on_export_mesh_inherits_from_source_ib_object(self):
+    def test_texcoord4_missing_on_export_mesh_ignores_source_ib_object_and_uses_default(self):
         source = FakeObject(
             "640d1c0e-3-0-source",
             [0],
@@ -466,13 +466,9 @@ class ExportPackageTests(unittest.TestCase):
                 tmpdir,
                 plan.parts,
                 layout,
-                source_collection=root,
             )
             texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
-            self.assertEqual(
-                texcoord_path.read_bytes(),
-                bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
-            )
+            self.assertEqual(texcoord_path.read_bytes(), bytes([0] * 12))
 
     def test_texcoord4_missing_without_source_uses_neutral_packed_default(self):
         target = FakeObject(
@@ -510,10 +506,51 @@ class ExportPackageTests(unittest.TestCase):
                 tmpdir,
                 plan.parts,
                 layout,
-                source_collection=root,
             )
             texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
             self.assertEqual(texcoord_path.read_bytes(), bytes([0] * 12))
+
+    def test_external_mesh_without_mirror_property_uses_export_default(self):
+        target = FakeObject(
+            "ExternalBody",
+            [0],
+            positions=[(1.0, 2.0, 3.0), (4.0, 5.0, 6.0), (7.0, 8.0, 9.0)],
+            triangles=[(0, 1, 2)],
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb0": {
+                        "slot": "vb0",
+                        "stride": 12,
+                        "elements": [
+                            {
+                                "semantic_name": "POSITION",
+                                "semantic_index": 0,
+                                "format": "R32G32B32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                mirror_flip_default=True,
+            )
+            position_path = Path(tmpdir) / "640d1c0e-3-0_part00-Position.buf"
+            values = struct.unpack("<9f", position_path.read_bytes())
+            self.assertEqual(values[:3], (-1.0, 2.0, 3.0))
 
 
 if __name__ == "__main__":

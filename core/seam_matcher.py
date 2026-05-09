@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from .spatial_index import (
@@ -10,6 +11,7 @@ from .spatial_index import (
     expanded_neighbor_cell_keys as _generic_expanded_neighbor_cell_keys,
     neighbor_keys as _generic_neighbor_keys,
 )
+from .numpy_compat import optional_numpy
 
 try:
     from mathutils import Vector as _MathutilsVector
@@ -67,9 +69,17 @@ class SeamMergeResult:
 
 
 def build_and_apply_seam_mapping(mesh_objects) -> SeamMergeResult:
-    build_result = build_seam_mapping(mesh_objects)
+    total_start = time.perf_counter()
+    perf: dict[str, float | int | list] = {}
+    build_start = time.perf_counter()
+    build_result = build_seam_mapping(mesh_objects, perf=perf)
+    perf["build_total"] = time.perf_counter() - build_start
+    apply_start = time.perf_counter()
     alias_payload = seam_aliases_to_payload(build_result.aliases)
     apply_result = apply_seam_mapping(mesh_objects, alias_payload)
+    perf["apply"] = time.perf_counter() - apply_start
+    perf["total"] = time.perf_counter() - total_start
+    _print_seam_performance_report(perf, build_result)
     return SeamMergeResult(
         aliases=build_result.aliases,
         pair_summaries=build_result.pair_summaries,
@@ -98,9 +108,31 @@ def seam_aliases_to_payload(aliases: tuple[SeamAliasRecord, ...] | list[SeamAlia
     ]
 
 
-def build_seam_mapping(mesh_objects) -> SeamBuildResult:
+def build_seam_mapping(mesh_objects, *, perf: dict | None = None) -> SeamBuildResult:
+    stage_start = time.perf_counter()
     mesh_objects = _mesh_objects_with_bbox_neighbors(list(mesh_objects), _OBJECT_BBOX_GAP_TOLERANCE)
-    caches = {mesh_obj.name: _build_seam_cache(mesh_obj) for mesh_obj in mesh_objects}
+    if perf is not None:
+        perf["bbox_filter"] = time.perf_counter() - stage_start
+        perf["candidate_objects"] = len(mesh_objects)
+
+    stage_start = time.perf_counter()
+    caches = {}
+    cache_details = []
+    for mesh_obj in mesh_objects:
+        cache_start = time.perf_counter()
+        cache_detail = {"object": mesh_obj.name}
+        cache = _build_seam_cache(mesh_obj, perf=cache_detail)
+        caches[mesh_obj.name] = cache
+        cache_seconds = time.perf_counter() - cache_start
+        cache_detail["seconds"] = cache_seconds
+        if cache is not None:
+            cache_detail["seam_vertices"] = len(cache["seam_vertices"])
+            cache_detail["groups"] = len(cache["group_clouds"])
+            cache_details.append(cache_detail)
+    if perf is not None:
+        perf["cache_build"] = time.perf_counter() - stage_start
+        perf["cache_details"] = cache_details
+
     object_names = [mesh_obj.name for mesh_obj in mesh_objects if caches.get(mesh_obj.name)]
     total_possible_pairs = max(0, len(object_names) * (len(object_names) - 1) // 2)
     candidate_edges: list[dict] = []
@@ -110,13 +142,19 @@ def build_seam_mapping(mesh_objects) -> SeamBuildResult:
         caches,
         object_names,
         _OBJECT_BBOX_GAP_TOLERANCE,
+        perf=perf,
     ):
         tested_pairs += 1
+        stage_start = time.perf_counter()
         source_vertices, source_spatial_hash, target_vertices, target_spatial_hash = _pair_vertices_for_allowed_groups(
             source_cache,
             target_cache,
             allowed_group_pairs,
         )
+        if perf is not None:
+            perf["pair_prepare"] = perf.get("pair_prepare", 0.0) + (time.perf_counter() - stage_start)
+
+        stage_start = time.perf_counter()
         matched_pairs = _build_vertex_pairs(
             source_vertices,
             source_spatial_hash,
@@ -124,9 +162,12 @@ def build_seam_mapping(mesh_objects) -> SeamBuildResult:
             target_spatial_hash,
             _MATCH_TOLERANCE,
         )
+        if perf is not None:
+            perf["nearest_pairs"] = perf.get("nearest_pairs", 0.0) + (time.perf_counter() - stage_start)
         if len(matched_pairs) < _MIN_VERTEX_PAIRS:
             continue
 
+        stage_start = time.perf_counter()
         candidates = _build_mapping_candidates_from_seams(
             source_cache["weight_items_by_vertex"],
             target_cache["weight_items_by_vertex"],
@@ -134,6 +175,8 @@ def build_seam_mapping(mesh_objects) -> SeamBuildResult:
             _WEIGHT_TOLERANCE,
             allowed_group_pairs,
         )
+        if perf is not None:
+            perf["mapping_candidates"] = perf.get("mapping_candidates", 0.0) + (time.perf_counter() - stage_start)
         for candidate in candidates:
             source_group = int(candidate["group_a"])
             target_group = int(candidate["group_b"])
@@ -152,8 +195,13 @@ def build_seam_mapping(mesh_objects) -> SeamBuildResult:
                 }
             )
 
+    stage_start = time.perf_counter()
     aliases = _build_aliases_from_edges(candidate_edges)
     summaries = _build_pair_summaries(aliases)
+    if perf is not None:
+        perf["alias_build"] = time.perf_counter() - stage_start
+        perf["tested_pairs"] = tested_pairs
+        perf["candidate_edges"] = len(candidate_edges)
     return SeamBuildResult(
         aliases=tuple(aliases),
         pair_summaries=tuple(summaries),
@@ -229,57 +277,111 @@ def apply_seam_mapping(mesh_objects, aliases: list[dict]) -> SeamApplyResult:
     )
 
 
-def _build_seam_cache(mesh_obj) -> dict | None:
+def _build_seam_cache(mesh_obj, *, perf: dict | None = None) -> dict | None:
+    stage_start = time.perf_counter()
     seam_vertices = _collect_seam_vertices(mesh_obj)
+    if perf is not None:
+        perf["collect_vertices"] = time.perf_counter() - stage_start
     if not seam_vertices:
         return None
+    stage_start = time.perf_counter()
     group_index_to_number = _build_group_index_to_number_map(mesh_obj)
+    if perf is not None:
+        perf["group_map"] = time.perf_counter() - stage_start
     if not group_index_to_number:
         return None
+    stage_start = time.perf_counter()
     weight_items_by_vertex = _build_sorted_vertex_weight_cache(
         mesh_obj,
         {vertex_index for vertex_index, _world_co in seam_vertices},
         group_index_to_number,
     )
+    if perf is not None:
+        perf["weights"] = time.perf_counter() - stage_start
+    stage_start = time.perf_counter()
     weighted_seam_vertices = [
         (vertex_index, world_co)
         for vertex_index, world_co in seam_vertices
         if weight_items_by_vertex.get(vertex_index)
     ]
+    if perf is not None:
+        perf["filter_vertices"] = time.perf_counter() - stage_start
     if len(weighted_seam_vertices) < _MIN_VERTEX_PAIRS:
         return None
+    stage_start = time.perf_counter()
     spatial_hash = _build_spatial_hash(weighted_seam_vertices, _MATCH_TOLERANCE)
     cell_keys = frozenset(spatial_hash)
+    if perf is not None:
+        perf["spatial_hash"] = time.perf_counter() - stage_start
+    stage_start = time.perf_counter()
     group_clouds = _build_group_clouds(weighted_seam_vertices, weight_items_by_vertex)
+    if perf is not None:
+        perf["group_clouds"] = time.perf_counter() - stage_start
+    stage_start = time.perf_counter()
+    bounds_min = _bounds_min(weighted_seam_vertices)
+    bounds_max = _bounds_max(weighted_seam_vertices)
+    if perf is not None:
+        perf["bounds"] = time.perf_counter() - stage_start
     return {
         "seam_vertices": weighted_seam_vertices,
         "spatial_hash": spatial_hash,
         "cell_keys": cell_keys,
         "neighbor_cell_keys": _expanded_neighbor_cell_keys(cell_keys),
         "group_clouds": group_clouds,
-        "bounds_min": _bounds_min(weighted_seam_vertices),
-        "bounds_max": _bounds_max(weighted_seam_vertices),
+        "group_numbers": frozenset(group_clouds),
+        "group_vertex_cache": {},
+        "bounds_min": bounds_min,
+        "bounds_max": bounds_max,
         "weight_items_by_vertex": weight_items_by_vertex,
     }
 
 
 def _build_group_clouds(weighted_seam_vertices, weight_items_by_vertex) -> dict[int, dict]:
-    points_by_group: dict[int, list[tuple[int, tuple[float, float, float]]]] = {}
+    accumulators: dict[int, dict] = {}
     for vertex_index, world_co in weighted_seam_vertices:
+        cell_key = _cell_key(world_co, _MATCH_TOLERANCE)
         for group_number, _weight in weight_items_by_vertex.get(vertex_index, ()):
-            points_by_group.setdefault(int(group_number), []).append((vertex_index, world_co))
+            group_number = int(group_number)
+            accumulator = accumulators.get(group_number)
+            if accumulator is None:
+                accumulator = {
+                    "points": [],
+                    "cell_keys": set(),
+                    "min_x": float(world_co[0]),
+                    "min_y": float(world_co[1]),
+                    "min_z": float(world_co[2]),
+                    "max_x": float(world_co[0]),
+                    "max_y": float(world_co[1]),
+                    "max_z": float(world_co[2]),
+                }
+                accumulators[group_number] = accumulator
+            accumulator["points"].append((vertex_index, world_co))
+            accumulator["cell_keys"].add(cell_key)
+            accumulator["min_x"] = min(accumulator["min_x"], float(world_co[0]))
+            accumulator["min_y"] = min(accumulator["min_y"], float(world_co[1]))
+            accumulator["min_z"] = min(accumulator["min_z"], float(world_co[2]))
+            accumulator["max_x"] = max(accumulator["max_x"], float(world_co[0]))
+            accumulator["max_y"] = max(accumulator["max_y"], float(world_co[1]))
+            accumulator["max_z"] = max(accumulator["max_z"], float(world_co[2]))
 
     clouds: dict[int, dict] = {}
-    for group_number, points in points_by_group.items():
+    for group_number, accumulator in accumulators.items():
+        points = accumulator["points"]
         if len(points) < _MIN_VERTEX_PAIRS:
             continue
-        cell_keys = frozenset(_cell_key(world_co, _MATCH_TOLERANCE) for _vertex_index, world_co in points)
         clouds[int(group_number)] = {
             "points": tuple(points),
-            "bounds_min": _bounds_min(points),
-            "bounds_max": _bounds_max(points),
-            "cell_keys": cell_keys,
-            "neighbor_cell_keys": _expanded_neighbor_cell_keys(cell_keys),
+            "bounds_min": (
+                float(accumulator["min_x"]),
+                float(accumulator["min_y"]),
+                float(accumulator["min_z"]),
+            ),
+            "bounds_max": (
+                float(accumulator["max_x"]),
+                float(accumulator["max_y"]),
+                float(accumulator["max_z"]),
+            ),
+            "cell_keys": frozenset(accumulator["cell_keys"]),
         }
     return clouds
 
@@ -298,6 +400,10 @@ def _build_group_index_to_number_map(mesh_obj) -> dict[int, int]:
 
 
 def _collect_seam_vertices(mesh_obj):
+    vertices = _collect_seam_vertices_numpy(mesh_obj)
+    if vertices is not None:
+        return vertices
+
     boundary_indices = _resolve_boundary_vertex_indices(mesh_obj)
     matrix_world = mesh_obj.matrix_world
     vertices = []
@@ -306,6 +412,83 @@ def _collect_seam_vertices(mesh_obj):
         vertices.append((vertex.index, _world_coord_tuple(matrix_world @ vertex.co)))
     vertices.sort(key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
     return vertices
+
+
+def _collect_seam_vertices_numpy(mesh_obj):
+    np = optional_numpy()
+    try:
+        mesh = mesh_obj.data
+        vertex_count = len(mesh.vertices)
+        edge_count = len(mesh.edges)
+        loop_count = len(mesh.loops)
+        if vertex_count <= 0 or edge_count <= 0 or loop_count <= 0:
+            return []
+
+        loop_edge_indices = np.empty(loop_count, dtype=np.int64)
+        mesh.loops.foreach_get("edge_index", loop_edge_indices)
+        edge_face_counts = np.bincount(loop_edge_indices, minlength=edge_count)
+        boundary_edge_mask = edge_face_counts[:edge_count] == 1
+
+        try:
+            loose_mask = np.zeros(edge_count, dtype=bool)
+            mesh.edges.foreach_get("is_loose", loose_mask)
+            boundary_edge_mask = np.logical_or(boundary_edge_mask, loose_mask)
+        except Exception:
+            loose_indices = [
+                edge_index
+                for edge_index, edge in enumerate(mesh.edges)
+                if bool(getattr(edge, "is_loose", False))
+            ]
+            if loose_indices:
+                boundary_edge_mask[np.asarray(loose_indices, dtype=np.int64)] = True
+
+        if not bool(boundary_edge_mask.any()):
+            return []
+
+        edge_vertices = np.empty(edge_count * 2, dtype=np.int64)
+        mesh.edges.foreach_get("vertices", edge_vertices)
+        edge_vertices = edge_vertices.reshape((edge_count, 2))
+        boundary_indices = np.unique(edge_vertices[boundary_edge_mask].reshape(-1))
+        if boundary_indices.size == 0:
+            return []
+
+        coords = np.empty(vertex_count * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", coords)
+        coords = coords.reshape((vertex_count, 3))[boundary_indices]
+        matrix = _matrix_world_numpy(mesh_obj.matrix_world, np)
+        world_coords = coords @ matrix[:3, :3].T + matrix[:3, 3]
+        order = np.lexsort((
+            boundary_indices,
+            world_coords[:, 2],
+            world_coords[:, 1],
+            world_coords[:, 0],
+        ))
+        boundary_indices = boundary_indices[order]
+        world_coords = world_coords[order]
+        return [
+            (
+                int(vertex_index),
+                (
+                    float(world_co[0]),
+                    float(world_co[1]),
+                    float(world_co[2]),
+                ),
+            )
+            for vertex_index, world_co in zip(boundary_indices, world_coords)
+        ]
+    except Exception:
+        return None
+
+
+def _matrix_world_numpy(matrix_world, np):
+    try:
+        rows = [list(row) for row in matrix_world]
+        matrix = np.asarray(rows, dtype=np.float64)
+        if matrix.shape == (4, 4):
+            return matrix
+    except Exception:
+        pass
+    return np.eye(4, dtype=np.float64)
 
 
 def _world_coord_tuple(world_co) -> tuple[float, float, float]:
@@ -571,10 +754,6 @@ def _build_spatial_hash(vertices, tolerance):
     return _generic_build_spatial_hash(vertices, lambda item: item[1], tolerance)
 
 
-def _expanded_neighbor_cell_keys(cell_keys):
-    return _generic_expanded_neighbor_cell_keys(cell_keys)
-
-
 def _mesh_objects_with_bbox_neighbors(mesh_objects: list, max_gap: float) -> list:
     if len(mesh_objects) < 2:
         return mesh_objects
@@ -633,7 +812,7 @@ def _transform_point(matrix, point):
             return point
 
 
-def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: float):
+def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: float, *, perf: dict | None = None):
     sorted_items = sorted(
         ((name, caches[name]) for name in object_names),
         key=lambda item: (item[1]["bounds_min"][0], item[1]["bounds_max"][0], item[0]),
@@ -654,10 +833,13 @@ def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: f
                 continue
             if source_cache["neighbor_cell_keys"].isdisjoint(target_cache["cell_keys"]):
                 continue
+            stage_start = time.perf_counter()
             allowed_group_pairs = _allowed_group_pairs_from_group_clouds(
                 source_cache["group_clouds"],
                 target_cache["group_clouds"],
             )
+            if perf is not None:
+                perf["allowed_groups"] = perf.get("allowed_groups", 0.0) + (time.perf_counter() - stage_start)
             if not allowed_group_pairs:
                 continue
             yield source_name, source_cache, target_name, target_cache, allowed_group_pairs
@@ -684,7 +866,7 @@ def _allowed_group_pairs_from_group_clouds(source_group_clouds: dict[int, dict],
                 _GROUP_BBOX_GAP_TOLERANCE,
             ):
                 continue
-            if source_cloud["neighbor_cell_keys"].isdisjoint(target_cloud["cell_keys"]):
+            if _neighbor_cell_keys_for_cloud(source_cloud).isdisjoint(target_cloud["cell_keys"]):
                 continue
             allowed.add((int(source_group), int(target_group)))
     return allowed
@@ -693,11 +875,26 @@ def _allowed_group_pairs_from_group_clouds(source_group_clouds: dict[int, dict],
 def _pair_vertices_for_allowed_groups(source_cache: dict, target_cache: dict, allowed_group_pairs: set[tuple[int, int]]):
     source_groups = {int(source_group) for source_group, _target_group in allowed_group_pairs}
     target_groups = {int(target_group) for _source_group, target_group in allowed_group_pairs}
-    source_vertices = _vertices_for_groups(source_cache["group_clouds"], source_groups)
-    target_vertices = _vertices_for_groups(target_cache["group_clouds"], target_groups)
-    source_spatial_hash = _build_spatial_hash(source_vertices, _MATCH_TOLERANCE)
-    target_spatial_hash = _build_spatial_hash(target_vertices, _MATCH_TOLERANCE)
+    source_vertices, source_spatial_hash = _cached_vertices_and_hash_for_groups(source_cache, source_groups)
+    target_vertices, target_spatial_hash = _cached_vertices_and_hash_for_groups(target_cache, target_groups)
     return source_vertices, source_spatial_hash, target_vertices, target_spatial_hash
+
+
+def _cached_vertices_and_hash_for_groups(cache: dict, groups: set[int]):
+    normalized_groups = frozenset(int(group) for group in groups)
+    if not normalized_groups:
+        return (), {}
+    if normalized_groups.issuperset(cache["group_numbers"]):
+        return cache["seam_vertices"], cache["spatial_hash"]
+    group_vertex_cache = cache.setdefault("group_vertex_cache", {})
+    cached = group_vertex_cache.get(normalized_groups)
+    if cached is not None:
+        return cached
+    vertices = _vertices_for_groups(cache["group_clouds"], set(normalized_groups))
+    spatial_hash = _build_spatial_hash(vertices, _MATCH_TOLERANCE)
+    cached = (vertices, spatial_hash)
+    group_vertex_cache[normalized_groups] = cached
+    return cached
 
 
 def _vertices_for_groups(group_clouds: dict[int, dict], groups: set[int]):
@@ -709,6 +906,57 @@ def _vertices_for_groups(group_clouds: dict[int, dict], groups: set[int]):
         for vertex_index, world_co in cloud["points"]:
             by_vertex.setdefault(int(vertex_index), (int(vertex_index), world_co))
     return sorted(by_vertex.values(), key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
+
+
+def _neighbor_cell_keys_for_cloud(cloud: dict):
+    neighbor_cell_keys = cloud.get("neighbor_cell_keys")
+    if neighbor_cell_keys is None:
+        neighbor_cell_keys = _expanded_neighbor_cell_keys(cloud["cell_keys"])
+        cloud["neighbor_cell_keys"] = neighbor_cell_keys
+    return neighbor_cell_keys
+
+
+def _expanded_neighbor_cell_keys(cell_keys):
+    return _generic_expanded_neighbor_cell_keys(cell_keys)
+
+
+def _print_seam_performance_report(perf: dict, build_result: SeamBuildResult) -> None:
+    print("[BMC Seam] Performance report")
+    print(
+        "[BMC Seam] "
+        f"total={float(perf.get('total', 0.0)):.3f}s "
+        f"build={float(perf.get('build_total', 0.0)):.3f}s "
+        f"bbox_filter={float(perf.get('bbox_filter', 0.0)):.3f}s "
+        f"cache_build={float(perf.get('cache_build', 0.0)):.3f}s "
+        f"allowed_groups={float(perf.get('allowed_groups', 0.0)):.3f}s "
+        f"pair_prepare={float(perf.get('pair_prepare', 0.0)):.3f}s "
+        f"nearest_pairs={float(perf.get('nearest_pairs', 0.0)):.3f}s "
+        f"mapping_candidates={float(perf.get('mapping_candidates', 0.0)):.3f}s "
+        f"alias_build={float(perf.get('alias_build', 0.0)):.3f}s "
+        f"apply={float(perf.get('apply', 0.0)):.3f}s"
+    )
+    print(
+        "[BMC Seam] "
+        f"objects={int(perf.get('candidate_objects', 0) or 0)} "
+        f"tested_pairs={build_result.matched_pairs} "
+        f"skipped_pairs={build_result.skipped_pairs} "
+        f"candidate_edges={int(perf.get('candidate_edges', 0) or 0)} "
+        f"aliases={len(build_result.aliases)}"
+    )
+    cache_details = list(perf.get("cache_details", []) or [])
+    if cache_details:
+        print("[BMC Seam] Slowest seam caches:")
+        for index, detail in enumerate(sorted(cache_details, key=lambda item: item["seconds"], reverse=True)[:5], start=1):
+            print(
+                "[BMC Seam]   "
+                f"{index}. {detail['object']} "
+                f"total={float(detail['seconds']):.3f}s "
+                f"collect_vertices={float(detail.get('collect_vertices', 0.0)):.3f}s "
+                f"weights={float(detail.get('weights', 0.0)):.3f}s "
+                f"group_clouds={float(detail.get('group_clouds', 0.0)):.3f}s "
+                f"vertices={int(detail['seam_vertices'])} "
+                f"groups={int(detail['groups'])}"
+            )
 
 
 def _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance):
@@ -733,8 +981,65 @@ def _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance):
     return nearest_by_source
 
 
+def _build_nearest_vertex_map_from_hash(source_spatial_hash, target_spatial_hash, tolerance):
+    try:
+        return _build_nearest_vertex_map_from_hash_numpy(source_spatial_hash, target_spatial_hash, tolerance)
+    except Exception:
+        source_vertices = [
+            item
+            for cell_items in source_spatial_hash.values()
+            for item in cell_items
+        ]
+        source_vertices.sort(key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
+        return _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance)
+
+
+def _build_nearest_vertex_map_from_hash_numpy(source_spatial_hash, target_spatial_hash, tolerance):
+    np = optional_numpy()
+    tolerance_squared = float(tolerance) * float(tolerance)
+    nearest_by_source = {}
+    max_distance_values = 1_000_000
+    for source_key, source_items in source_spatial_hash.items():
+        if not source_items:
+            continue
+        target_items = [
+            item
+            for neighbor_key in _neighbor_keys(source_key)
+            for item in target_spatial_hash.get(neighbor_key, ())
+        ]
+        if not target_items:
+            continue
+
+        source_indices = np.fromiter((int(item[0]) for item in source_items), dtype=np.int64, count=len(source_items))
+        target_indices = np.fromiter((int(item[0]) for item in target_items), dtype=np.int64, count=len(target_items))
+        source_coords = np.asarray([item[1] for item in source_items], dtype=np.float64)
+        target_coords = np.asarray([item[1] for item in target_items], dtype=np.float64)
+        if source_coords.size == 0 or target_coords.size == 0:
+            continue
+
+        chunk_size = max(1, int(max_distance_values // max(1, len(target_items))))
+        for chunk_start in range(0, len(source_items), chunk_size):
+            chunk_end = min(len(source_items), chunk_start + chunk_size)
+            source_chunk = source_coords[chunk_start:chunk_end]
+            deltas = source_chunk[:, None, :] - target_coords[None, :, :]
+            distances_squared = np.einsum("ijk,ijk->ij", deltas, deltas)
+            nearest_positions = np.argmin(distances_squared, axis=1)
+            row_indices = np.arange(chunk_end - chunk_start)
+            nearest_distances_squared = distances_squared[row_indices, nearest_positions]
+            valid_rows = np.nonzero(nearest_distances_squared <= tolerance_squared)[0]
+            for row in valid_rows:
+                source_index = int(source_indices[chunk_start + int(row)])
+                target_position = int(nearest_positions[int(row)])
+                target_index = int(target_indices[target_position])
+                nearest_by_source[source_index] = (
+                    target_index,
+                    float(nearest_distances_squared[int(row)] ** 0.5),
+                )
+    return nearest_by_source
+
+
 def _build_vertex_pairs(source_vertices, source_spatial_hash, target_vertices, target_spatial_hash, tolerance):
-    source_to_target = _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance)
+    source_to_target = _build_nearest_vertex_map_from_hash(source_spatial_hash, target_spatial_hash, tolerance)
     if len(source_to_target) < _MIN_VERTEX_PAIRS:
         return []
     candidate_target_indices = {target_index for target_index, _distance in source_to_target.values()}
@@ -745,7 +1050,8 @@ def _build_vertex_pairs(source_vertices, source_spatial_hash, target_vertices, t
     ]
     if len(target_candidates) < _MIN_VERTEX_PAIRS:
         return []
-    target_to_source = _build_nearest_vertex_map(target_candidates, source_spatial_hash, tolerance)
+    target_candidates_spatial_hash = _build_spatial_hash(target_candidates, tolerance)
+    target_to_source = _build_nearest_vertex_map_from_hash(target_candidates_spatial_hash, source_spatial_hash, tolerance)
     matched_pairs = []
     for source_index, (target_index, distance) in source_to_target.items():
         reverse = target_to_source.get(target_index)

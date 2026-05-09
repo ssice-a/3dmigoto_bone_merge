@@ -1956,6 +1956,8 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
         return bool(scene and getattr(scene, "bmc_manifest_path", ""))
 
     def execute(self, context):
+        apply_start = time.perf_counter()
+        timings: dict[str, float] = {}
         scene = context.scene
         manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
         if not manifest_path or not os.path.exists(manifest_path):
@@ -1964,25 +1966,39 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
         seam_result = None
         seam_warnings: list[str] = []
         seam_skipped_reason = ""
+        meshes_and_remaps = []
         try:
+            stage_start = time.perf_counter()
             manifest = read_json(manifest_path)
+            timings["manifest"] = time.perf_counter() - stage_start
             if not manifest.get("bone_pool_order") or not manifest.get("object_remaps"):
                 self.report({"ERROR"}, "Global bone pool is empty; run Build Global Bone Pool first")
                 return {"CANCELLED"}
+            stage_start = time.perf_counter()
             _update_scene_mapping_payload(scene, manifest_path)
+            timings["scene_payload"] = time.perf_counter() - stage_start
+            stage_start = time.perf_counter()
             meshes_and_remaps = _candidate_source_meshes_and_remaps(context, manifest)
+            timings["collect_meshes"] = time.perf_counter() - stage_start
+            stage_start = time.perf_counter()
             updated_objects, renamed_groups, rename_warnings = _apply_global_names_to_candidate_source_objects(
                 context,
                 manifest,
                 meshes_and_remaps,
             )
+            timings["rename_groups"] = time.perf_counter() - stage_start
             if renamed_groups > 0:
                 try:
+                    stage_start = time.perf_counter()
                     seam_result = _merge_candidate_source_seam_groups(context, manifest, meshes_and_remaps)
+                    timings["seam_merge"] = time.perf_counter() - stage_start
                 except Exception as seam_exc:
+                    timings["seam_merge"] = time.perf_counter() - stage_start
                     seam_warnings.append(f"Seam merge skipped: {seam_exc}")
             else:
                 seam_skipped_reason = "unchanged groups"
+                timings["seam_merge"] = 0.0
+            timings["total"] = time.perf_counter() - apply_start
         except Exception as exc:
             self.report({"ERROR"}, f"Apply Global Bone Pool failed: {exc}")
             return {"CANCELLED"}
@@ -2002,6 +2018,30 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
         warnings.extend(seam_warnings)
         if warnings:
             self.report({"WARNING"}, " | ".join(warnings[:3]))
+        print("[BMC Apply Pool] Performance report")
+        print(f"[BMC Apply Pool] numpy={numpy_status()}")
+        print(
+            "[BMC Apply Pool] "
+            f"total={timings.get('total', 0.0):.3f}s "
+            f"manifest={timings.get('manifest', 0.0):.3f}s "
+            f"scene_payload={timings.get('scene_payload', 0.0):.3f}s "
+            f"collect_meshes={timings.get('collect_meshes', 0.0):.3f}s "
+            f"rename_groups={timings.get('rename_groups', 0.0):.3f}s "
+            f"seam_merge={timings.get('seam_merge', 0.0):.3f}s"
+        )
+        print(
+            "[BMC Apply Pool] "
+            f"objects={len(meshes_and_remaps)} "
+            f"renamed_objects={updated_objects} "
+            f"renamed_groups={renamed_groups}"
+        )
+        if seam_result is not None:
+            print(
+                "[BMC Apply Pool] "
+                f"seam aliases={len(seam_result.aliases)} "
+                f"tested_pairs={seam_result.matched_pairs} "
+                f"skipped_pairs={seam_result.skipped_pairs}"
+            )
         return {"FINISHED"}
 
 

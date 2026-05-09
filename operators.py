@@ -35,6 +35,7 @@ from .core.import_candidates import import_selected_candidates
 from .core.lod_analyze import analyze_lod_for_manifest, review_lod_global_pool_coverage
 from .core.lod_fallback import apply_lod_fallbacks_to_manifest, preview_lod_fallbacks_for_export
 from .core.main_analyze import build_bone_pool_order, write_main_analysis_manifest
+from .core.numpy_compat import numpy_status
 from .core.seam_matcher import build_and_apply_seam_mapping
 from .core.texture_marks import (
     dump_texture_mark_payload,
@@ -1697,6 +1698,7 @@ def _print_export_performance_report(result: dict, *, materialize_seconds: float
     performance = dict(result.get("performance", {}) or {})
     geometry = dict(performance.get("geometry", {}) or {})
     print("[BMC Export] Performance report")
+    print(f"[BMC Export] numpy={numpy_status()}")
     if timings:
         print(
             "[BMC Export] "
@@ -2241,6 +2243,7 @@ class BMC_OT_import_selected_candidates(bpy.types.Operator):
         try:
             manifest = read_json(manifest_path)
             target_collection = _ensure_export_collection(context)
+            performance: dict = {}
             imported_objects = import_selected_candidates(
                 context,
                 manifest,
@@ -2248,6 +2251,7 @@ class BMC_OT_import_selected_candidates(bpy.types.Operator):
                 target_collection,
                 mirror_flip=bool(getattr(scene, "bmc_mirror_flip", True)),
                 uv_flip_v=bool(getattr(scene, "bmc_uv_flip_v", True)),
+                performance=performance,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Import Selected IBs failed: {exc}")
@@ -2259,7 +2263,42 @@ class BMC_OT_import_selected_candidates(bpy.types.Operator):
         message = f"Imported {len(imported_objects)} candidate IB object(s) into {target_collection.name}"
         if warning_count:
             message += f"; {warning_count} with warnings"
+        _print_import_performance_report(performance)
         self.report({"INFO"}, message)
         return {"FINISHED"}
+
+
+def _print_import_performance_report(performance: dict) -> None:
+    if not performance:
+        return
+    print("[BMC Import] Performance report")
+    print(f"[BMC Import] numpy={numpy_status()}")
+    print(
+        "[BMC Import] "
+        f"total={float(performance.get('total', 0.0) or 0.0):.3f}s "
+        f"objects={len(list(performance.get('objects', []) or []))}"
+    )
+    objects = list(performance.get("objects", []) or [])
+    if not objects:
+        return
+    slowest = sorted(objects, key=lambda item: float(item.get("total", 0.0) or 0.0), reverse=True)[:5]
+    print("[BMC Import] Slowest objects:")
+    for index, item in enumerate(slowest, start=1):
+        stages = dict(item.get("create_stages", {}) or {})
+        formatted_stages = " ".join(
+            f"{name}={float(seconds or 0.0):.3f}s"
+            for name, seconds in sorted(stages.items(), key=lambda pair: float(pair[1] or 0.0), reverse=True)
+            if name != "total"
+        )
+        print(
+            "[BMC Import] "
+            f"  {index}. {item.get('name', '')} "
+            f"total={float(item.get('total', 0.0) or 0.0):.3f}s "
+            f"load={float(item.get('load', 0.0) or 0.0):.3f}s "
+            f"create={float(item.get('create', 0.0) or 0.0):.3f}s "
+            f"vertices={int(item.get('vertices', 0) or 0)} "
+            f"triangles={int(item.get('triangles', 0) or 0)} "
+            f"stages=[{formatted_stages}]"
+        )
 
 

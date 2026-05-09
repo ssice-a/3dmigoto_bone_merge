@@ -7,10 +7,12 @@ import math
 import os
 import re
 import struct
+import time
 from dataclasses import dataclass, field
 from typing import Iterable
 
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
+from .numpy_compat import optional_numpy
 from .texcoord_attrs import snorm_byte_to_color_component, texcoord_color_attr_names
 from .uv_transform import DEFAULT_UV_FLIP_V, game_uv_to_blender
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
@@ -171,11 +173,14 @@ def import_selected_candidates(
     *,
     mirror_flip: bool = DEFAULT_MIRROR_FLIP,
     uv_flip_v: bool = DEFAULT_UV_FLIP_V,
+    performance: dict | None = None,
 ):
     """Create Blender mesh objects for selected candidate display names."""
 
     import bpy  # type: ignore
 
+    total_start = time.perf_counter()
+    object_reports: list[dict] = []
     selected_names = {str(value) for value in selected_display_names if str(value)}
     if not selected_names:
         return []
@@ -185,7 +190,12 @@ def import_selected_candidates(
         display_name = str(candidate.get("display_name", "") or _candidate_display_name(candidate))
         if display_name not in selected_names:
             continue
+        object_start = time.perf_counter()
+        stage_start = time.perf_counter()
         geometry = load_candidate_geometry(candidate, frameanalysis_dir)
+        load_seconds = time.perf_counter() - stage_start
+        create_report: dict[str, float] = {}
+        stage_start = time.perf_counter()
         imported_object = create_blender_object_from_geometry(
             bpy,
             geometry,
@@ -194,8 +204,21 @@ def import_selected_candidates(
             shadow_draw_indices=list(candidate.get("shadow_draw_indices", []) or []),
             mirror_flip=mirror_flip,
             uv_flip_v=uv_flip_v,
+            performance=create_report,
         )
+        create_seconds = time.perf_counter() - stage_start
         imported_objects.append(imported_object)
+        object_reports.append(
+            {
+                "name": display_name,
+                "vertices": len(geometry.positions),
+                "triangles": len(geometry.triangles),
+                "load": load_seconds,
+                "create": create_seconds,
+                "total": time.perf_counter() - object_start,
+                "create_stages": create_report,
+            }
+        )
 
     if imported_objects:
         for selected_object in context.selected_objects:
@@ -203,6 +226,14 @@ def import_selected_candidates(
         for imported_object in imported_objects:
             imported_object.select_set(True)
         context.view_layer.objects.active = imported_objects[0]
+    if performance is not None:
+        performance.clear()
+        performance.update(
+            {
+                "total": time.perf_counter() - total_start,
+                "objects": object_reports,
+            }
+        )
     return imported_objects
 
 
@@ -215,25 +246,43 @@ def create_blender_object_from_geometry(
     shadow_draw_indices: list[int],
     mirror_flip: bool = DEFAULT_MIRROR_FLIP,
     uv_flip_v: bool = DEFAULT_UV_FLIP_V,
+    performance: dict | None = None,
 ):
+    total_start = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    stage_start = time.perf_counter()
     mesh = bpy_module.data.meshes.new(geometry.display_name)
     imported_object = bpy_module.data.objects.new(geometry.display_name, mesh)
     target_collection.objects.link(imported_object)
+    timings["setup"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     blender_positions = _positions_for_blender(geometry.positions, mirror_flip=mirror_flip)
     blender_normals = _normals_for_blender(geometry.normals, mirror_flip=mirror_flip)
     blender_triangles = _triangles_for_blender(geometry.triangles, mirror_flip=mirror_flip)
+    timings["transform"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     mesh.from_pydata(blender_positions, [], blender_triangles)
     mesh.validate(verbose=False, clean_customdata=False)
     mesh.update()
     for polygon in mesh.polygons:
         polygon.use_smooth = True
+    timings["mesh"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     if geometry.uv0 is not None:
         _apply_uv_layer(mesh, "UV0", geometry.uv0, uv_flip_v=uv_flip_v)
     if geometry.uv1 is not None:
         _apply_uv_layer(mesh, "UV1", geometry.uv1, uv_flip_v=uv_flip_v)
+    timings["uv"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     _apply_custom_normals(mesh, blender_normals)
+    timings["normals"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     _store_int_attribute(mesh, "bmc_orig_vertex_id", geometry.original_vertex_ids)
     _store_uint32_split_attributes(mesh, "bmc_normal_packed", geometry.normal_packed)
     _store_texcoord_semantic_attributes(mesh, geometry.texcoord_semantics)
@@ -253,8 +302,13 @@ def create_blender_object_from_geometry(
             f"bmc_blend_weight_{channel_index}",
             [record[channel_index] for record in geometry.blend_weights],
         )
+    timings["attributes"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     _assign_vertex_groups(imported_object, geometry.blend_indices, geometry.blend_weights)
+    timings["vertex_groups"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     imported_object.merge_ib_hash = geometry.ib_hash
     imported_object.merge_match_index_count = int(geometry.match_index_count)
     imported_object.merge_ib_autodetected = False
@@ -280,6 +334,11 @@ def create_blender_object_from_geometry(
     )
     if geometry.warnings:
         imported_object["bmc_import_warnings"] = "\n".join(geometry.warnings)
+    timings["metadata"] = time.perf_counter() - stage_start
+    timings["total"] = time.perf_counter() - total_start
+    if performance is not None:
+        performance.clear()
+        performance.update(timings)
     return imported_object
 
 
@@ -377,9 +436,11 @@ def _read_index_buffer(path: str, header: BufferHeader) -> list[int]:
     if "R16_UINT" in fmt:
         stride = 2
         unpack_format = "<H"
+        numpy_dtype = "<u2"
     elif "R32_UINT" in fmt:
         stride = 4
         unpack_format = "<I"
+        numpy_dtype = "<u4"
     else:
         raise ValueError(f"Unsupported IB format: {header.fmt}")
     first_index = int(header.first_index)
@@ -388,6 +449,12 @@ def _read_index_buffer(path: str, header: BufferHeader) -> list[int]:
         data = file_handle.read(index_count * stride)
     if len(data) < index_count * stride:
         raise ValueError(f"IB buffer is shorter than expected: {path}")
+    np = optional_numpy()
+    if np is not None:
+        try:
+            return [int(value) for value in np.frombuffer(data, dtype=np.dtype(numpy_dtype), count=index_count)]
+        except Exception:
+            pass
     return [int(record[0]) for record in struct.iter_unpack(unpack_format, data)]
 
 
@@ -715,6 +782,9 @@ def _element_layout_payload(element: HeaderElement) -> dict:
 
 def _read_uint32_records(slot: _SlotSlice, element: HeaderElement, vertex_ids: list[int]) -> list[int]:
     _validate_vertex_record_range(slot, element, vertex_ids, 4)
+    numpy_values = _read_numpy_scalar_records(slot, element, vertex_ids, "<u4")
+    if numpy_values is not None:
+        return [int(value) for value in numpy_values]
     stride = int(slot.header.stride)
     element_offset = int(element.aligned_byte_offset)
     data = slot.data
@@ -727,6 +797,15 @@ def _read_int8x4_records(
     vertex_ids: list[int],
 ) -> list[tuple[int, int, int, int]]:
     _validate_vertex_record_range(slot, element, vertex_ids, 4)
+    numpy_values = _read_numpy_vector_records(slot, element, vertex_ids, "u1", 4)
+    if numpy_values is not None:
+        try:
+            np = optional_numpy()
+            signed = numpy_values.astype(np.int16)
+            signed = np.where(signed >= 128, signed - 256, signed)
+            return [tuple(int(component) for component in row) for row in signed.tolist()]
+        except Exception:
+            pass
     stride = int(slot.header.stride)
     element_offset = int(element.aligned_byte_offset)
     data = slot.data
@@ -775,6 +854,9 @@ def _read_format_records(
 ) -> list[tuple[float, ...]]:
     size = _format_size(element.fmt)
     _validate_vertex_record_range(slot, element, vertex_ids, size)
+    numpy_records = _read_format_records_numpy(slot, element, vertex_ids)
+    if numpy_records is not None:
+        return numpy_records
     stride = int(slot.header.stride)
     element_offset = int(element.aligned_byte_offset)
     data = slot.data
@@ -782,6 +864,95 @@ def _read_format_records(
         _unpack_format(data, int(vertex_id) * stride + element_offset, element.fmt)
         for vertex_id in vertex_ids
     ]
+
+
+def _read_format_records_numpy(
+    slot: _SlotSlice,
+    element: HeaderElement,
+    vertex_ids: list[int],
+) -> list[tuple[float, ...]] | None:
+    normalized_fmt = _normalize_dxgi_format(str(element.fmt or ""))
+    specs = {
+        "R32_FLOAT": ("<f4", 1, None),
+        "R32G32_FLOAT": ("<f4", 2, None),
+        "R32G32B32_FLOAT": ("<f4", 3, None),
+        "R32G32B32A32_FLOAT": ("<f4", 4, None),
+        "R32G32B32A32_UINT": ("<u4", 4, None),
+        "R16G16B16A16_UNORM": ("<u2", 4, "unorm16"),
+        "R8G8B8A8_UINT": ("u1", 4, None),
+        "R8G8B8A8_SNORM": ("u1", 4, "snorm8"),
+        "R8G8B8A8_UNORM": ("u1", 4, "unorm8"),
+    }
+    spec = specs.get(normalized_fmt)
+    if spec is None:
+        return None
+    dtype_name, component_count, conversion = spec
+    values = _read_numpy_vector_records(slot, element, vertex_ids, dtype_name, component_count)
+    if values is None:
+        return None
+    try:
+        np = optional_numpy()
+        if conversion == "unorm16":
+            values = values.astype(np.float64) / 65535.0
+        elif conversion == "unorm8":
+            values = values.astype(np.float64) / 255.0
+        elif conversion == "snorm8":
+            signed = values.astype(np.int16)
+            values = np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
+        else:
+            values = values.astype(np.float64)
+        return [tuple(float(component) for component in row) for row in values.tolist()]
+    except Exception:
+        return None
+
+
+def _read_numpy_scalar_records(
+    slot: _SlotSlice,
+    element: HeaderElement,
+    vertex_ids: list[int],
+    dtype_name: str,
+):
+    values = _read_numpy_vector_records(slot, element, vertex_ids, dtype_name, 1)
+    if values is None:
+        return None
+    try:
+        return values[:, 0]
+    except Exception:
+        return None
+
+
+def _read_numpy_vector_records(
+    slot: _SlotSlice,
+    element: HeaderElement,
+    vertex_ids: list[int],
+    dtype_name: str,
+    component_count: int,
+):
+    np = optional_numpy()
+    if np is None:
+        return None
+    try:
+        field_dtype = np.dtype(dtype_name)
+        record_dtype = np.dtype(
+            {
+                "names": ["field"],
+                "formats": [(field_dtype, (int(component_count),))],
+                "offsets": [int(element.aligned_byte_offset)],
+                "itemsize": int(slot.header.stride),
+            }
+        )
+        records = np.frombuffer(slot.data, dtype=record_dtype, count=int(slot.header.vertex_count))
+        indices = np.asarray(vertex_ids, dtype=np.intp)
+        return records["field"][indices]
+    except Exception:
+        return None
+
+
+def _normalize_dxgi_format(fmt: str) -> str:
+    normalized = str(fmt or "").upper()
+    if normalized.startswith("DXGI_FORMAT_"):
+        normalized = normalized[len("DXGI_FORMAT_"):]
+    return normalized
 
 
 def _read_raw_records(

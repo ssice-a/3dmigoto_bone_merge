@@ -14,6 +14,7 @@ from .texcoord_attrs import (
     texcoord_component_attr_names,
 )
 from .export_package import ExportPartPlan, write_r32_index_buffer
+from .numpy_compat import optional_numpy
 from .uv_transform import DEFAULT_UV_FLIP_V, blender_uv_to_game
 from .vertex_format import encode_game_packed_normal, pack_vertex_format
 
@@ -76,11 +77,14 @@ class _MeshExportCache:
     vertex_position_values: list[tuple[float, float, float]] | None
     loop_normal_values: list[tuple[float, float, float]] | None
     game_position_values: list[tuple[float, float, float]] | None
+    game_normal_values: list[tuple[float, float, float]] | None
     game_packed_normal_values: list[int] | None
     game_position_by_vertex: dict[int, tuple[float, float, float]]
     game_normal_by_loop: dict[int, tuple[float, float, float]]
     top4_by_vertex: dict[int, tuple[tuple[float, float, float, float], tuple[int, int, int, int]]]
     top4_packed_by_vertex: dict[int, tuple[tuple[int, int, int, int], tuple[int, int, int, int]]]
+    blend_weights_by_vertex: object | None
+    blend_indices_by_vertex: object | None
     uv_layers: dict[str, object | None]
     uv_values_by_layer: dict[str, list[tuple[float, float]] | None]
     game_uv_values_by_layer: dict[str, list[tuple[float, float]] | None]
@@ -135,11 +139,14 @@ class _ExportPartCache:
                 vertex_position_values=None,
                 loop_normal_values=None,
                 game_position_values=None,
+                game_normal_values=None,
                 game_packed_normal_values=None,
                 game_position_by_vertex={},
                 game_normal_by_loop={},
                 top4_by_vertex={},
                 top4_packed_by_vertex={},
+                blend_weights_by_vertex=None,
+                blend_indices_by_vertex=None,
                 uv_layers={},
                 uv_values_by_layer={},
                 game_uv_values_by_layer={},
@@ -473,12 +480,18 @@ def _write_fast_prepared_vertex_slot(
                 pack_into("<2f", output, offset, float(uv[0]), float(uv[1]))
             elif kind == "texcoord_snorm4":
                 _write_texcoord_snorm4_into(output, offset, slot.slot_name, int(plan[2]), loop_vertex, export_cache)
-            elif kind == "blend_weights_u16":
+            elif kind == "blend_weights":
                 weights, _indices = _local_top4_weights(loop_vertex, export_cache)
-                pack_into("<4H", output, offset, *(_unorm16(value) for value in weights))
-            elif kind == "blend_indices_u8":
+                if len(plan) > 2 and _normalize_format(str(plan[2])) == "R32G32B32A32_FLOAT":
+                    pack_into("<4f", output, offset, *weights)
+                else:
+                    pack_into("<4H", output, offset, *(_unorm16(value) for value in weights))
+            elif kind == "blend_indices":
                 _weights, indices = _local_top4_weights(loop_vertex, export_cache)
-                pack_into("<4B", output, offset, *(_uint8(value) for value in indices))
+                if len(plan) > 2 and _normalize_format(str(plan[2])) == "R32G32B32A32_UINT":
+                    pack_into("<4I", output, offset, *indices)
+                else:
+                    pack_into("<4B", output, offset, *(_uint8(value) for value in indices))
             else:
                 return False
     return True
@@ -522,6 +535,8 @@ def _write_position_slot(
         and normal3_offset is None
     ):
         return _write_position_packed_normal_slot16(slot, loop_vertices, export_cache)
+    if _write_numpy_position_slot(slot, field_plans, loop_vertices, export_cache):
+        return True
     output = slot.output
     stride = int(slot.stride)
     pack_into = struct.pack_into
@@ -552,6 +567,8 @@ def _write_position_packed_normal_slot16(
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
 ) -> bool:
+    if _write_numpy_position_packed_normal_slot16(slot, loop_vertices, export_cache):
+        return True
     output = slot.output
     pack_into = struct.pack_into
     current_key = None
@@ -570,6 +587,99 @@ def _write_position_packed_normal_slot16(
     return True
 
 
+def _write_numpy_position_packed_normal_slot16(
+    slot: _PreparedVertexSlot,
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    np = optional_numpy()
+    if np is None or not loop_vertices or int(slot.stride) != 16:
+        return False
+    try:
+        records = np.empty(
+            len(loop_vertices),
+            dtype=np.dtype([("position", "<f4", (3,)), ("normal", "<u4")]),
+        )
+        for start, end in _loop_vertex_mesh_ranges(loop_vertices):
+            first = loop_vertices[start]
+            mesh_cache = export_cache.mesh_cache(first)
+            positions = np.asarray(_game_position_values(first.mesh, mesh_cache), dtype="<f4")
+            normals = np.asarray(_game_packed_normal_values(first.mesh, mesh_cache), dtype="<u4")
+            vertex_indices = np.fromiter(
+                (loop_vertices[index].vertex_index for index in range(start, end)),
+                dtype=np.intp,
+                count=end - start,
+            )
+            loop_indices = np.fromiter(
+                (loop_vertices[index].loop_index for index in range(start, end)),
+                dtype=np.intp,
+                count=end - start,
+            )
+            if vertex_indices.size and int(vertex_indices.max()) >= len(positions):
+                return False
+            if loop_indices.size and int(loop_indices.max()) >= len(normals):
+                return False
+            records["position"][start:end] = positions[vertex_indices]
+            records["normal"][start:end] = normals[loop_indices]
+        slot.output[:] = records.tobytes()
+        return True
+    except Exception:
+        return False
+
+
+def _write_numpy_position_slot(
+    slot: _PreparedVertexSlot,
+    field_plans: list[tuple],
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    np = optional_numpy()
+    if np is None or not loop_vertices:
+        return False
+    if any(plan[0] not in {"position3", "normal_packed", "normal3"} for plan in field_plans):
+        return False
+    position_offset = _single_plan_offset(field_plans, "position3")
+    normal_packed_offset = _single_plan_offset(field_plans, "normal_packed")
+    normal3_offset = _single_plan_offset(field_plans, "normal3")
+    if position_offset is None and normal_packed_offset is None and normal3_offset is None:
+        return False
+    stride = int(slot.stride)
+    try:
+        records = np.zeros((len(loop_vertices), stride), dtype=np.uint8)
+        for start, end in _loop_vertex_mesh_ranges(loop_vertices):
+            first = loop_vertices[start]
+            mesh_cache = export_cache.mesh_cache(first)
+            vertex_indices = np.fromiter(
+                (loop_vertices[index].vertex_index for index in range(start, end)),
+                dtype=np.intp,
+                count=end - start,
+            )
+            loop_indices = np.fromiter(
+                (loop_vertices[index].loop_index for index in range(start, end)),
+                dtype=np.intp,
+                count=end - start,
+            )
+            if position_offset is not None:
+                positions = np.asarray(_game_position_values(first.mesh, mesh_cache), dtype=np.float32)
+                if vertex_indices.size and int(vertex_indices.max()) >= len(positions):
+                    return False
+                _numpy_assign_bytes(records[start:end], int(position_offset), positions[vertex_indices])
+            if normal_packed_offset is not None:
+                packed_normals = np.asarray(_game_packed_normal_values(first.mesh, mesh_cache), dtype=np.uint32)
+                if loop_indices.size and int(loop_indices.max()) >= len(packed_normals):
+                    return False
+                _numpy_assign_bytes(records[start:end], int(normal_packed_offset), packed_normals[loop_indices])
+            if normal3_offset is not None:
+                normals = np.asarray(_game_normal_values(first.mesh, mesh_cache), dtype=np.float32)
+                if loop_indices.size and int(loop_indices.max()) >= len(normals):
+                    return False
+                _numpy_assign_bytes(records[start:end], int(normal3_offset), normals[loop_indices])
+        slot.output[:] = records.tobytes()
+        return True
+    except Exception:
+        return False
+
+
 def _write_texcoord_slot(
     slot: _PreparedVertexSlot,
     field_plans: list[tuple],
@@ -580,6 +690,8 @@ def _write_texcoord_slot(
     texcoord_snorm4_plans = [plan for plan in field_plans if plan[0] == "texcoord_snorm4"]
     if len(uv_plans) + len(texcoord_snorm4_plans) != len(field_plans):
         return False
+    if _write_numpy_texcoord_slot(slot, field_plans, loop_vertices, export_cache):
+        return True
     output = slot.output
     stride = int(slot.stride)
     pack_into = struct.pack_into
@@ -623,33 +735,212 @@ def _write_texcoord_slot(
     return True
 
 
+def _write_numpy_texcoord_slot(
+    slot: _PreparedVertexSlot,
+    field_plans: list[tuple],
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    np = optional_numpy()
+    if np is None or not loop_vertices:
+        return False
+    uv_plans = [plan for plan in field_plans if plan[0] == "uv"]
+    texcoord_snorm4_plans = [plan for plan in field_plans if plan[0] == "texcoord_snorm4"]
+    if len(uv_plans) + len(texcoord_snorm4_plans) != len(field_plans):
+        return False
+    stride = int(slot.stride)
+    try:
+        records = np.zeros((len(loop_vertices), stride), dtype=np.uint8)
+        for start, end in _loop_vertex_mesh_ranges(loop_vertices):
+            first = loop_vertices[start]
+            mesh_cache = export_cache.mesh_cache(first)
+            loop_indices = np.fromiter(
+                (loop_vertices[index].loop_index for index in range(start, end)),
+                dtype=np.intp,
+                count=end - start,
+            )
+            for _kind, field_offset, layer_name in uv_plans:
+                uv_values = _game_uv_values(first.mesh, str(layer_name), mesh_cache)
+                if uv_values is None:
+                    return False
+                uv_values = np.asarray(uv_values, dtype=np.float32)
+                if loop_indices.size and int(loop_indices.max()) >= len(uv_values):
+                    return False
+                _numpy_assign_bytes(records[start:end], int(field_offset), uv_values[loop_indices])
+            for _kind, field_offset, semantic_index in texcoord_snorm4_plans:
+                source = _texcoord_snorm4_source(first.mesh, slot.slot_name, int(semantic_index), mesh_cache)
+                snorm_values = _numpy_texcoord_snorm4_values(source, loop_vertices, start, end, loop_indices)
+                if snorm_values is None:
+                    return False
+                _numpy_assign_bytes(records[start:end], int(field_offset), snorm_values)
+        slot.output[:] = records.tobytes()
+        return True
+    except Exception:
+        return False
+
+
 def _write_blend_slot(
     slot: _PreparedVertexSlot,
     field_plans: list[tuple],
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
 ) -> bool:
-    if any(plan[0] not in {"blend_weights_u16", "blend_indices_u8"} for plan in field_plans):
+    if any(plan[0] not in {"blend_weights", "blend_indices"} for plan in field_plans):
         return False
-    weights_offset = _single_plan_offset(field_plans, "blend_weights_u16")
-    indices_offset = _single_plan_offset(field_plans, "blend_indices_u8")
+    weights_plan = _single_plan_detail(field_plans, "blend_weights")
+    indices_plan = _single_plan_detail(field_plans, "blend_indices")
+    weights_offset = int(weights_plan[1]) if weights_plan is not None else None
+    indices_offset = int(indices_plan[1]) if indices_plan is not None else None
     if weights_offset is None and indices_offset is None:
         return False
     output = slot.output
     stride = int(slot.stride)
     pack_into = struct.pack_into
-    combined_offsets = weights_offset == 0 and indices_offset == 8
+    weights_format = _normalize_format(str(weights_plan[2])) if weights_plan is not None and len(weights_plan) > 2 else ""
+    indices_format = _normalize_format(str(indices_plan[2])) if indices_plan is not None and len(indices_plan) > 2 else ""
+    if _write_numpy_blend_slot(slot, field_plans, loop_vertices, export_cache):
+        return True
     for record_index, loop_vertex in enumerate(loop_vertices):
         record_base = record_index * stride
-        weights, indices = _local_top4_packed(loop_vertex, export_cache)
-        if combined_offsets:
-            pack_into("<4H4B", output, record_base, *weights, *indices)
-            continue
+        weights, indices = _local_top4_weights(loop_vertex, export_cache)
         if weights_offset is not None:
-            pack_into("<4H", output, record_base + weights_offset, *weights)
+            if weights_format == "R32G32B32A32_FLOAT":
+                pack_into("<4f", output, record_base + weights_offset, *weights)
+            else:
+                pack_into("<4H", output, record_base + weights_offset, *(_unorm16(value) for value in weights))
         if indices_offset is not None:
-            pack_into("<4B", output, record_base + indices_offset, *indices)
+            if indices_format == "R32G32B32A32_UINT":
+                pack_into("<4I", output, record_base + indices_offset, *indices)
+            else:
+                pack_into("<4B", output, record_base + indices_offset, *(_uint8(value) for value in indices))
     return True
+
+
+def _write_numpy_blend_slot(
+    slot: _PreparedVertexSlot,
+    field_plans: list[tuple],
+    loop_vertices: list[_LoopVertex],
+    export_cache: _ExportPartCache,
+) -> bool:
+    np = optional_numpy()
+    if np is None or not loop_vertices:
+        return False
+    weights_plan = _single_plan_detail(field_plans, "blend_weights")
+    indices_plan = _single_plan_detail(field_plans, "blend_indices")
+    weights_offset = int(weights_plan[1]) if weights_plan is not None else None
+    indices_offset = int(indices_plan[1]) if indices_plan is not None else None
+    if weights_offset is None and indices_offset is None:
+        return False
+    weights_format = _normalize_format(str(weights_plan[2])) if weights_plan is not None and len(weights_plan) > 2 else ""
+    indices_format = _normalize_format(str(indices_plan[2])) if indices_plan is not None and len(indices_plan) > 2 else ""
+    if weights_format not in {"", "R16G16B16A16_UNORM", "R32G32B32A32_FLOAT"}:
+        return False
+    if indices_format not in {"", "R8G8B8A8_UINT", "R32G32B32A32_UINT"}:
+        return False
+    try:
+        records = np.zeros((len(loop_vertices), int(slot.stride)), dtype=np.uint8)
+        for start, end in _loop_vertex_mesh_ranges(loop_vertices):
+            first = loop_vertices[start]
+            mesh_cache = export_cache.mesh_cache(first)
+            vertex_indices = np.fromiter(
+                (loop_vertices[index].vertex_index for index in range(start, end)),
+                dtype=np.intp,
+                count=end - start,
+            )
+            weights_by_vertex, indices_by_vertex = _local_top4_vertex_arrays(first.mesh, mesh_cache, export_cache)
+            weights_by_vertex = np.asarray(weights_by_vertex)
+            indices_by_vertex = np.asarray(indices_by_vertex)
+            if weights_offset is not None:
+                if vertex_indices.size and int(vertex_indices.max()) >= len(weights_by_vertex):
+                    return False
+                weights_array = weights_by_vertex[vertex_indices]
+                if weights_format == "R16G16B16A16_UNORM":
+                    weights_array = np.rint(np.clip(np.asarray(weights_array, dtype=np.float32), 0.0, 1.0) * 65535.0).astype(np.uint16)
+                else:
+                    weights_array = np.asarray(weights_array, dtype=np.float32)
+                _numpy_assign_bytes(records[start:end], weights_offset, weights_array)
+            if indices_offset is not None:
+                if vertex_indices.size and int(vertex_indices.max()) >= len(indices_by_vertex):
+                    return False
+                indices_array = indices_by_vertex[vertex_indices]
+                if indices_format == "R32G32B32A32_UINT":
+                    indices_array = np.asarray(indices_array, dtype=np.uint32)
+                else:
+                    indices_array = np.asarray(indices_array, dtype=np.uint8)
+                _numpy_assign_bytes(records[start:end], indices_offset, indices_array)
+        slot.output[:] = records.tobytes()
+        return True
+    except Exception:
+        return False
+
+
+def _loop_vertex_mesh_ranges(loop_vertices: list[_LoopVertex]):
+    if not loop_vertices:
+        return
+    start = 0
+    current_key = id(loop_vertices[0].mesh_obj)
+    for index in range(1, len(loop_vertices)):
+        key = id(loop_vertices[index].mesh_obj)
+        if key == current_key:
+            continue
+        yield start, index
+        start = index
+        current_key = key
+    yield start, len(loop_vertices)
+
+
+def _numpy_assign_bytes(target, offset: int, values) -> None:
+    np = optional_numpy()
+    if np is None:
+        raise ValueError("numpy is required for the fast path")
+    array = np.ascontiguousarray(values)
+    if array.size == 0:
+        return
+    byte_view = array.view(np.uint8).reshape(int(array.shape[0]), -1)
+    target[:, int(offset):int(offset) + byte_view.shape[1]] = byte_view
+
+
+def _numpy_texcoord_snorm4_values(
+    source: tuple,
+    loop_vertices: list[_LoopVertex],
+    start: int,
+    end: int,
+    loop_indices,
+) -> object | None:
+    np = optional_numpy()
+    if np is None:
+        return None
+    kind = source[0]
+    count = end - start
+    if kind == "zero":
+        return np.zeros((count, 4), dtype=np.uint8)
+    if kind == "point":
+        component_data = source[1]
+        values = np.zeros((count, 4), dtype=np.uint8)
+        for component, data in enumerate(component_data):
+            values[:, component] = np.fromiter(
+                (
+                    _raw_byte_from_attribute_data(data, int(loop_vertices[index].vertex_index))
+                    for index in range(start, end)
+                ),
+                dtype=np.uint8,
+                count=count,
+            )
+        return values
+    if kind == "color":
+        attribute, use_loop_index = source[1], bool(source[2])
+        data = getattr(attribute, "data", [])
+        values = np.zeros((count, 4), dtype=np.uint8)
+        for local_index, loop_index in enumerate(loop_indices):
+            data_index = int(loop_index if use_loop_index else loop_vertices[start + int(local_index)].vertex_index)
+            item = data[data_index] if data_index < len(data) else None
+            color_values = _color_values_from_item(item) if item is not None else None
+            if color_values is None:
+                continue
+            for component, value in enumerate(color_values[:4]):
+                values[local_index, component] = color_component_to_raw_byte(value)
+        return values
+    return None
 
 
 def _single_plan_offset(field_plans: list[tuple], kind: str) -> int | None:
@@ -657,6 +948,13 @@ def _single_plan_offset(field_plans: list[tuple], kind: str) -> int | None:
     if len(offsets) > 1:
         return None
     return offsets[0] if offsets else None
+
+
+def _single_plan_detail(field_plans: list[tuple], kind: str) -> tuple | None:
+    plans = [plan for plan in field_plans if plan[0] == kind]
+    if len(plans) > 1:
+        return None
+    return plans[0] if plans else None
 
 
 def _fast_field_plans(slot: _PreparedVertexSlot) -> list[tuple] | None:
@@ -675,10 +973,10 @@ def _fast_field_plans(slot: _PreparedVertexSlot) -> list[tuple] | None:
             plans.append(("uv", offset, f"UV{semantic_index}"))
         elif semantic_name == "TEXCOORD" and fmt == "R8G8B8A8_SNORM":
             plans.append(("texcoord_snorm4", offset, semantic_index))
-        elif semantic_name == "BLENDWEIGHTS" and semantic_index == 0 and fmt == "R16G16B16A16_UNORM":
-            plans.append(("blend_weights_u16", offset))
-        elif semantic_name == "BLENDINDICES" and semantic_index == 0 and fmt == "R8G8B8A8_UINT":
-            plans.append(("blend_indices_u8", offset))
+        elif semantic_name == "BLENDWEIGHTS" and semantic_index == 0 and fmt in {"R16G16B16A16_UNORM", "R32G32B32A32_FLOAT"}:
+            plans.append(("blend_weights", offset, fmt))
+        elif semantic_name == "BLENDINDICES" and semantic_index == 0 and fmt in {"R8G8B8A8_UINT", "R32G32B32A32_UINT"}:
+            plans.append(("blend_indices", offset, fmt))
         else:
             return None
     return plans
@@ -844,17 +1142,17 @@ def _game_normal(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tu
     cached = mesh_cache.game_normal_by_loop.get(loop_vertex.loop_index)
     if cached is not None:
         return cached
-    normal_values = _loop_normal_values(loop_vertex.mesh, mesh_cache)
+    normal_values = _game_normal_values(loop_vertex.mesh, mesh_cache)
     if loop_vertex.loop_index < len(normal_values):
         normal = normal_values[loop_vertex.loop_index]
     else:
         loop = getattr(loop_vertex.mesh, "loops", [])[loop_vertex.loop_index]
         normal = _vector3(getattr(loop, "normal", None) or getattr(loop_vertex.polygon, "normal", None) or (0.0, 0.0, 1.0))
-    if not mesh_cache.matrix_world_applied:
-        normal = _transform_normal(loop_vertex.mesh_obj, normal)
-    if mesh_cache.mirror_flip:
-        normal = (-normal[0], normal[1], normal[2])
-    normal = _normalize3(normal)
+        if not mesh_cache.matrix_world_applied:
+            normal = _transform_normal(loop_vertex.mesh_obj, normal)
+        if mesh_cache.mirror_flip:
+            normal = (-normal[0], normal[1], normal[2])
+        normal = _normalize3(normal)
     mesh_cache.game_normal_by_loop[loop_vertex.loop_index] = normal
     return normal
 
@@ -931,31 +1229,92 @@ def _indexed_uv_layer(uv_layers, index: int):
 def _game_position_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float, float, float]]:
     if mesh_cache.game_position_values is not None:
         return mesh_cache.game_position_values
-    values = []
-    for co in _vertex_position_values(mesh, mesh_cache):
+    np = optional_numpy()
+    values = _vertex_position_values(mesh, mesh_cache)
+    if np is not None and hasattr(values, "shape"):
+        positions = np.asarray(values, dtype=np.float32)
+        if not mesh_cache.matrix_world_applied:
+            positions = _transform_points_numpy(mesh_cache.mesh_obj, positions)
+        if mesh_cache.mirror_flip:
+            positions = positions.copy()
+            positions[:, 0] *= -1.0
+        mesh_cache.game_position_values = positions
+        return positions
+    result = []
+    for co in values:
         position = co
         if not mesh_cache.matrix_world_applied:
             position = _transform_point(mesh_cache.mesh_obj, position)
         if mesh_cache.mirror_flip:
             position = (-position[0], position[1], position[2])
-        values.append(position)
-    mesh_cache.game_position_values = values
-    return values
+        result.append(position)
+    mesh_cache.game_position_values = result
+    return result
 
 
-def _game_packed_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[int]:
-    if mesh_cache.game_packed_normal_values is not None:
-        return mesh_cache.game_packed_normal_values
-    values = []
-    for normal in _loop_normal_values(mesh, mesh_cache):
+def _game_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float, float, float]]:
+    if mesh_cache.game_normal_values is not None:
+        return mesh_cache.game_normal_values
+    np = optional_numpy()
+    values = _loop_normal_values(mesh, mesh_cache)
+    if np is not None and hasattr(values, "shape"):
+        normals = np.asarray(values, dtype=np.float32)
+        if not mesh_cache.matrix_world_applied:
+            normals = _transform_normals_numpy(mesh_cache.mesh_obj, normals)
+        if mesh_cache.mirror_flip:
+            normals = normals.copy()
+            normals[:, 0] *= -1.0
+        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        lengths = np.where(lengths <= 1e-12, 1.0, lengths)
+        normals = normals / lengths
+        mesh_cache.game_normal_values = normals
+        return normals
+    result = []
+    for normal in values:
         game_normal = normal
         if not mesh_cache.matrix_world_applied:
             game_normal = _transform_normal(mesh_cache.mesh_obj, game_normal)
         if mesh_cache.mirror_flip:
             game_normal = (-game_normal[0], game_normal[1], game_normal[2])
-        values.append(int(encode_game_packed_normal(game_normal)))
-    mesh_cache.game_packed_normal_values = values
-    return values
+        result.append(_normalize3(game_normal))
+    mesh_cache.game_normal_values = result
+    return result
+
+
+def _game_packed_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[int]:
+    if mesh_cache.game_packed_normal_values is not None:
+        return mesh_cache.game_packed_normal_values
+    np = optional_numpy()
+    values = _game_normal_values(mesh, mesh_cache)
+    if np is not None and hasattr(values, "shape"):
+        normals = np.asarray(values, dtype=np.float32)
+        if normals.size == 0:
+            packed = np.zeros((0,), dtype=np.uint32)
+        else:
+            x_values = normals[:, 0]
+            y_values = normals[:, 1]
+            z_values = normals[:, 2]
+            inv_l1 = 1.0 / np.maximum(np.abs(x_values) + np.abs(y_values) + np.abs(z_values), 1e-12)
+            oct_x = x_values * inv_l1
+            oct_y = y_values * inv_l1
+            fold_mask = z_values < 0.0
+            if np.any(fold_mask):
+                sign_x = np.where(oct_x >= 0.0, 1.0, -1.0)
+                sign_y = np.where(oct_y >= 0.0, 1.0, -1.0)
+                folded_x = (1.0 - np.abs(oct_y)) * sign_x
+                folded_y = (1.0 - np.abs(oct_x)) * sign_y
+                oct_x = np.where(fold_mask, folded_x, oct_x)
+                oct_y = np.where(fold_mask, folded_y, oct_y)
+            quant_x = np.rint(np.clip(oct_x, -1.0, 1.0) * 511.0).astype(np.int32)
+            quant_y = np.rint(np.clip(oct_y, -1.0, 1.0) * 511.0).astype(np.int32)
+            packed = (0x40000000 | (quant_x & 0x3FF) | ((quant_y & 0x3FF) << 10)).astype(np.uint32)
+        mesh_cache.game_packed_normal_values = packed
+        return packed
+    result = []
+    for normal in values:
+        result.append(int(encode_game_packed_normal(normal)))
+    mesh_cache.game_packed_normal_values = result
+    return result
 
 
 def _required_game_uv_values(loop_vertex: _LoopVertex, layer_name: str, mesh_cache: _MeshExportCache) -> list[tuple[float, float]]:
@@ -976,9 +1335,18 @@ def _game_uv_values(mesh, layer_name: str, mesh_cache: _MeshExportCache) -> list
     if layer is None:
         mesh_cache.game_uv_values_by_layer[layer_name] = None
         return None
+    raw_uv_values = _uv_layer_values(layer, layer_name, mesh_cache)
+    np = optional_numpy()
+    if np is not None and hasattr(raw_uv_values, "shape"):
+        uv_values = np.asarray(raw_uv_values, dtype=np.float32)
+        if mesh_cache.uv_flip_v:
+            uv_values = uv_values.copy()
+            uv_values[:, 1] = 1.0 - uv_values[:, 1]
+        mesh_cache.game_uv_values_by_layer[layer_name] = uv_values
+        return uv_values
     uv_values = [
         blender_uv_to_game((float(uv[0]), float(uv[1])), flip_v=mesh_cache.uv_flip_v)
-        for uv in _uv_layer_values(layer, layer_name, mesh_cache)
+        for uv in raw_uv_values
     ]
     mesh_cache.game_uv_values_by_layer[layer_name] = uv_values
     return uv_values
@@ -999,13 +1367,24 @@ def _loop_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float,
 def _uv_layer_values(layer, layer_name: str, mesh_cache: _MeshExportCache) -> list[tuple[float, float]]:
     if layer_name not in mesh_cache.uv_values_by_layer:
         mesh_cache.uv_values_by_layer[layer_name] = _float_tuple_values(getattr(layer, "data", []) or [], "uv", 2)
-    return mesh_cache.uv_values_by_layer[layer_name] or []
+    cached = mesh_cache.uv_values_by_layer[layer_name]
+    return cached if cached is not None else []
 
 
 def _float_tuple_values(collection, attribute_name: str, component_count: int) -> list[tuple]:
     count = len(collection)
     if count <= 0:
         return []
+    np = optional_numpy()
+    if np is not None:
+        try:
+            flat_values = np.empty(count * component_count, dtype=np.float32)
+            foreach_get = getattr(collection, "foreach_get", None)
+            if callable(foreach_get):
+                foreach_get(attribute_name, flat_values)
+                return flat_values.reshape((count, component_count))
+        except Exception:
+            pass
     flat_values = [0.0] * (count * component_count)
     foreach_get = getattr(collection, "foreach_get", None)
     if callable(foreach_get):
@@ -1109,12 +1488,16 @@ def _aliased_texcoord_uv_layer(slot_layout: dict, field: dict) -> str:
     return ""
 
 
-def _local_top4_weights(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[tuple[float, float, float, float], tuple[int, int, int, int]]:
-    mesh_cache = export_cache.mesh_cache(loop_vertex)
-    cached = mesh_cache.top4_by_vertex.get(loop_vertex.vertex_index)
+def _local_top4_weights_for_vertex(
+    mesh,
+    vertex_index: int,
+    mesh_cache: _MeshExportCache,
+    export_cache: _ExportPartCache,
+) -> tuple[tuple[float, float, float, float], tuple[int, int, int, int]]:
+    cached = mesh_cache.top4_by_vertex.get(vertex_index)
     if cached is not None:
         return cached
-    vertex = getattr(loop_vertex.mesh, "vertices")[loop_vertex.vertex_index]
+    vertex = getattr(mesh, "vertices")[vertex_index]
     weighted: list[tuple[int, float]] = []
     for group_element in getattr(vertex, "groups", []) or []:
         global_group = mesh_cache.group_index_to_global.get(int(group_element.group))
@@ -1132,7 +1515,7 @@ def _local_top4_weights(loop_vertex: _LoopVertex, export_cache: _ExportPartCache
     total = sum(weight for _index, weight in top)
     if total <= 1e-12:
         result = (0.0, 0.0, 0.0, 0.0), (0, 0, 0, 0)
-        mesh_cache.top4_by_vertex[loop_vertex.vertex_index] = result
+        mesh_cache.top4_by_vertex[vertex_index] = result
         return result
     weights = [weight / total for _index, weight in top]
     indices = [index for index, _weight in top]
@@ -1140,8 +1523,13 @@ def _local_top4_weights(loop_vertex: _LoopVertex, export_cache: _ExportPartCache
         weights.append(0.0)
         indices.append(0)
     result = tuple(weights[:4]), tuple(indices[:4])
-    mesh_cache.top4_by_vertex[loop_vertex.vertex_index] = result
+    mesh_cache.top4_by_vertex[vertex_index] = result
     return result
+
+
+def _local_top4_weights(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[tuple[float, float, float, float], tuple[int, int, int, int]]:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    return _local_top4_weights_for_vertex(loop_vertex.mesh, loop_vertex.vertex_index, mesh_cache, export_cache)
 
 
 def _local_top4_packed(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
@@ -1156,6 +1544,38 @@ def _local_top4_packed(loop_vertex: _LoopVertex, export_cache: _ExportPartCache)
     )
     mesh_cache.top4_packed_by_vertex[loop_vertex.vertex_index] = result
     return result
+
+
+def _local_top4_vertex_arrays(mesh, mesh_cache: _MeshExportCache, export_cache: _ExportPartCache):
+    np = optional_numpy()
+    vertex_count = len(getattr(mesh, "vertices", []) or [])
+    if np is not None:
+        cached_weights = mesh_cache.blend_weights_by_vertex
+        cached_indices = mesh_cache.blend_indices_by_vertex
+        if cached_weights is not None and cached_indices is not None:
+            return cached_weights, cached_indices
+        weights_array = np.zeros((vertex_count, 4), dtype=np.float32)
+        indices_array = np.zeros((vertex_count, 4), dtype=np.uint32)
+        for vertex_index in range(vertex_count):
+            weights, indices = _local_top4_weights_for_vertex(mesh, vertex_index, mesh_cache, export_cache)
+            weights_array[vertex_index] = weights
+            indices_array[vertex_index] = indices
+        mesh_cache.blend_weights_by_vertex = weights_array
+        mesh_cache.blend_indices_by_vertex = indices_array
+        return weights_array, indices_array
+    cached_weights = mesh_cache.blend_weights_by_vertex
+    cached_indices = mesh_cache.blend_indices_by_vertex
+    if cached_weights is not None and cached_indices is not None:
+        return cached_weights, cached_indices
+    weights_list: list[tuple[float, float, float, float]] = []
+    indices_list: list[tuple[int, int, int, int]] = []
+    for vertex_index in range(vertex_count):
+        weights, indices = _local_top4_weights_for_vertex(mesh, vertex_index, mesh_cache, export_cache)
+        weights_list.append(weights)
+        indices_list.append(indices)
+    mesh_cache.blend_weights_by_vertex = weights_list
+    mesh_cache.blend_indices_by_vertex = indices_list
+    return weights_list, indices_list
 
 
 def _group_index_to_global(mesh_obj) -> dict[int, int]:
@@ -1389,6 +1809,25 @@ def _transform_point(mesh_obj, value: tuple[float, float, float]) -> tuple[float
             return value
 
 
+def _transform_points_numpy(mesh_obj, values):
+    np = optional_numpy()
+    if np is None:
+        return values
+    matrix = _matrix_world_numpy(mesh_obj)
+    if matrix is None:
+        return values
+    try:
+        points = np.asarray(values, dtype=np.float32)
+        if points.size == 0:
+            return points
+        hom = np.ones((len(points), 4), dtype=np.float32)
+        hom[:, :3] = points[:, :3]
+        transformed = hom @ matrix.T
+        return transformed[:, :3]
+    except Exception:
+        return values
+
+
 def _transform_normal(mesh_obj, value: tuple[float, float, float]) -> tuple[float, float, float]:
     matrix = getattr(mesh_obj, "matrix_world", None)
     if matrix is None:
@@ -1405,6 +1844,26 @@ def _transform_normal(mesh_obj, value: tuple[float, float, float]) -> tuple[floa
             return _vector3(matrix.to_3x3() @ vector)
         except Exception:
             return value
+
+
+def _transform_normals_numpy(mesh_obj, values):
+    np = optional_numpy()
+    if np is None:
+        return values
+    matrix = _matrix_world_numpy(mesh_obj)
+    if matrix is None:
+        return values
+    try:
+        normals = np.asarray(values, dtype=np.float32)
+        if normals.size == 0:
+            return normals
+        matrix3 = matrix[:3, :3]
+        transformed = normals @ matrix3.T
+        lengths = np.linalg.norm(transformed, axis=1, keepdims=True)
+        lengths = np.where(lengths <= 1e-12, 1.0, lengths)
+        return transformed / lengths
+    except Exception:
+        return values
 
 
 def _normalize3(value: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -1424,3 +1883,19 @@ def _mathutils_vector(value: tuple[float, float, float]):
     except Exception:
         return None
     return Vector(value)
+
+
+def _matrix_world_numpy(mesh_obj):
+    np = optional_numpy()
+    if np is None:
+        return None
+    matrix = getattr(mesh_obj, "matrix_world", None)
+    if matrix is None:
+        return None
+    try:
+        return np.asarray(matrix, dtype=np.float32)
+    except Exception:
+        try:
+            return np.asarray([list(row) for row in matrix], dtype=np.float32)
+        except Exception:
+            return None

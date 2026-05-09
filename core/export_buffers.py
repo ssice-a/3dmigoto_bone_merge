@@ -760,6 +760,11 @@ def _write_numpy_texcoord_slot(
                 dtype=np.intp,
                 count=end - start,
             )
+            vertex_indices = np.fromiter(
+                (loop_vertices[index].vertex_index for index in range(start, end)),
+                dtype=np.intp,
+                count=end - start,
+            )
             for _kind, field_offset, layer_name in uv_plans:
                 uv_values = _game_uv_values(first.mesh, str(layer_name), mesh_cache)
                 if uv_values is None:
@@ -770,7 +775,7 @@ def _write_numpy_texcoord_slot(
                 _numpy_assign_bytes(records[start:end], int(field_offset), uv_values[loop_indices])
             for _kind, field_offset, semantic_index in texcoord_snorm4_plans:
                 source = _texcoord_snorm4_source(first.mesh, slot.slot_name, int(semantic_index), mesh_cache)
-                snorm_values = _numpy_texcoord_snorm4_values(source, loop_vertices, start, end, loop_indices)
+                snorm_values = _numpy_texcoord_snorm4_values(source, loop_vertices, start, end, loop_indices, vertex_indices)
                 if snorm_values is None:
                     return False
                 _numpy_assign_bytes(records[start:end], int(field_offset), snorm_values)
@@ -900,6 +905,7 @@ def _numpy_texcoord_snorm4_values(
     start: int,
     end: int,
     loop_indices,
+    vertex_indices=None,
 ) -> object | None:
     np = optional_numpy()
     if np is None:
@@ -908,6 +914,17 @@ def _numpy_texcoord_snorm4_values(
     count = end - start
     if kind == "zero":
         return np.zeros((count, 4), dtype=np.uint8)
+    if kind == "point_array":
+        values = source[1]
+        if vertex_indices is None:
+            vertex_indices = np.fromiter(
+                (loop_vertices[index].vertex_index for index in range(start, end)),
+                dtype=np.intp,
+                count=count,
+            )
+        if vertex_indices.size and int(vertex_indices.max()) >= len(values):
+            return None
+        return np.asarray(values[vertex_indices], dtype=np.uint8)
     if kind == "point":
         component_data = source[1]
         values = np.zeros((count, 4), dtype=np.uint8)
@@ -921,6 +938,21 @@ def _numpy_texcoord_snorm4_values(
                 count=count,
             )
         return values
+    if kind == "color_array":
+        values, use_loop_index = source[1], bool(source[2])
+        if use_loop_index:
+            indices = loop_indices
+        else:
+            if vertex_indices is None:
+                vertex_indices = np.fromiter(
+                    (loop_vertices[index].vertex_index for index in range(start, end)),
+                    dtype=np.intp,
+                    count=count,
+                )
+            indices = vertex_indices
+        if indices.size and int(indices.max()) >= len(values):
+            return None
+        return np.asarray(values[indices], dtype=np.uint8)
     if kind == "color":
         attribute, use_loop_index = source[1], bool(source[2])
         data = getattr(attribute, "data", [])
@@ -998,11 +1030,27 @@ def _write_texcoord_snorm4_into(
     if kind == "zero":
         struct.pack_into("<I", output, offset, 0)
         return
+    if kind == "point_array":
+        values = source[1]
+        vertex_index = int(loop_vertex.vertex_index)
+        if vertex_index < len(values):
+            output[offset:offset + 4] = bytes(int(component) & 0xFF for component in values[vertex_index][:4])
+            return
+        struct.pack_into("<I", output, offset, 0)
+        return
     if kind == "point":
         attribute_data = source[1]
         vertex_index = int(loop_vertex.vertex_index)
         for component, data in enumerate(attribute_data):
             output[offset + component] = _raw_byte_from_attribute_data(data, vertex_index)
+        return
+    if kind == "color_array":
+        values, use_loop_index = source[1], bool(source[2])
+        data_index = int(loop_vertex.loop_index if use_loop_index else loop_vertex.vertex_index)
+        if data_index < len(values):
+            output[offset:offset + 4] = bytes(int(component) & 0xFF for component in values[data_index][:4])
+            return
+        struct.pack_into("<I", output, offset, 0)
         return
     if kind == "color":
         attribute, use_loop_index = source[1], bool(source[2])
@@ -1031,7 +1079,11 @@ def _texcoord_snorm4_source(mesh, slot_name: str, semantic_index: int, mesh_cach
             break
         component_data.append(getattr(attribute, "data", []))
     if len(component_data) == 4:
-        source = ("point", tuple(component_data))
+        point_array = _texcoord_component_numpy_array(component_data)
+        if point_array is not None:
+            source = ("point_array", point_array)
+        else:
+            source = ("point", tuple(component_data))
     else:
         color_attribute = _color_attribute(mesh, texcoord_color_attr_names(slot_name, semantic_index), mesh_cache)
         if color_attribute is None:
@@ -1040,10 +1092,68 @@ def _texcoord_snorm4_source(mesh, slot_name: str, semantic_index: int, mesh_cach
             data = getattr(color_attribute, "data", [])
             domain = str(getattr(color_attribute, "domain", "") or "").upper()
             use_loop_index = domain == "CORNER" or len(data) == len(getattr(mesh, "loops", []) or [])
-            source = ("color", color_attribute, use_loop_index)
+            color_array = _color_attribute_numpy_array(color_attribute)
+            if color_array is not None:
+                source = ("color_array", color_array, use_loop_index)
+            else:
+                source = ("color", color_attribute, use_loop_index)
 
     mesh_cache.texcoord_snorm4_sources[key] = source
     return source
+
+
+def _texcoord_component_numpy_array(component_data: list) -> object | None:
+    np = optional_numpy()
+    if np is None or len(component_data) != 4:
+        return None
+    arrays = []
+    for data in component_data:
+        values = _scalar_attribute_numpy_array(data, np.int32)
+        if values is None:
+            return None
+        arrays.append(values)
+    try:
+        return (np.stack(arrays, axis=1).astype(np.int32) & 0xFF).astype(np.uint8)
+    except Exception:
+        return None
+
+
+def _color_attribute_numpy_array(attribute) -> object | None:
+    np = optional_numpy()
+    if np is None:
+        return None
+    data = getattr(attribute, "data", [])
+    count = len(data)
+    if count <= 0:
+        return np.zeros((0, 4), dtype=np.uint8)
+    foreach_get = getattr(data, "foreach_get", None)
+    if not callable(foreach_get):
+        return None
+    try:
+        values = np.empty(count * 4, dtype=np.float32)
+        foreach_get("color", values)
+        values = values.reshape((count, 4))
+        return np.rint(np.clip(values, 0.0, 1.0) * 255.0).astype(np.uint8)
+    except Exception:
+        return None
+
+
+def _scalar_attribute_numpy_array(data, dtype) -> object | None:
+    np = optional_numpy()
+    if np is None:
+        return None
+    count = len(data)
+    if count <= 0:
+        return np.zeros((0,), dtype=dtype)
+    foreach_get = getattr(data, "foreach_get", None)
+    if not callable(foreach_get):
+        return None
+    try:
+        values = np.empty(count, dtype=dtype)
+        foreach_get("value", values)
+        return values
+    except Exception:
+        return None
 
 
 def _point_attribute(mesh, names: tuple[str, ...], mesh_cache: _MeshExportCache):

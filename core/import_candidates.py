@@ -13,7 +13,7 @@ from typing import Iterable
 
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
 from .numpy_compat import optional_numpy
-from .numpy_buffers import index_format_spec, read_index_file, read_interleaved_field
+from .numpy_buffers import index_format_spec, read_index_file, read_interleaved_field, read_interleaved_fields
 from .texcoord_attrs import snorm_byte_to_color_component, texcoord_color_attr_names
 from .uv_transform import DEFAULT_UV_FLIP_V, game_uv_to_blender
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
@@ -55,6 +55,55 @@ class _SlotSlice:
     elements: dict[tuple[str, int], HeaderElement]
     base_offset: int
     data: bytes
+
+
+class _RowTupleArray:
+    """NumPy-backed rows that keep the old tuple-like indexing contract."""
+
+    def __init__(self, values) -> None:
+        self._values = values
+
+    @property
+    def shape(self):
+        return self._values.shape
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __array__(self, dtype=None):
+        np = optional_numpy()
+        if np is None:
+            return self._values
+        return np.asarray(self._values, dtype=dtype) if dtype is not None else np.asarray(self._values)
+
+    def __getitem__(self, index):
+        value = self._values[index]
+        if isinstance(index, slice):
+            return _RowTupleArray(value)
+        shape = getattr(value, "shape", None)
+        if shape is not None and len(shape) > 0:
+            return tuple(value.tolist())
+        try:
+            return value.item()
+        except Exception:
+            return value
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+
+def _row_tuple_array(values):
+    np = optional_numpy()
+    if np is None or values is None:
+        return values
+    try:
+        array = np.asarray(values)
+        if array.ndim >= 2:
+            return _RowTupleArray(array)
+    except Exception:
+        pass
+    return values
 
 
 def load_candidate_geometry(
@@ -109,31 +158,15 @@ def load_candidate_geometry(
     if vb0 is None:
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no vb0 slice")
     stage_start = time.perf_counter()
-    positions = _read_required_float3(vb0, "POSITION", 0, original_vertex_ids)
-    timings["positions"] = time.perf_counter() - stage_start
-
-    stage_start = time.perf_counter()
-    normal_element = _find_element(vb0, "NORMAL", 0)
-    if normal_element is not None and _is_format(normal_element.fmt, "R32_FLOAT"):
-        normal_packed = _read_uint32_records(vb0, normal_element, original_vertex_ids)
-        normals = [decode_game_packed_normal(value) for value in normal_packed]
-    elif normal_element is not None and _is_format(normal_element.fmt, "R32G32B32_FLOAT"):
-        normals = [
-            _normalize_vector((float(record[0]), float(record[1]), float(record[2])))
-            for record in _read_format_records(vb0, normal_element, original_vertex_ids)
-        ]
-        normal_packed = [0 for _ in original_vertex_ids]
-    else:
-        warnings.append(f"{vb0.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
-        normal_packed = [0 for _ in original_vertex_ids]
-        normals = [(0.0, 0.0, 1.0) for _ in original_vertex_ids]
-    timings["normals"] = time.perf_counter() - stage_start
+    positions, normals, normal_packed = _read_vb0_position_normal(vb0, original_vertex_ids, warnings)
+    vb0_seconds = time.perf_counter() - stage_start
+    timings["positions"] = vb0_seconds * 0.5
+    timings["normals"] = vb0_seconds * 0.5
 
     stage_start = time.perf_counter()
     vb1 = get_slot("vb1", 1)
     if vb1 is not None:
-        uv0 = _read_float2_if_present(vb1, "TEXCOORD", 0, original_vertex_ids)
-        uv1 = _read_float2_if_present(vb1, "TEXCOORD", 1, original_vertex_ids)
+        uv0, uv1 = _read_vb1_uv_layers(vb1, original_vertex_ids)
     else:
         warnings.append("vb1 is missing; no UV layers are imported from vb1")
         uv0 = None
@@ -145,8 +178,7 @@ def load_candidate_geometry(
     skin_slot = get_slot(skin_slot_name, skin_slot_index)
     if skin_slot is not None:
         _validate_skin_format(skin_slot, dict(candidate.get("skin_format", {}) or {}), warnings)
-        blend_weights = _read_blend_weights(skin_slot, original_vertex_ids)
-        blend_indices = _read_blend_indices(skin_slot, original_vertex_ids)
+        blend_weights, blend_indices = _read_skin_weights_indices(skin_slot, original_vertex_ids)
         if not _blend_indices_are_valid(blend_indices):
             warnings.append(f"{skin_slot.slot_name}: BLENDINDICES0 contains values outside 0..255; weights skipped")
             blend_weights = [(0.0, 0.0, 0.0, 0.0) for _ in original_vertex_ids]
@@ -176,18 +208,18 @@ def load_candidate_geometry(
         ib_hash=str(candidate.get("ib_hash", "") or "").lower(),
         match_first_index=int(candidate.get("match_first_index", 0) or 0),
         match_index_count=int(candidate.get("match_index_count", candidate.get("source_index_count", 0)) or 0),
-        positions=positions,
+        positions=_row_tuple_array(positions),
         triangles=triangles,
         original_vertex_ids=original_vertex_ids,
-        uv0=uv0,
-        uv1=uv1,
-        normals=normals,
+        uv0=_row_tuple_array(uv0),
+        uv1=_row_tuple_array(uv1),
+        normals=_row_tuple_array(normals),
         normal_packed=normal_packed,
         texcoord4_raw=texcoord4_raw,
         texcoord_semantics=texcoord_semantics,
         vertex_layout=vertex_layout,
-        blend_indices=blend_indices,
-        blend_weights=blend_weights,
+        blend_indices=_row_tuple_array(blend_indices),
+        blend_weights=_row_tuple_array(blend_weights),
         warnings=warnings,
     )
     if performance is not None:
@@ -388,6 +420,13 @@ def _positions_for_blender(
     *,
     mirror_flip: bool,
 ) -> list[tuple[float, float, float]]:
+    np = optional_numpy()
+    if np is not None and hasattr(positions, "shape"):
+        values = np.asarray(positions, dtype=np.float32)
+        if mirror_flip and values.size:
+            values = values.copy()
+            values[:, 0] *= -1.0
+        return values.tolist()
     if not mirror_flip:
         return list(positions)
     return [_mirror_x_vector(position) for position in positions]
@@ -398,6 +437,13 @@ def _normals_for_blender(
     *,
     mirror_flip: bool,
 ) -> list[tuple[float, float, float]]:
+    np = optional_numpy()
+    if np is not None and hasattr(normals, "shape"):
+        values = np.asarray(normals, dtype=np.float32)
+        if mirror_flip and values.size:
+            values = values.copy()
+            values[:, 0] *= -1.0
+        return values.tolist()
     if not mirror_flip:
         return list(normals)
     return [_mirror_x_vector(normal) for normal in normals]
@@ -412,6 +458,90 @@ def _triangles_for_blender(
     # Mirror Flip only changes coordinate handedness; Blender mesh faces still
     # need the source IB order reversed to display the same front side.
     return [_reverse_triangle_winding(triangle) for triangle in triangles]
+
+
+def _decode_game_packed_normals(values):
+    np = optional_numpy()
+    if np is None:
+        return [decode_game_packed_normal(value) for value in values]
+    try:
+        packed = np.asarray(values, dtype=np.uint32).reshape(-1)
+        valid = (packed & np.uint32(0x40000000)) != 0
+        raw_x = (packed & np.uint32(0x3FF)).astype(np.int32)
+        raw_y = ((packed >> np.uint32(10)) & np.uint32(0x3FF)).astype(np.int32)
+        signed_x = np.where(raw_x >= 512, raw_x - 1024, raw_x).astype(np.float32) / 511.0
+        signed_y = np.where(raw_y >= 512, raw_y - 1024, raw_y).astype(np.float32) / 511.0
+        z_values = 1.0 - np.abs(signed_x) - np.abs(signed_y)
+        normal_x = signed_x.copy()
+        normal_y = signed_y.copy()
+        fold = z_values < 0.0
+        if np.any(fold):
+            sign_x = np.where(signed_x >= 0.0, 1.0, -1.0)
+            sign_y = np.where(signed_y >= 0.0, 1.0, -1.0)
+            normal_x = np.where(fold, (1.0 - np.abs(signed_y)) * sign_x, normal_x)
+            normal_y = np.where(fold, (1.0 - np.abs(signed_x)) * sign_y, normal_y)
+        normals = np.stack((normal_x, normal_y, z_values), axis=1).astype(np.float32)
+        normals[~valid] = (0.0, 0.0, 1.0)
+        return _normalize_vectors(normals)
+    except Exception:
+        return [decode_game_packed_normal(value) for value in values]
+
+
+def _normalize_vectors(values):
+    np = optional_numpy()
+    if np is not None:
+        try:
+            vectors = np.asarray(values, dtype=np.float32)
+            if vectors.size == 0:
+                return vectors.reshape((0, 3))
+            lengths = np.linalg.norm(vectors[:, :3], axis=1, keepdims=True)
+            lengths = np.where(lengths <= 1e-12, 1.0, lengths)
+            return vectors[:, :3] / lengths
+        except Exception:
+            pass
+    return [_normalize_vector((float(record[0]), float(record[1]), float(record[2]))) for record in values]
+
+
+def _default_normals(vertex_ids: list[int]):
+    np = optional_numpy()
+    if np is not None:
+        try:
+            values = np.zeros((len(vertex_ids), 3), dtype=np.float32)
+            values[:, 2] = 1.0
+            return values
+        except Exception:
+            pass
+    return [(0.0, 0.0, 1.0) for _ in vertex_ids]
+
+
+def _zeros_like_vertex_ids(vertex_ids: list[int], *, dtype: str):
+    np = optional_numpy()
+    if np is not None:
+        try:
+            return np.zeros((len(vertex_ids),), dtype=np.dtype(dtype))
+        except Exception:
+            pass
+    return [0 for _ in vertex_ids]
+
+
+def _default_blend_weights(vertex_ids: list[int]):
+    np = optional_numpy()
+    if np is not None:
+        try:
+            return np.zeros((len(vertex_ids), 4), dtype=np.float32)
+        except Exception:
+            pass
+    return [(0.0, 0.0, 0.0, 0.0) for _ in vertex_ids]
+
+
+def _default_blend_indices(vertex_ids: list[int]):
+    np = optional_numpy()
+    if np is not None:
+        try:
+            return np.zeros((len(vertex_ids), 4), dtype=np.uint32)
+        except Exception:
+            pass
+    return [(0, 0, 0, 0) for _ in vertex_ids]
 
 
 def decode_game_packed_normal(value: int) -> tuple[float, float, float]:
@@ -702,6 +832,86 @@ def _read_required_float3(
     return [(float(record[0]), float(record[1]), float(record[2])) for record in values]
 
 
+def _read_vb0_position_normal(
+    slot: _SlotSlice,
+    vertex_ids: list[int],
+    warnings: list[str],
+):
+    position_element = _find_element(slot, "POSITION", 0)
+    if position_element is None:
+        raise ValueError(f"{slot.slot_name}: POSITION0 is missing")
+    normal_element = _find_element(slot, "NORMAL", 0)
+    fields = [
+        ("positions", int(position_element.aligned_byte_offset), str(position_element.fmt), True),
+    ]
+    normal_mode = ""
+    if normal_element is not None and _is_format(normal_element.fmt, "R32_FLOAT"):
+        fields.append(("normal_packed", int(normal_element.aligned_byte_offset), "R32_UINT", False))
+        normal_mode = "packed"
+    elif normal_element is not None and _is_format(normal_element.fmt, "R32G32B32_FLOAT"):
+        fields.append(("normals", int(normal_element.aligned_byte_offset), str(normal_element.fmt), True))
+        normal_mode = "float3"
+    batch = read_interleaved_fields(
+        slot.data,
+        vertex_ids,
+        stride=int(slot.header.stride),
+        fields=fields,
+        vertex_count=int(slot.header.vertex_count),
+    )
+    if batch is not None:
+        positions = batch["positions"]
+        if normal_mode == "packed":
+            normal_packed = batch["normal_packed"].reshape(-1)
+            normals = _decode_game_packed_normals(normal_packed)
+            return positions, normals, normal_packed
+        if normal_mode == "float3":
+            normals = _normalize_vectors(batch["normals"])
+            normal_packed = _zeros_like_vertex_ids(vertex_ids, dtype="uint32")
+            return positions, normals, normal_packed
+        warnings.append(f"{slot.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
+        return positions, _default_normals(vertex_ids), _zeros_like_vertex_ids(vertex_ids, dtype="uint32")
+
+    positions = _read_required_float3(slot, "POSITION", 0, vertex_ids)
+    if normal_element is not None and _is_format(normal_element.fmt, "R32_FLOAT"):
+        normal_packed = _read_uint32_records(slot, normal_element, vertex_ids)
+        normals = [decode_game_packed_normal(value) for value in normal_packed]
+    elif normal_element is not None and _is_format(normal_element.fmt, "R32G32B32_FLOAT"):
+        normals = [
+            _normalize_vector((float(record[0]), float(record[1]), float(record[2])))
+            for record in _read_format_records(slot, normal_element, vertex_ids)
+        ]
+        normal_packed = [0 for _ in vertex_ids]
+    else:
+        warnings.append(f"{slot.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
+        normal_packed = [0 for _ in vertex_ids]
+        normals = [(0.0, 0.0, 1.0) for _ in vertex_ids]
+    return positions, normals, normal_packed
+
+
+def _read_vb1_uv_layers(slot: _SlotSlice, vertex_ids: list[int]):
+    uv0_element = _find_element(slot, "TEXCOORD", 0)
+    uv1_element = _find_element(slot, "TEXCOORD", 1)
+    fields = []
+    if uv0_element is not None and _is_format(uv0_element.fmt, "R32G32_FLOAT"):
+        fields.append(("uv0", int(uv0_element.aligned_byte_offset), str(uv0_element.fmt), True))
+    if uv1_element is not None and _is_format(uv1_element.fmt, "R32G32_FLOAT"):
+        fields.append(("uv1", int(uv1_element.aligned_byte_offset), str(uv1_element.fmt), True))
+    if fields:
+        batch = read_interleaved_fields(
+            slot.data,
+            vertex_ids,
+            stride=int(slot.header.stride),
+            fields=fields,
+            vertex_count=int(slot.header.vertex_count),
+        )
+        if batch is not None:
+            return batch.get("uv0"), batch.get("uv1")
+    return (
+        _read_float2_if_present(slot, "TEXCOORD", 0, vertex_ids),
+        _read_float2_if_present(slot, "TEXCOORD", 1, vertex_ids),
+    )
+
+
 def _read_float2_or_default(
     slot: _SlotSlice,
     semantic_name: str,
@@ -902,6 +1112,33 @@ def _read_blend_weights(
     ]
 
 
+def _read_skin_weights_indices(slot: _SlotSlice, vertex_ids: list[int]):
+    weight_element = _find_element(slot, "BLENDWEIGHTS", 0)
+    index_element = _find_element(slot, "BLENDINDICES", 0)
+    fields = []
+    if weight_element is not None:
+        fields.append(("weights", int(weight_element.aligned_byte_offset), str(weight_element.fmt), True))
+    if index_element is not None:
+        fields.append(("indices", int(index_element.aligned_byte_offset), str(index_element.fmt), True))
+    if fields:
+        batch = read_interleaved_fields(
+            slot.data,
+            vertex_ids,
+            stride=int(slot.header.stride),
+            fields=fields,
+            vertex_count=int(slot.header.vertex_count),
+        )
+        if batch is not None:
+            weights = batch.get("weights")
+            indices = batch.get("indices")
+            if weights is None:
+                weights = _default_blend_weights(vertex_ids)
+            if indices is None:
+                indices = _default_blend_indices(vertex_ids)
+            return weights, indices
+    return _read_blend_weights(slot, vertex_ids), _read_blend_indices(slot, vertex_ids)
+
+
 def _read_blend_indices(
     slot: _SlotSlice,
     vertex_ids: list[int],
@@ -917,6 +1154,15 @@ def _read_blend_indices(
 
 
 def _blend_indices_are_valid(blend_indices: list[tuple[int, int, int, int]]) -> bool:
+    np = optional_numpy()
+    if np is not None and hasattr(blend_indices, "shape"):
+        try:
+            values = np.asarray(blend_indices)
+            if values.size == 0:
+                return True
+            return bool(int(values.min()) >= 0 and int(values.max()) <= 255)
+        except Exception:
+            pass
     return all(0 <= int(value) <= 255 for record in blend_indices for value in record)
 
 
@@ -1101,6 +1347,9 @@ def _normalize_vector(vector: tuple[float, float, float]) -> tuple[float, float,
 
 def _apply_uv_layer(mesh, layer_name: str, values: list[tuple[float, float]], *, uv_flip_v: bool = DEFAULT_UV_FLIP_V) -> None:
     uv_layer = mesh.uv_layers.new(name=layer_name)
+    if _apply_uv_layer_numpy(mesh, uv_layer, values, uv_flip_v=uv_flip_v):
+        mesh.uv_layers.active = mesh.uv_layers.get("UV0")
+        return
     flat_uvs: list[float] = []
     for loop in mesh.loops:
         vertex_index = int(loop.vertex_index)
@@ -1116,6 +1365,32 @@ def _apply_uv_layer(mesh, layer_name: str, values: list[tuple[float, float]], *,
             if vertex_index < len(values):
                 uv_layer.data[loop_index].uv = game_uv_to_blender(values[vertex_index], flip_v=uv_flip_v)
     mesh.uv_layers.active = mesh.uv_layers.get("UV0")
+
+
+def _apply_uv_layer_numpy(mesh, uv_layer, values, *, uv_flip_v: bool = DEFAULT_UV_FLIP_V) -> bool:
+    np = optional_numpy()
+    loops = getattr(mesh, "loops", [])
+    loop_count = len(loops)
+    if np is None or loop_count <= 0:
+        return False
+    foreach_get = getattr(loops, "foreach_get", None)
+    if not callable(foreach_get):
+        return False
+    try:
+        vertex_indices = np.empty(loop_count, dtype=np.int32)
+        foreach_get("vertex_index", vertex_indices)
+        uv_values = np.asarray(values, dtype=np.float32)
+        if uv_values.ndim < 2 or uv_values.shape[1] < 2:
+            return False
+        output = np.zeros((loop_count, 2), dtype=np.float32)
+        valid = (vertex_indices >= 0) & (vertex_indices < len(uv_values))
+        if np.any(valid):
+            output[valid] = uv_values[vertex_indices[valid], :2]
+        if uv_flip_v:
+            output[:, 1] = 1.0 - output[:, 1]
+        return _foreach_set(uv_layer.data, "uv", output.reshape(-1))
+    except Exception:
+        return False
 
 
 def _apply_custom_normals(mesh, normals: list[tuple[float, float, float]]) -> None:

@@ -129,6 +129,69 @@ def read_interleaved_field(
         return None
 
 
+def read_interleaved_fields(
+    data: bytes,
+    vertex_ids,
+    *,
+    stride: int,
+    fields: list[tuple[str, int, str, bool]],
+    vertex_count: int | None = None,
+) -> dict[str, object] | None:
+    np = optional_numpy()
+    if np is None or int(stride) <= 0:
+        return None
+    try:
+        names = []
+        formats = []
+        offsets = []
+        conversions = {}
+        for name, offset, fmt, converted in fields:
+            spec = dxgi_format_spec(fmt)
+            if spec is None or int(offset) < 0:
+                return None
+            dtype_name, component_count, conversion = spec
+            names.append(str(name))
+            formats.append((np.dtype(dtype_name), (int(component_count),)))
+            offsets.append(int(offset))
+            conversions[str(name)] = conversion if bool(converted) else None
+        count = int(vertex_count) if vertex_count is not None else len(data) // int(stride)
+        record_dtype = np.dtype(
+            {
+                "names": names,
+                "formats": formats,
+                "offsets": offsets,
+                "itemsize": int(stride),
+            }
+        )
+        records = np.frombuffer(data, dtype=record_dtype, count=count)
+        indices = np.asarray(vertex_ids, dtype=np.intp)
+        return {
+            name: _convert_interleaved_values(records[name][indices], conversions[name])
+            for name in names
+        }
+    except Exception:
+        return None
+
+
+def _convert_interleaved_values(values, conversion):
+    np = optional_numpy()
+    if np is None:
+        return values
+    if conversion == "unorm16":
+        return values.astype(np.float64) / 65535.0
+    if conversion == "unorm8":
+        return values.astype(np.float64) / 255.0
+    if conversion == "snorm8":
+        signed = values.astype(np.int16)
+        return np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
+    if conversion is None:
+        return values.copy()
+    if values.dtype.kind in {"u", "i"}:
+        return values.copy()
+    with np.errstate(invalid="ignore", over="ignore"):
+        return values.astype(np.float64)
+
+
 def read_interleaved_fields_from_file(
     path: str,
     vertex_ids,
@@ -148,7 +211,17 @@ def read_interleaved_fields_from_file(
     except OSError:
         return None
     result = {}
-    for name, offset, fmt in fields:
+    field_specs = [(str(name), int(offset), str(fmt), bool(converted)) for name, offset, fmt in fields]
+    batch = read_interleaved_fields(
+        data,
+        vertex_ids,
+        stride=int(stride),
+        fields=field_specs,
+        vertex_count=int(vertex_count),
+    )
+    if batch is not None:
+        return batch
+    for name, offset, fmt, item_converted in field_specs:
         values = read_interleaved_field(
             data,
             vertex_ids,
@@ -156,7 +229,7 @@ def read_interleaved_fields_from_file(
             offset=int(offset),
             fmt=str(fmt),
             vertex_count=int(vertex_count),
-            converted=converted,
+            converted=bool(item_converted),
         )
         if values is None:
             return None

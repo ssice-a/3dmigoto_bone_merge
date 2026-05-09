@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from .spatial_index import (
     build_spatial_hash as _generic_build_spatial_hash,
     cell_key as _generic_cell_key,
-    expanded_neighbor_cell_keys as _generic_expanded_neighbor_cell_keys,
     neighbor_keys as _generic_neighbor_keys,
 )
 from .numpy_compat import optional_numpy
@@ -318,6 +317,10 @@ def _build_seam_cache(mesh_obj, *, perf: dict | None = None) -> dict | None:
     if perf is not None:
         perf["group_clouds"] = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
+    group_cell_index = _build_group_cell_index(group_clouds)
+    if perf is not None:
+        perf["group_cell_index"] = time.perf_counter() - stage_start
+    stage_start = time.perf_counter()
     bounds_min = _bounds_min(weighted_seam_vertices)
     bounds_max = _bounds_max(weighted_seam_vertices)
     if perf is not None:
@@ -326,8 +329,8 @@ def _build_seam_cache(mesh_obj, *, perf: dict | None = None) -> dict | None:
         "seam_vertices": weighted_seam_vertices,
         "spatial_hash": spatial_hash,
         "cell_keys": cell_keys,
-        "neighbor_cell_keys": _expanded_neighbor_cell_keys(cell_keys),
         "group_clouds": group_clouds,
+        "group_cell_index": group_cell_index,
         "group_numbers": frozenset(group_clouds),
         "group_vertex_cache": {},
         "bounds_min": bounds_min,
@@ -384,6 +387,14 @@ def _build_group_clouds(weighted_seam_vertices, weight_items_by_vertex) -> dict[
             "cell_keys": frozenset(accumulator["cell_keys"]),
         }
     return clouds
+
+
+def _build_group_cell_index(group_clouds: dict[int, dict]) -> dict:
+    cell_index: dict[tuple[int, int, int], set[int]] = {}
+    for group_number, cloud in group_clouds.items():
+        for cell_key in cloud["cell_keys"]:
+            cell_index.setdefault(cell_key, set()).add(int(group_number))
+    return cell_index
 
 
 def _build_group_index_to_number_map(mesh_obj) -> dict[int, int]:
@@ -831,13 +842,10 @@ def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: f
                 max_gap,
             ):
                 continue
-            if source_cache["neighbor_cell_keys"].isdisjoint(target_cache["cell_keys"]):
+            if not _cell_key_sets_touch(source_cache["cell_keys"], target_cache["cell_keys"]):
                 continue
             stage_start = time.perf_counter()
-            allowed_group_pairs = _allowed_group_pairs_from_group_clouds(
-                source_cache["group_clouds"],
-                target_cache["group_clouds"],
-            )
+            allowed_group_pairs = _allowed_group_pairs_from_caches(source_cache, target_cache)
             if perf is not None:
                 perf["allowed_groups"] = perf.get("allowed_groups", 0.0) + (time.perf_counter() - stage_start)
             if not allowed_group_pairs:
@@ -845,19 +853,22 @@ def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: f
             yield source_name, source_cache, target_name, target_cache, allowed_group_pairs
 
 
-def _allowed_group_pairs_from_group_clouds(source_group_clouds: dict[int, dict], target_group_clouds: dict[int, dict]) -> set[tuple[int, int]]:
-    if not source_group_clouds or not target_group_clouds:
+def _allowed_group_pairs_from_caches(source_cache: dict, target_cache: dict) -> set[tuple[int, int]]:
+    source_group_clouds = source_cache["group_clouds"]
+    target_group_clouds = target_cache["group_clouds"]
+    target_group_cell_index = target_cache["group_cell_index"]
+    if not source_group_clouds or not target_group_clouds or not target_group_cell_index:
         return set()
     allowed: set[tuple[int, int]] = set()
-    target_items = sorted(
-        target_group_clouds.items(),
-        key=lambda item: (item[1]["bounds_min"][0], item[1]["bounds_max"][0], int(item[0])),
-    )
     for source_group, source_cloud in sorted(source_group_clouds.items()):
-        source_max_x = float(source_cloud["bounds_max"][0]) + _GROUP_BBOX_GAP_TOLERANCE
-        for target_group, target_cloud in target_items:
-            if float(target_cloud["bounds_min"][0]) > source_max_x:
-                break
+        target_groups = set()
+        for cell_key in source_cloud["cell_keys"]:
+            for neighbor_key in _neighbor_keys(cell_key):
+                target_groups.update(target_group_cell_index.get(neighbor_key, ()))
+        for target_group in target_groups:
+            target_cloud = target_group_clouds.get(int(target_group))
+            if target_cloud is None:
+                continue
             if not _bounds_overlap_with_gap(
                 source_cloud["bounds_min"],
                 source_cloud["bounds_max"],
@@ -865,8 +876,6 @@ def _allowed_group_pairs_from_group_clouds(source_group_clouds: dict[int, dict],
                 target_cloud["bounds_max"],
                 _GROUP_BBOX_GAP_TOLERANCE,
             ):
-                continue
-            if _neighbor_cell_keys_for_cloud(source_cloud).isdisjoint(target_cloud["cell_keys"]):
                 continue
             allowed.add((int(source_group), int(target_group)))
     return allowed
@@ -908,16 +917,15 @@ def _vertices_for_groups(group_clouds: dict[int, dict], groups: set[int]):
     return sorted(by_vertex.values(), key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
 
 
-def _neighbor_cell_keys_for_cloud(cloud: dict):
-    neighbor_cell_keys = cloud.get("neighbor_cell_keys")
-    if neighbor_cell_keys is None:
-        neighbor_cell_keys = _expanded_neighbor_cell_keys(cloud["cell_keys"])
-        cloud["neighbor_cell_keys"] = neighbor_cell_keys
-    return neighbor_cell_keys
-
-
-def _expanded_neighbor_cell_keys(cell_keys):
-    return _generic_expanded_neighbor_cell_keys(cell_keys)
+def _cell_key_sets_touch(left_keys, right_keys) -> bool:
+    if not left_keys or not right_keys:
+        return False
+    probe_keys, target_keys = (left_keys, right_keys) if len(left_keys) <= len(right_keys) else (right_keys, left_keys)
+    for cell_key in probe_keys:
+        for neighbor_key in _neighbor_keys(cell_key):
+            if neighbor_key in target_keys:
+                return True
+    return False
 
 
 def _print_seam_performance_report(perf: dict, build_result: SeamBuildResult) -> None:

@@ -13,6 +13,13 @@ from typing import Iterable
 from ..constants import CAPTURE_MANIFEST_FILE_NAME
 from .data_types import annotate_vertex_layout
 from .io import write_json
+from .numpy_buffers import (
+    dxgi_format_size,
+    max_interleaved_uint4,
+    read_index_file,
+    read_interleaved_fields_from_file,
+)
+from .numpy_compat import optional_numpy
 
 
 _HASH_RE = re.compile(r"^[0-9a-fA-F]{8}$")
@@ -1588,6 +1595,31 @@ def _read_used_local_bone_indices_from_import_draw(
     index_size = _vertex_format_size(index_element.fmt)
     if weight_size <= 0 or index_size <= 0 or header.stride <= 0:
         return []
+    numpy_fields = read_interleaved_fields_from_file(
+        data_path,
+        vertex_ids,
+        byte_offset=base_offset,
+        vertex_count=int(header.vertex_count),
+        stride=int(header.stride),
+        fields=[
+            ("weights", int(weight_element.aligned_byte_offset), str(weight_element.fmt)),
+            ("indices", int(index_element.aligned_byte_offset), str(index_element.fmt)),
+        ],
+        converted=True,
+    )
+    if numpy_fields is not None:
+        try:
+            np = optional_numpy()
+            if np is None:
+                raise ValueError("numpy unavailable")
+            weights = np.asarray(numpy_fields["weights"], dtype=np.float64)
+            indices_array = np.asarray(numpy_fields["indices"], dtype=np.int64)
+            used = indices_array[weights > 0.0]
+            if used.size:
+                return sorted(int(value) for value in np.unique(used) if int(value) >= 0)
+            return []
+        except Exception:
+            pass
     with open(data_path, "rb") as file_handle:
         file_handle.seek(base_offset)
         raw_vertex_data = file_handle.read(int(header.vertex_count) * int(header.stride))
@@ -1615,25 +1647,15 @@ def _read_index_values(data_path: str, header: BufferHeader) -> list[int]:
     index_count = int(header.index_count)
     if not data_path or not os.path.exists(data_path) or index_count <= 0:
         return []
-    fmt = str(header.fmt or "").upper()
-    if "R16_UINT" in fmt:
-        stride = 2
-        unpack = "<H"
-    elif "R32_UINT" in fmt:
-        stride = 4
-        unpack = "<I"
-    else:
-        return []
-    import struct
-
-    first_index = int(header.first_index)
-    with open(data_path, "rb") as file_handle:
-        file_handle.seek(int(header.byte_offset) + first_index * stride)
-        raw_data = file_handle.read(index_count * stride)
     return [
-        int(struct.unpack_from(unpack, raw_data, index * stride)[0])
-        for index in range(index_count)
-        if index * stride + stride <= len(raw_data)
+        int(value)
+        for value in read_index_file(
+            data_path,
+            str(header.fmt or ""),
+            index_count,
+            byte_offset=int(header.byte_offset),
+            first_index=int(header.first_index),
+        )
     ]
 
 
@@ -1776,24 +1798,7 @@ def _buffer_sample_matches(file_handle, byte_offset: int, element: HeaderElement
 
 
 def _vertex_format_size(fmt: str) -> int:
-    upper_fmt = str(fmt or "").upper()
-    if upper_fmt in {"R32_FLOAT", "DXGI_FORMAT_R32_FLOAT"}:
-        return 4
-    if upper_fmt in {"R32G32_FLOAT", "DXGI_FORMAT_R32G32_FLOAT"}:
-        return 8
-    if upper_fmt in {"R32G32B32_FLOAT", "DXGI_FORMAT_R32G32B32_FLOAT"}:
-        return 12
-    if upper_fmt in {"R32G32B32A32_FLOAT", "DXGI_FORMAT_R32G32B32A32_FLOAT"}:
-        return 16
-    if upper_fmt in {"R32G32B32A32_UINT", "DXGI_FORMAT_R32G32B32A32_UINT"}:
-        return 16
-    if upper_fmt in {"R16G16B16A16_UNORM", "DXGI_FORMAT_R16G16B16A16_UNORM"}:
-        return 8
-    if upper_fmt in {"R8G8B8A8_UINT", "DXGI_FORMAT_R8G8B8A8_UINT"}:
-        return 4
-    if upper_fmt in {"R8G8B8A8_SNORM", "DXGI_FORMAT_R8G8B8A8_SNORM"}:
-        return 4
-    return 0
+    return dxgi_format_size(fmt)
 
 
 def _header_format_is(fmt: str, name: str) -> bool:
@@ -1857,6 +1862,15 @@ def _read_max_blend_index(
             raw_vertex_data = file_handle.read(vertex_count * stride)
     except OSError:
         return -1
+    numpy_max = max_interleaved_uint4(
+        raw_vertex_data,
+        stride=int(stride),
+        offset=int(blend_offset),
+        fmt=str(blend_format),
+        vertex_count=int(vertex_count),
+    )
+    if numpy_max >= 0:
+        return int(numpy_max)
     for vertex_offset in range(blend_offset, len(raw_vertex_data), stride):
         raw_indices = raw_vertex_data[vertex_offset : vertex_offset + record_size]
         if len(raw_indices) < record_size:

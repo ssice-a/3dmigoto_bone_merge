@@ -14,6 +14,7 @@ from .texcoord_attrs import (
     texcoord_component_attr_names,
 )
 from .export_package import ExportPartPlan, write_r32_index_buffer
+from .numpy_buffers import assign_bytes
 from .numpy_compat import optional_numpy
 from .uv_transform import DEFAULT_UV_FLIP_V, blender_uv_to_game
 from .vertex_format import encode_game_packed_normal, pack_vertex_format
@@ -890,14 +891,7 @@ def _loop_vertex_mesh_ranges(loop_vertices: list[_LoopVertex]):
 
 
 def _numpy_assign_bytes(target, offset: int, values) -> None:
-    np = optional_numpy()
-    if np is None:
-        raise ValueError("numpy is required for the fast path")
-    array = np.ascontiguousarray(values)
-    if array.size == 0:
-        return
-    byte_view = array.view(np.uint8).reshape(int(array.shape[0]), -1)
-    target[:, int(offset):int(offset) + byte_view.shape[1]] = byte_view
+    assign_bytes(target, offset, values)
 
 
 def _numpy_texcoord_snorm4_values(

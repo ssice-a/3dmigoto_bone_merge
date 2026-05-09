@@ -22,6 +22,8 @@ from .import_candidates import (
 )
 from .main_analyze import ANALYZER_VERSION, analyze_main_frameanalysis
 from .main_analyze import _parse_buffer_header
+from .numpy_buffers import positions_diag
+from .numpy_compat import optional_numpy
 from .spatial_index import (
     build_spatial_hash as _generic_build_spatial_hash,
     cell_key as _generic_cell_key,
@@ -720,9 +722,21 @@ def _compress_point_cloud(points: list[WeightedPoint], target_count: int, tolera
 
 def _aggregate_points_by_cell(points: list[WeightedPoint], cell_size: float) -> list[WeightedPoint]:
     buckets: dict[tuple[int, int, int, object], dict] = {}
-    for point in points:
+    np = optional_numpy()
+    cell_keys = None
+    if np is not None and points:
+        try:
+            positions = np.asarray([point.position for point in points], dtype=np.float64)
+            cell_keys = np.floor(positions / max(float(cell_size), 1.0e-6)).astype(np.int64)
+        except Exception:
+            cell_keys = None
+    for point_index, point in enumerate(points):
         dominant_key = point.weights[0][0] if point.weights else None
-        bucket_key = (*_cell_key(point.position, cell_size), dominant_key)
+        if cell_keys is not None:
+            cell = cell_keys[point_index]
+            bucket_key = (int(cell[0]), int(cell[1]), int(cell[2]), dominant_key)
+        else:
+            bucket_key = (*_cell_key(point.position, cell_size), dominant_key)
         bucket = buckets.get(bucket_key)
         if bucket is None:
             bucket = {
@@ -1168,13 +1182,7 @@ def _point_cloud_diag(points: list[WeightedPoint]) -> float:
 
 
 def _positions_diag(positions: list[tuple[float, float, float]]) -> float:
-    min_x = min(position[0] for position in positions)
-    min_y = min(position[1] for position in positions)
-    min_z = min(position[2] for position in positions)
-    max_x = max(position[0] for position in positions)
-    max_y = max(position[1] for position in positions)
-    max_z = max(position[2] for position in positions)
-    return math.sqrt((max_x - min_x) ** 2 + (max_y - min_y) ** 2 + (max_z - min_z) ** 2)
+    return positions_diag(positions)
 
 
 def _distance_squared(left: tuple[float, float, float], right: tuple[float, float, float]) -> float:

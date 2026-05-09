@@ -2285,9 +2285,15 @@ def _print_import_performance_report(performance: dict) -> None:
     print("[BMC Import] Slowest objects:")
     for index, item in enumerate(slowest, start=1):
         stages = dict(item.get("create_stages", {}) or {})
+        load_stages = dict(item.get("load_stages", {}) or {})
         formatted_stages = " ".join(
             f"{name}={float(seconds or 0.0):.3f}s"
             for name, seconds in sorted(stages.items(), key=lambda pair: float(pair[1] or 0.0), reverse=True)
+            if name != "total"
+        )
+        formatted_load_stages = " ".join(
+            f"{name}={float(seconds or 0.0):.3f}s"
+            for name, seconds in sorted(load_stages.items(), key=lambda pair: float(pair[1] or 0.0), reverse=True)
             if name != "total"
         )
         print(
@@ -2298,6 +2304,7 @@ def _print_import_performance_report(performance: dict) -> None:
             f"create={float(item.get('create', 0.0) or 0.0):.3f}s "
             f"vertices={int(item.get('vertices', 0) or 0)} "
             f"triangles={int(item.get('triangles', 0) or 0)} "
+            f"load_stages=[{formatted_load_stages}] "
             f"stages=[{formatted_stages}]"
         )
 

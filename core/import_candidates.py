@@ -13,6 +13,7 @@ from typing import Iterable
 
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
 from .numpy_compat import optional_numpy
+from .numpy_buffers import index_format_spec, read_index_file, read_interleaved_field
 from .texcoord_attrs import snorm_byte_to_color_component, texcoord_color_attr_names
 from .uv_transform import DEFAULT_UV_FLIP_V, game_uv_to_blender
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
@@ -56,8 +57,16 @@ class _SlotSlice:
     data: bytes
 
 
-def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> LoadedCandidateGeometry:
+def load_candidate_geometry(
+    candidate: dict,
+    frameanalysis_dir: str = "",
+    *,
+    performance: dict | None = None,
+) -> LoadedCandidateGeometry:
     """Load one candidate from .buf slices into a compact CPU geometry payload."""
+
+    total_start = time.perf_counter()
+    timings: dict[str, float] = {}
 
     import_paths = dict(candidate.get("import_paths", {}) or {})
     ib_txt_path = _resolve_path(str(import_paths.get("ib", "") or ""), frameanalysis_dir)
@@ -67,11 +76,14 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
     if not ib_buf_path or not os.path.exists(ib_buf_path):
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no IB buf path")
 
+    stage_start = time.perf_counter()
     ib_header = _parse_buffer_header(ib_txt_path)
     indices = _read_index_buffer(ib_buf_path, ib_header)
     if len(indices) < 3:
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no triangles")
+    timings["ib"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     raw_triangles = [
         (int(indices[index]), int(indices[index + 1]), int(indices[index + 2]))
         for index in range(0, len(indices) - 2, 3)
@@ -82,6 +94,7 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         (remap[triangle[0]], remap[triangle[1]], remap[triangle[2]])
         for triangle in raw_triangles
     ]
+    timings["topology"] = time.perf_counter() - stage_start
 
     warnings: list[str] = []
     vb_payload = dict(import_paths.get("vb", {}) or {})
@@ -95,8 +108,11 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
     vb0 = get_slot("vb0", 0)
     if vb0 is None:
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no vb0 slice")
+    stage_start = time.perf_counter()
     positions = _read_required_float3(vb0, "POSITION", 0, original_vertex_ids)
+    timings["positions"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     normal_element = _find_element(vb0, "NORMAL", 0)
     if normal_element is not None and _is_format(normal_element.fmt, "R32_FLOAT"):
         normal_packed = _read_uint32_records(vb0, normal_element, original_vertex_ids)
@@ -111,7 +127,9 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         warnings.append(f"{vb0.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
         normal_packed = [0 for _ in original_vertex_ids]
         normals = [(0.0, 0.0, 1.0) for _ in original_vertex_ids]
+    timings["normals"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     vb1 = get_slot("vb1", 1)
     if vb1 is not None:
         uv0 = _read_float2_if_present(vb1, "TEXCOORD", 0, original_vertex_ids)
@@ -120,7 +138,9 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         warnings.append("vb1 is missing; no UV layers are imported from vb1")
         uv0 = None
         uv1 = None
+    timings["uv"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     skin_slot_name, skin_slot_index = _skin_slot_from_candidate(candidate)
     skin_slot = get_slot(skin_slot_name, skin_slot_index)
     if skin_slot is not None:
@@ -135,16 +155,23 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         warnings.append(f"{skin_slot_name} is missing; blend weights and indices use fallback values")
         blend_weights = [(0.0, 0.0, 0.0, 0.0) for _ in original_vertex_ids]
         blend_indices = [(0, 0, 0, 0) for _ in original_vertex_ids]
+    timings["skin"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     for slot_name in sorted(vb_payload, key=_slot_sort_key):
         if re.match(r"^vb\d+$", str(slot_name)):
             get_slot(str(slot_name), int(str(slot_name)[2:]))
     loaded_slots = [slot for slot in slot_slices.values() if slot is not None]
     texcoord_semantics = _read_texcoord_semantics(loaded_slots, original_vertex_ids)
     texcoord4_raw = _first_raw_snorm_texcoord4(texcoord_semantics, len(original_vertex_ids))
-    vertex_layout = _build_loaded_vertex_layout(loaded_slots)
+    timings["texcoord_semantics"] = time.perf_counter() - stage_start
 
-    return LoadedCandidateGeometry(
+    stage_start = time.perf_counter()
+    vertex_layout = _build_loaded_vertex_layout(loaded_slots)
+    timings["layout"] = time.perf_counter() - stage_start
+    timings["total"] = time.perf_counter() - total_start
+
+    geometry = LoadedCandidateGeometry(
         display_name=str(candidate.get("display_name", "") or _candidate_display_name(candidate)),
         ib_hash=str(candidate.get("ib_hash", "") or "").lower(),
         match_first_index=int(candidate.get("match_first_index", 0) or 0),
@@ -163,6 +190,10 @@ def load_candidate_geometry(candidate: dict, frameanalysis_dir: str = "") -> Loa
         blend_weights=blend_weights,
         warnings=warnings,
     )
+    if performance is not None:
+        performance.clear()
+        performance.update(timings)
+    return geometry
 
 
 def import_selected_candidates(
@@ -192,7 +223,8 @@ def import_selected_candidates(
             continue
         object_start = time.perf_counter()
         stage_start = time.perf_counter()
-        geometry = load_candidate_geometry(candidate, frameanalysis_dir)
+        load_report: dict[str, float] = {}
+        geometry = load_candidate_geometry(candidate, frameanalysis_dir, performance=load_report)
         load_seconds = time.perf_counter() - stage_start
         create_report: dict[str, float] = {}
         stage_start = time.perf_counter()
@@ -216,6 +248,7 @@ def import_selected_candidates(
                 "load": load_seconds,
                 "create": create_seconds,
                 "total": time.perf_counter() - object_start,
+                "load_stages": load_report,
                 "create_stages": create_report,
             }
         )
@@ -432,30 +465,23 @@ def _read_index_buffer(path: str, header: BufferHeader) -> list[int]:
     index_count = int(header.index_count)
     if index_count <= 0:
         return []
-    fmt = str(header.fmt or "").upper()
-    if "R16_UINT" in fmt:
-        stride = 2
-        unpack_format = "<H"
-        numpy_dtype = "<u2"
-    elif "R32_UINT" in fmt:
-        stride = 4
-        unpack_format = "<I"
-        numpy_dtype = "<u4"
-    else:
+    index_spec = index_format_spec(str(header.fmt or ""))
+    if index_spec is None:
         raise ValueError(f"Unsupported IB format: {header.fmt}")
-    first_index = int(header.first_index)
-    with open(path, "rb") as file_handle:
-        file_handle.seek(int(header.byte_offset) + first_index * stride)
-        data = file_handle.read(index_count * stride)
-    if len(data) < index_count * stride:
+    _dtype_name, stride = index_spec
+    expected_end = int(header.byte_offset) + int(header.first_index) * int(stride) + index_count * int(stride)
+    if not path or not os.path.exists(path) or os.path.getsize(path) < expected_end:
         raise ValueError(f"IB buffer is shorter than expected: {path}")
-    np = optional_numpy()
-    if np is not None:
-        try:
-            return [int(value) for value in np.frombuffer(data, dtype=np.dtype(numpy_dtype), count=index_count)]
-        except Exception:
-            pass
-    return [int(record[0]) for record in struct.iter_unpack(unpack_format, data)]
+    values = read_index_file(
+        path,
+        str(header.fmt or ""),
+        index_count,
+        byte_offset=int(header.byte_offset),
+        first_index=int(header.first_index),
+    )
+    if len(values) > 0:
+        return [int(value) for value in values]
+    raise ValueError(f"IB buffer is shorter than expected: {path}")
 
 
 def _load_slot_slice(
@@ -718,24 +744,67 @@ def _read_texcoord_semantics(slots: list[_SlotSlice], vertex_ids: list[int]) -> 
 
 def _read_semantic_payload(slot: _SlotSlice, element: HeaderElement, vertex_ids: list[int]) -> dict:
     fmt = str(element.fmt or "").upper()
-    if _is_format(fmt, "R8G8B8A8_SNORM"):
-        values = _read_int8x4_records(slot, element, vertex_ids)
+    semantic_index = int(element.semantic_index)
+    if semantic_index in {0, 1} and _is_format(fmt, "R32G32_FLOAT"):
+        values = []
+        storage = "uv_layer"
+        component_count = 2
+    elif _is_format(fmt, "R8G8B8A8_SNORM"):
+        values = None
+        np = optional_numpy()
+        raw_values = read_interleaved_field(
+            slot.data,
+            vertex_ids,
+            stride=int(slot.header.stride),
+            offset=int(element.aligned_byte_offset),
+            fmt=str(element.fmt or ""),
+            vertex_count=int(slot.header.vertex_count),
+            converted=False,
+        )
+        if raw_values is not None and np is not None:
+            signed = raw_values.astype(np.int16)
+            values = np.where(signed >= 128, signed - 256, signed)
+        if values is None:
+            values = _read_int8x4_records(slot, element, vertex_ids)
         storage = "sint8_raw"
+        component_count = _record_component_count(values, fmt)
     else:
-        values = _read_format_records(slot, element, vertex_ids)
+        values = read_interleaved_field(
+            slot.data,
+            vertex_ids,
+            stride=int(slot.header.stride),
+            offset=int(element.aligned_byte_offset),
+            fmt=str(element.fmt or ""),
+            vertex_count=int(slot.header.vertex_count),
+            converted=True,
+        )
+        if values is None:
+            values = _read_format_records(slot, element, vertex_ids)
         storage = "float"
-    component_count = len(values[0]) if values else max(1, _format_size(fmt) // 4)
+        component_count = _record_component_count(values, fmt)
     return {
         "slot_name": slot.slot_name,
         "slot_index": int(slot.slot_index),
         "semantic_name": str(element.semantic_name).upper(),
-        "semantic_index": int(element.semantic_index),
+        "semantic_index": semantic_index,
         "format": fmt,
         "aligned_byte_offset": int(element.aligned_byte_offset),
         "component_count": int(component_count),
         "storage": storage,
-        "values": [tuple(value) for value in values],
+        "values": values,
     }
+
+
+def _record_component_count(values, fmt: str) -> int:
+    shape = getattr(values, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        return int(shape[1])
+    try:
+        if len(values) > 0:
+            return len(values[0])
+    except TypeError:
+        pass
+    return max(1, _format_size(fmt) // 4)
 
 
 def _first_raw_snorm_texcoord4(texcoord_semantics: list[dict], vertex_count: int) -> list[tuple[int, int, int, int]]:
@@ -746,7 +815,11 @@ def _first_raw_snorm_texcoord4(texcoord_semantics: list[dict], vertex_count: int
             and str(record.get("storage", "")) == "sint8_raw"
             and int(record.get("component_count", 0)) == 4
         ):
-            return [tuple(int(component) for component in value) for value in record.get("values", [])]
+            values = record.get("values", [])
+            tolist = getattr(values, "tolist", None)
+            if callable(tolist):
+                values = tolist()
+            return [tuple(int(component) for component in value) for value in values]
     return [(0, 0, 0, 0) for _ in range(vertex_count)]
 
 
@@ -871,36 +944,18 @@ def _read_format_records_numpy(
     element: HeaderElement,
     vertex_ids: list[int],
 ) -> list[tuple[float, ...]] | None:
-    normalized_fmt = _normalize_dxgi_format(str(element.fmt or ""))
-    specs = {
-        "R32_FLOAT": ("<f4", 1, None),
-        "R32G32_FLOAT": ("<f4", 2, None),
-        "R32G32B32_FLOAT": ("<f4", 3, None),
-        "R32G32B32A32_FLOAT": ("<f4", 4, None),
-        "R32G32B32A32_UINT": ("<u4", 4, None),
-        "R16G16B16A16_UNORM": ("<u2", 4, "unorm16"),
-        "R8G8B8A8_UINT": ("u1", 4, None),
-        "R8G8B8A8_SNORM": ("u1", 4, "snorm8"),
-        "R8G8B8A8_UNORM": ("u1", 4, "unorm8"),
-    }
-    spec = specs.get(normalized_fmt)
-    if spec is None:
-        return None
-    dtype_name, component_count, conversion = spec
-    values = _read_numpy_vector_records(slot, element, vertex_ids, dtype_name, component_count)
+    values = read_interleaved_field(
+        slot.data,
+        vertex_ids,
+        stride=int(slot.header.stride),
+        offset=int(element.aligned_byte_offset),
+        fmt=str(element.fmt or ""),
+        vertex_count=int(slot.header.vertex_count),
+        converted=True,
+    )
     if values is None:
         return None
     try:
-        np = optional_numpy()
-        if conversion == "unorm16":
-            values = values.astype(np.float64) / 65535.0
-        elif conversion == "unorm8":
-            values = values.astype(np.float64) / 255.0
-        elif conversion == "snorm8":
-            signed = values.astype(np.int16)
-            values = np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
-        else:
-            values = values.astype(np.float64)
         return [tuple(float(component) for component in row) for row in values.tolist()]
     except Exception:
         return None
@@ -932,6 +987,29 @@ def _read_numpy_vector_records(
     if np is None:
         return None
     try:
+        fmt_by_dtype = {
+            ("<u4", 1): "R32_UINT",
+            ("<u4", 4): "R32G32B32A32_UINT",
+            ("<f4", 1): "R32_FLOAT",
+            ("<f4", 2): "R32G32_FLOAT",
+            ("<f4", 3): "R32G32B32_FLOAT",
+            ("<f4", 4): "R32G32B32A32_FLOAT",
+            ("<u2", 4): "R16G16B16A16_UNORM",
+            ("u1", 4): "R8G8B8A8_UINT",
+        }
+        fmt = fmt_by_dtype.get((str(dtype_name), int(component_count)))
+        if fmt is not None:
+            values = read_interleaved_field(
+                slot.data,
+                vertex_ids,
+                stride=int(slot.header.stride),
+                offset=int(element.aligned_byte_offset),
+                fmt=fmt,
+                vertex_count=int(slot.header.vertex_count),
+                converted=False,
+            )
+            if values is not None:
+                return values
         field_dtype = np.dtype(dtype_name)
         record_dtype = np.dtype(
             {
@@ -1050,7 +1128,14 @@ def _apply_custom_normals(mesh, normals: list[tuple[float, float, float]]) -> No
 
 def _store_int_attribute(mesh, name: str, values: list[int]) -> None:
     attribute = mesh.attributes.new(name=name, type="INT", domain="POINT")
-    if _foreach_set(attribute.data, "value", [int(value) for value in values]):
+    np = optional_numpy()
+    payload = values
+    if np is not None:
+        try:
+            payload = np.asarray(values, dtype=np.int32)
+        except Exception:
+            payload = values
+    if _foreach_set(attribute.data, "value", payload):
         return
     for item, value in zip(attribute.data, values):
         item.value = int(value)
@@ -1058,7 +1143,14 @@ def _store_int_attribute(mesh, name: str, values: list[int]) -> None:
 
 def _store_float_attribute(mesh, name: str, values: list[float]) -> None:
     attribute = mesh.attributes.new(name=name, type="FLOAT", domain="POINT")
-    if _foreach_set(attribute.data, "value", [float(value) for value in values]):
+    np = optional_numpy()
+    payload = values
+    if np is not None:
+        try:
+            payload = np.asarray(values, dtype=np.float32)
+        except Exception:
+            payload = values
+    if _foreach_set(attribute.data, "value", payload):
         return
     for item, value in zip(attribute.data, values):
         item.value = float(value)
@@ -1072,10 +1164,24 @@ def _foreach_set(data, attribute_name: str, values: list[float | int]) -> bool:
         setter(attribute_name, values)
         return True
     except Exception:
+        pass
+    try:
+        setter(attribute_name, list(values))
+        return True
+    except Exception:
         return False
 
 
 def _store_uint32_split_attributes(mesh, base_name: str, values: list[int]) -> None:
+    np = optional_numpy()
+    if np is not None:
+        try:
+            array = np.asarray(values, dtype=np.uint32)
+            _store_int_attribute(mesh, f"{base_name}_lo16", (array & 0xFFFF).astype(np.int32))
+            _store_int_attribute(mesh, f"{base_name}_hi16", ((array >> 16) & 0xFFFF).astype(np.int32))
+            return
+        except Exception:
+            pass
     _store_int_attribute(mesh, f"{base_name}_lo16", [int(value) & 0xFFFF for value in values])
     _store_int_attribute(mesh, f"{base_name}_hi16", [(int(value) >> 16) & 0xFFFF for value in values])
 
@@ -1084,28 +1190,44 @@ def _store_texcoord_semantic_attributes(mesh, records: list[dict]) -> None:
     for record in records:
         slot_index = int(record.get("slot_index", -1))
         semantic_index = int(record.get("semantic_index", -1))
-        values = list(record.get("values", []) or [])
         component_count = int(record.get("component_count", 0) or 0)
         storage = str(record.get("storage", "") or "")
+        if storage == "uv_layer":
+            continue
+        values = record.get("values", [])
+        if values is None:
+            values = []
         if slot_index < 0 or semantic_index < 0 or component_count <= 0:
             continue
         base_name = f"bmc_vb{slot_index}_texcoord{semantic_index}"
         for component_index in range(component_count):
-            component_values = [
-                value[component_index] if component_index < len(value) else 0
-                for value in values
-            ]
+            component_values = _component_values(values, component_index)
             attr_name = f"{base_name}_{component_index}"
             if storage == "sint8_raw":
-                _store_int_attribute(mesh, attr_name, [int(value) for value in component_values])
+                _store_int_attribute(mesh, attr_name, component_values)
             else:
-                _store_float_attribute(mesh, attr_name, [float(value) for value in component_values])
+                _store_float_attribute(mesh, attr_name, component_values)
         if storage == "sint8_raw" and component_count == 4:
             _store_snorm_byte_color_attribute(
                 mesh,
                 texcoord_color_attr_names(f"vb{slot_index}", semantic_index)[0],
                 values,
             )
+
+
+def _component_values(values, component_index: int):
+    np = optional_numpy()
+    if np is not None:
+        try:
+            array = np.asarray(values)
+            if array.ndim >= 2 and int(component_index) < int(array.shape[1]):
+                return array[:, int(component_index)]
+        except Exception:
+            pass
+    return [
+        value[component_index] if component_index < len(value) else 0
+        for value in values
+    ]
 
 
 def _store_snorm_byte_color_attribute(mesh, name: str, values: list[tuple[int, ...]]) -> None:
@@ -1125,10 +1247,23 @@ def _store_snorm_byte_color_attribute(mesh, name: str, values: list[tuple[int, .
                 attribute = creator(name=name, type="FLOAT_COLOR", domain="POINT")
             except Exception:
                 return
-    colors: list[float] = []
-    for record in values:
-        components = [int(record[index]) if index < len(record) else 0 for index in range(4)]
-        colors.extend(snorm_byte_to_color_component(component) for component in components)
+    np = optional_numpy()
+    if np is not None:
+        try:
+            array = np.asarray(values, dtype=np.int16)
+            if array.ndim >= 2 and array.shape[1] >= 4:
+                colors = ((array[:, :4].astype(np.int16) & 0xFF).astype(np.float32) / 255.0).reshape(-1)
+            else:
+                colors = []
+        except Exception:
+            colors = []
+    else:
+        colors = []
+    if len(colors) <= 0:
+        colors = []
+        for record in values:
+            components = [int(record[index]) if index < len(record) else 0 for index in range(4)]
+            colors.extend(snorm_byte_to_color_component(component) for component in components)
     data = getattr(attribute, "data", [])
     if _foreach_set(data, "color", colors):
         return

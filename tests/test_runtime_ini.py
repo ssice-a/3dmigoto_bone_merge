@@ -436,8 +436,8 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]")
         ]
         self.assertIn("hash = cccccccc", host_section)
-        self.assertIn("  x100 = 1", host_section)
-        self.assertIn("  cs-t2 = ResourceLodCaptureBoneMap", host_section)
+        self.assertIn("x100 = 1", host_section)
+        self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", host_section)
         self.assertIn("  handling = skip", host_section)
         self.assertIn("; delayed normal shadow replay", host_section)
         self.assertIn("; replay aaaaaaaa_10_0_part00", host_section)
@@ -552,9 +552,8 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("[ResourcePart_12345678_42_0_part00_Index]", ini_text)
         self.assertIn("if vs != 200", ini_text)
         self.assertIn("  handling = skip", ini_text)
-        self.assertIn("  ; visible fallback main bone capture", ini_text)
-        self.assertIn("  cs-t2 = ResourceMainCaptureBoneMap", ini_text)
-        self.assertIn("  run = CustomShader_RecordBones", ini_text)
+        self.assertIn("run = CustomShader_ExtractCB1\nx100 = 0\ncs-t2 = ResourceMainCaptureBoneMap\nrun = CustomShader_RecordBones", ini_text)
+        self.assertNotIn("visible fallback main bone capture", ini_text)
         self.assertIn("  x101 = 2", ini_text)
         self.assertIn("  run = CustomShader_GatherLocalBones", ini_text)
         self.assertIn("  vs-t0 = ResourceLocalBonePool_SRV", ini_text)
@@ -582,11 +581,9 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
         section = ini_text[ini_text.index("[TextureOverride_BMC_12345678_42_0]") :]
-        self.assertIn("if vs != 200", section)
-        self.assertIn("  ; visible fallback main bone capture", section)
-        self.assertIn("  x100 = 0", section)
-        self.assertIn("  cs-t2 = ResourceMainCaptureBoneMap", section)
-        self.assertIn("  run = CustomShader_RecordBones", section)
+        self.assertIn("run = CustomShader_ExtractCB1\nx100 = 0\ncs-t2 = ResourceMainCaptureBoneMap\nrun = CustomShader_RecordBones", section)
+        self.assertNotIn("if vs != 200", section)
+        self.assertNotIn("visible fallback main bone capture", section)
         self.assertNotIn("  handling = skip", section)
         self.assertNotIn("  drawindexedinstanced", section)
 

@@ -263,6 +263,8 @@ def regenerate_bonestore_runtime_files(
     ini_file_name = _ini_file_name_from_export_manifest(export_manifest)
     runtime_plan["ini_file_name"] = ini_file_name
     ini_path = write_bonestore_ini(output_dir, runtime_plan, ini_file_name=ini_file_name) if write_ini else ""
+    if write_ini:
+        export_required_hlsl(output_dir)
 
     if normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
         export_manifest = read_json(normalized_export_manifest_path)

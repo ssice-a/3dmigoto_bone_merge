@@ -355,17 +355,24 @@ INI and buffer generation must stop when required validation fails.
 
 ## Runtime Pipeline
 
-Capture pass:
+Capture step:
 
 ```ini
-if vs == <capture_filter>
-  run = CustomShader_ExtractCB1
-  cs-t2 = ResourceMainCaptureBoneMap
-  run = CustomShader_RecordBones
-endif
+run = CustomShader_ExtractCB1
+x100 = <capture_record_index>
+cs-t2 = ResourceMainCaptureBoneMap
+run = CustomShader_RecordBones
 ```
 
-`RecordBones` reads the current draw's native `vs-t0` by reference and reads the current draw's shader-visible `cb1[5].x/y` from the extracted CB1 copy.
+Generated runtime may run capture outside `if vs == 200` so visible/effect
+draws can refresh the pool when the early shadow capture draw is absent. Safety
+therefore lives in `RecordBones`: it validates the current draw's
+shader-visible `cb1[5]` bone window, source bone count, `vs-t0` dimensions, and
+a nonzero sampled matrix before writing to the global bone pool. Invalid passes
+must leave the previous valid pool contents untouched.
+
+`RecordBones` reads the current draw's native `vs-t0` by reference and reads
+the current draw's shader-visible `cb1[5].x/y/z` from the extracted CB1 copy.
 
 FrameAnalysis showed that the game binds a large native bone store in `vs-t0`. The native `cb1[5].x/y` values point into that large store and are not `0/1024`. Therefore capture must use:
 

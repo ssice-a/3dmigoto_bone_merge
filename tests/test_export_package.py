@@ -452,9 +452,50 @@ class ExportPackageTests(unittest.TestCase):
             self.assertEqual(Path(result["bonestore_ini_path"]).name, "LXi Final Export.ini")
             self.assertTrue((Path(tmpdir) / "LXi Final Export.ini").exists())
             self.assertFalse((Path(tmpdir) / "BoneStore.ini").exists())
+            record_bones_shader = (Path(tmpdir) / "hlsl" / "record_bones_cs.hlsl").read_text(encoding="utf-8")
+            self.assertIn("capture_valid", record_bones_shader)
+            self.assertIn("NativeT0.GetDimensions", record_bones_shader)
+            self.assertIn("max_source_local_bone < source_count", record_bones_shader)
             export_manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
             self.assertEqual(export_manifest["ini_file_name"], "LXi Final Export.ini")
             self.assertEqual(export_manifest["runtime"]["ini_file_name"], "LXi Final Export.ini")
+
+    def test_regenerate_runtime_files_refreshes_bundled_hlsl(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hlsl_dir = Path(tmpdir) / "hlsl"
+            hlsl_dir.mkdir()
+            (hlsl_dir / "record_bones_cs.hlsl").write_text("// stale shader\n", encoding="utf-8")
+            capture_manifest_path = Path(tmpdir) / "capture_manifest.json"
+            capture_manifest_path.write_text(
+                json.dumps(
+                    {
+                        "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
+                        "bone_pool_order": [
+                            {
+                                "ib_hash": "640d1c0e",
+                                "match_first_index": 0,
+                                "match_index_count": 3,
+                                "global_bone_base": 0,
+                                "local_bone_count": 1,
+                                "used_local_bone_indices": [0],
+                                "bone_capture_available": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            export_prepare.regenerate_bonestore_runtime_files(
+                output_dir=tmpdir,
+                capture_manifest_path=str(capture_manifest_path),
+                write_ini=True,
+            )
+
+            record_bones_shader = (hlsl_dir / "record_bones_cs.hlsl").read_text(encoding="utf-8")
+            self.assertNotIn("stale shader", record_bones_shader)
+            self.assertIn("capture_valid", record_bones_shader)
+            self.assertIn("NativeT0.GetDimensions", record_bones_shader)
 
     def test_texcoord4_missing_on_export_mesh_ignores_source_ib_object_and_uses_default(self):
         source = FakeObject(

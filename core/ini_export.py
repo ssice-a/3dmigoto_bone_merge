@@ -1240,50 +1240,24 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
                 f"match_index_count = {match_index_count}",
             ]
         )
-        if grouped_records.get("main") or grouped_records.get("lod"):
-            lines.extend(
-                [
-                    "if vs == 200",
-                    "  run = CustomShader_ExtractCB1",
-                ]
-            )
-            for record_index in grouped_records.get("main", []):
-                lines.extend(
-                    [
-                        f"  x100 = {record_index}",
-                        "  cs-t2 = ResourceMainCaptureBoneMap",
-                        "  run = CustomShader_RecordBones",
-                    ]
-                )
-            for record_index in grouped_records.get("lod", []):
-                lines.extend(
-                    [
-                        f"  x100 = {record_index}",
-                        "  cs-t2 = ResourceLodCaptureBoneMap",
-                        "  run = CustomShader_RecordBones",
-                    ]
-                )
-            if key in shadow_skip_keys:
-                lines.append("  handling = skip")
-            for plan in shadow_hosts_by_key.get(key, []):
-                lines.extend(_shadow_host_replay_lines(plan, geometry_by_suffix, indent="  "))
+        has_capture_records = bool(grouped_records.get("main") or grouped_records.get("lod"))
+        if has_capture_records:
+            lines.extend(_capture_record_lines(grouped_records, indent=""))
+
+        shadow_lines: list[str] = []
+        if key in shadow_skip_keys:
+            shadow_lines.append("  handling = skip")
+        for plan in shadow_hosts_by_key.get(key, []):
+            shadow_lines.extend(_shadow_host_replay_lines(plan, geometry_by_suffix, indent="  "))
+        if shadow_lines:
+            lines.append("if vs == 200")
+            lines.extend(shadow_lines)
             lines.append("endif")
-        elif key in shadow_hosts_by_key:
-            lines.extend(
-                [
-                    "if vs == 200",
-                ]
-            )
-            for plan in shadow_hosts_by_key.get(key, []):
-                lines.extend(_shadow_host_replay_lines(plan, geometry_by_suffix, indent="  "))
-            lines.append("endif")
+
         if geometry_records:
-            if grouped_records.get("main") or grouped_records.get("lod"):
+            if has_capture_records or shadow_lines:
                 lines.append("")
-            lines.extend(_visible_replay_lines(geometry_records, runtime_plan, grouped_records))
-        elif grouped_records.get("main") or grouped_records.get("lod"):
-            lines.append("")
-            lines.extend(_visible_capture_only_lines(grouped_records, runtime_plan))
+            lines.extend(_visible_replay_lines(geometry_records, runtime_plan))
         lines.append("")
     if lines and lines[-1] == "":
         lines.pop()
@@ -1362,35 +1336,24 @@ def _hash_label(key: tuple[str, int, int]) -> str:
     return str(key[0])
 
 
-def _visible_replay_lines(geometry_records: list[dict], runtime_plan: dict, grouped_records: dict) -> list[str]:
+def _visible_replay_lines(geometry_records: list[dict], runtime_plan: dict) -> list[str]:
     lines = [
         _visible_replay_condition(runtime_plan),
         "  handling = skip",
         "  run = CustomShader_ExtractCB1",
     ]
-    lines.extend(_visible_capture_record_lines(grouped_records, indent="  "))
     for record in geometry_records:
         lines.extend(_replay_part_lines(record, indent="  "))
     lines.append("endif")
     return lines
 
 
-def _visible_capture_only_lines(grouped_records: dict, runtime_plan: dict) -> list[str]:
-    lines = [
-        _visible_replay_condition(runtime_plan),
-        "  run = CustomShader_ExtractCB1",
-    ]
-    lines.extend(_visible_capture_record_lines(grouped_records, indent="  "))
-    lines.append("endif")
-    return lines
-
-
-def _visible_capture_record_lines(grouped_records: dict, *, indent: str) -> list[str]:
+def _capture_record_lines(grouped_records: dict, *, indent: str) -> list[str]:
     lines: list[str] = []
     for record_index in grouped_records.get("main", []) or []:
         lines.extend(
             [
-                f"{indent}; visible fallback main bone capture",
+                f"{indent}run = CustomShader_ExtractCB1",
                 f"{indent}x100 = {record_index}",
                 f"{indent}cs-t2 = ResourceMainCaptureBoneMap",
                 f"{indent}run = CustomShader_RecordBones",
@@ -1399,7 +1362,7 @@ def _visible_capture_record_lines(grouped_records: dict, *, indent: str) -> list
     for record_index in grouped_records.get("lod", []) or []:
         lines.extend(
             [
-                f"{indent}; visible fallback LOD bone capture",
+                f"{indent}run = CustomShader_ExtractCB1",
                 f"{indent}x100 = {record_index}",
                 f"{indent}cs-t2 = ResourceLodCaptureBoneMap",
                 f"{indent}run = CustomShader_RecordBones",

@@ -164,12 +164,10 @@ Do not generate one-off wrapper command lists for simple capture or replay
 steps. These should stay inline:
 
 ```ini
-if vs == 200
-  x100 = <capture_record_index>
-  ; bind/select capture map
-  run = CustomShader_RecordBones
-  ; optional handling = skip
-endif
+run = CustomShader_ExtractCB1
+x100 = <capture_record_index>
+; bind/select capture map
+run = CustomShader_RecordBones
 
 if vs != 200
   ; bind part map
@@ -187,6 +185,11 @@ CustomShader = reusable algorithm
 CommandList  = reused orchestration or frame lifecycle hook
 Inline       = default TextureOverride control flow
 ```
+
+Capture does not need to be guarded by `if vs == 200`. The compute shader must
+validate the extracted `cb1[5]` bone window and `vs-t0` bounds before it writes
+anything. Draw suppression and replay are still guarded separately, because
+capturing an IB does not by itself mean the original draw should be skipped.
 
 ## Capture Record Selector
 

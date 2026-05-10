@@ -37,6 +37,25 @@ class FakePolygon:
     edge_keys: tuple[tuple[int, int], ...] = ()
 
 
+class FakeLoop:
+    def __init__(self, edge_index: int):
+        self.edge_index = edge_index
+
+
+class FakeCollection(list):
+    def foreach_get(self, attribute_name: str, output):
+        cursor = 0
+        for item in self:
+            value = getattr(item, attribute_name)
+            if isinstance(value, (tuple, list)):
+                for component in value:
+                    output[cursor] = component
+                    cursor += 1
+            else:
+                output[cursor] = value
+                cursor += 1
+
+
 class FakeVertexGroup:
     def __init__(self, name: str, index: int):
         self.name = name
@@ -75,9 +94,10 @@ class IdentityMatrix:
 
 class FakeMeshData:
     def __init__(self, vertices: list[FakeVertex]):
-        self.vertices = vertices
-        self.edges = [FakeEdge((index, (index + 1) % len(vertices))) for index in range(len(vertices))]
-        self.polygons = [FakePolygon()]
+        self.vertices = FakeCollection(vertices)
+        self.edges = FakeCollection([FakeEdge((index, (index + 1) % len(vertices))) for index in range(len(vertices))])
+        self.loops = FakeCollection([FakeLoop(index) for index in range(len(self.edges))])
+        self.polygons = FakeCollection([FakePolygon()])
 
 
 class FakeObject:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from .numpy_compat import optional_numpy
+import numpy as np
 
 
 def normalize_dxgi_format(fmt: str) -> str:
@@ -19,7 +19,6 @@ def dxgi_format_size(fmt: str) -> int:
     if spec is None:
         return 0
     dtype_name, component_count, _conversion = spec
-    np = optional_numpy()
     return int(np.dtype(dtype_name).itemsize) * int(component_count)
 
 
@@ -57,7 +56,6 @@ def read_index_file(path: str, fmt: str, index_count: int, *, byte_offset: int =
     with open(path, "rb") as file_handle:
         file_handle.seek(int(byte_offset) + int(first_index) * int(stride))
         data = file_handle.read(read_size)
-    np = optional_numpy()
     count = min(int(index_count), len(data) // int(stride))
     return np.frombuffer(data, dtype=np.dtype(dtype_name), count=count).astype(np.int64, copy=False).tolist()
 
@@ -72,7 +70,6 @@ def read_interleaved_field(
     vertex_count: int | None = None,
     converted: bool = True,
 ):
-    np = optional_numpy()
     spec = dxgi_format_spec(fmt)
     if spec is None or int(stride) <= 0 or int(offset) < 0:
         return None
@@ -113,7 +110,6 @@ def read_interleaved_fields(
     fields: list[tuple[str, int, str, bool]],
     vertex_count: int | None = None,
 ) -> dict[str, object] | None:
-    np = optional_numpy()
     if int(stride) <= 0:
         return None
     names = []
@@ -147,7 +143,6 @@ def read_interleaved_fields(
 
 
 def _convert_interleaved_values(values, conversion):
-    np = optional_numpy()
     if conversion == "unorm16":
         return values.astype(np.float64) / 65535.0
     if conversion == "unorm8":
@@ -192,7 +187,6 @@ def read_interleaved_fields_from_file(
 
 
 def assign_bytes(target, offset: int, values) -> None:
-    np = optional_numpy()
     array = np.ascontiguousarray(values)
     if array.size == 0:
         return
@@ -201,7 +195,6 @@ def assign_bytes(target, offset: int, values) -> None:
 
 
 def foreach_get_array(collection, attribute_name: str, *, dtype="float64", shape: tuple[int, ...] | None = None):
-    np = optional_numpy()
     getter = getattr(collection, "foreach_get", None)
     if not callable(getter):
         raise ValueError(f"collection does not support foreach_get({attribute_name})")
@@ -218,7 +211,6 @@ def foreach_get_array(collection, attribute_name: str, *, dtype="float64", shape
 
 
 def object_attribute_array(items, attribute_name: str, *, dtype="int64", start: int = 0, end: int | None = None):
-    np = optional_numpy()
     item_count = len(items)
     start_index = max(0, int(start))
     end_index = item_count if end is None else min(item_count, int(end))
@@ -232,7 +224,6 @@ def object_attribute_array(items, attribute_name: str, *, dtype="int64", start: 
 
 
 def normalize_rows(values, *, columns: int = 3, dtype="float32"):
-    np = optional_numpy()
     vectors = np.asarray(values, dtype=np.dtype(dtype))
     if vectors.size == 0:
         return vectors.reshape((0, int(columns)))
@@ -243,7 +234,6 @@ def normalize_rows(values, *, columns: int = 3, dtype="float32"):
 
 
 def point_bounds(points):
-    np = optional_numpy()
     values = np.asarray(points, dtype=np.float64)
     if values.size == 0:
         return None
@@ -252,14 +242,12 @@ def point_bounds(points):
 
 
 def cell_key_array(points, tolerance: float):
-    np = optional_numpy()
     values = np.asarray(points, dtype=np.float64).reshape((-1, 3))
     inverse = 1.0 / max(float(tolerance), 1.0e-6)
     return np.floor(values * inverse).astype(np.int64)
 
 
 def cell_key_set_from_array(cell_keys) -> frozenset[tuple[int, int, int]]:
-    np = optional_numpy()
     keys = np.asarray(cell_keys, dtype=np.int64).reshape((-1, 3))
     if keys.size == 0:
         return frozenset()
@@ -279,7 +267,6 @@ def expanded_cell_key_set(cell_keys) -> frozenset[tuple[int, int, int]]:
 
 
 def max_interleaved_uint4(data: bytes, *, stride: int, offset: int, fmt: str, vertex_count: int) -> int:
-    np = optional_numpy()
     values = read_interleaved_field(
         data,
         range(int(vertex_count)),
@@ -295,7 +282,6 @@ def max_interleaved_uint4(data: bytes, *, stride: int, offset: int, fmt: str, ve
 
 
 def positions_diag(positions) -> float:
-    np = optional_numpy()
     values = np.asarray(positions, dtype=np.float64)
     if values.size == 0:
         return 0.0

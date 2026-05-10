@@ -7,6 +7,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 PACKAGE_PARENT = PACKAGE_DIR.parent
@@ -16,7 +18,6 @@ if str(PACKAGE_PARENT) not in sys.path:
 vertex_format = importlib.import_module(f"{PACKAGE_DIR.name}.core.vertex_format")
 import_candidates = importlib.import_module(f"{PACKAGE_DIR.name}.core.import_candidates")
 export_buffers = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_buffers")
-numpy_compat = importlib.import_module(f"{PACKAGE_DIR.name}.core.numpy_compat")
 
 
 class VertexFormatTests(unittest.TestCase):
@@ -75,9 +76,6 @@ class VertexFormatTests(unittest.TestCase):
         self.assertNotEqual((packed >> 20) & 0x3FF, 0)
 
     def test_numpy_packed_tangent_frame_round_trips_roll(self):
-        np = numpy_compat.optional_numpy()
-        if np is None:
-            self.skipTest("numpy not available")
         packed_values = np.asarray(
             [0xFB979E48, 0x54B77DB8, 0xF8FDB181, 0xF7AD89B4],
             dtype=np.uint32,

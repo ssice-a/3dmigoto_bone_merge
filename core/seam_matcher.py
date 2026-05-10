@@ -12,7 +12,6 @@ from .spatial_index import (
 )
 from .draw_arrays import require_numpy
 from .numpy_buffers import expanded_cell_key_set, point_bounds
-from .numpy_compat import optional_numpy
 
 try:
     from mathutils import Vector as _MathutilsVector
@@ -320,10 +319,9 @@ def _build_seam_cache(mesh_obj, *, perf: dict | None = None) -> dict | None:
     if perf is not None:
         perf["group_clouds"] = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
-    group_cell_index = _build_group_cell_index(group_clouds)
-    group_neighbor_cell_index = _build_group_cell_index(group_clouds, expanded=True)
+    group_array_index = _build_group_array_index(group_clouds)
     if perf is not None:
-        perf["group_cell_index"] = time.perf_counter() - stage_start
+        perf["group_array_index"] = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
     bounds = point_bounds([world_co for _vertex_index, world_co in weighted_seam_vertices])
     bounds_min = tuple(float(value) for value in bounds[0])
@@ -336,8 +334,7 @@ def _build_seam_cache(mesh_obj, *, perf: dict | None = None) -> dict | None:
         "cell_keys": cell_keys,
         "expanded_cell_keys": expanded_cell_keys,
         "group_clouds": group_clouds,
-        "group_cell_index": group_cell_index,
-        "group_neighbor_cell_index": group_neighbor_cell_index,
+        "group_array_index": group_array_index,
         "group_numbers": frozenset(group_clouds),
         "group_vertex_cache": {},
         "bounds_min": bounds_min,
@@ -379,6 +376,8 @@ def _build_group_clouds(weighted_seam_vertices, weight_items_by_vertex) -> dict[
         points = accumulator["points"]
         if len(points) < _MIN_VERTEX_PAIRS:
             continue
+        cell_keys = frozenset(accumulator["cell_keys"])
+        expanded_cell_keys = expanded_cell_key_set(cell_keys)
         clouds[int(group_number)] = {
             "points": tuple(points),
             "bounds_min": (
@@ -391,19 +390,29 @@ def _build_group_clouds(weighted_seam_vertices, weight_items_by_vertex) -> dict[
                 float(accumulator["max_y"]),
                 float(accumulator["max_z"]),
             ),
-            "cell_keys": frozenset(accumulator["cell_keys"]),
-            "expanded_cell_keys": expanded_cell_key_set(accumulator["cell_keys"]),
+            "cell_keys": cell_keys,
+            "expanded_cell_keys": expanded_cell_keys,
+            "cell_codes": _cell_key_codes(cell_keys),
+            "expanded_cell_codes": _cell_key_codes(expanded_cell_keys),
         }
     return clouds
 
 
-def _build_group_cell_index(group_clouds: dict[int, dict], *, expanded: bool = False) -> dict:
-    cell_index: dict[tuple[int, int, int], set[int]] = {}
-    for group_number, cloud in group_clouds.items():
-        key_name = "expanded_cell_keys" if expanded else "cell_keys"
-        for cell_key in cloud[key_name]:
-            cell_index.setdefault(cell_key, set()).add(int(group_number))
-    return cell_index
+def _build_group_array_index(group_clouds: dict[int, dict]) -> dict:
+    np = require_numpy()
+    groups = np.asarray(sorted(group_clouds), dtype=np.int64)
+    if groups.size == 0:
+        empty_bounds = np.zeros((0, 3), dtype=np.float64)
+        return {
+            "groups": groups,
+            "bounds_min": empty_bounds,
+            "bounds_max": empty_bounds,
+        }
+    return {
+        "groups": groups,
+        "bounds_min": np.asarray([group_clouds[int(group)]["bounds_min"] for group in groups], dtype=np.float64),
+        "bounds_max": np.asarray([group_clouds[int(group)]["bounds_max"] for group in groups], dtype=np.float64),
+    }
 
 
 def _build_group_index_to_number_map(mesh_obj) -> dict[int, int]:
@@ -420,84 +429,61 @@ def _build_group_index_to_number_map(mesh_obj) -> dict[int, int]:
 
 
 def _collect_seam_vertices(mesh_obj):
-    vertices = _collect_seam_vertices_numpy(mesh_obj)
-    if vertices is not None:
-        return vertices
-
-    boundary_indices = _resolve_boundary_vertex_indices(mesh_obj)
-    matrix_world = mesh_obj.matrix_world
-    vertices = []
-    for vertex_index in boundary_indices:
-        vertex = mesh_obj.data.vertices[vertex_index]
-        vertices.append((vertex.index, _world_coord_tuple(matrix_world @ vertex.co)))
-    vertices.sort(key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
-    return vertices
+    return _collect_seam_vertices_numpy(mesh_obj)
 
 
 def _collect_seam_vertices_numpy(mesh_obj):
-    np = optional_numpy()
-    try:
-        mesh = mesh_obj.data
-        vertex_count = len(mesh.vertices)
-        edge_count = len(mesh.edges)
-        loop_count = len(mesh.loops)
-        if vertex_count <= 0 or edge_count <= 0 or loop_count <= 0:
-            return []
+    np = require_numpy()
+    mesh = mesh_obj.data
+    vertex_count = len(mesh.vertices)
+    edge_count = len(mesh.edges)
+    loop_count = len(mesh.loops)
+    if vertex_count <= 0 or edge_count <= 0 or loop_count <= 0:
+        return []
 
-        loop_edge_indices = np.empty(loop_count, dtype=np.int64)
-        mesh.loops.foreach_get("edge_index", loop_edge_indices)
-        edge_face_counts = np.bincount(loop_edge_indices, minlength=edge_count)
-        boundary_edge_mask = edge_face_counts[:edge_count] == 1
+    loop_edge_indices = np.empty(loop_count, dtype=np.int64)
+    mesh.loops.foreach_get("edge_index", loop_edge_indices)
+    edge_face_counts = np.bincount(loop_edge_indices, minlength=edge_count)
+    boundary_edge_mask = edge_face_counts[:edge_count] == 1
 
-        try:
-            loose_mask = np.zeros(edge_count, dtype=bool)
-            mesh.edges.foreach_get("is_loose", loose_mask)
-            boundary_edge_mask = np.logical_or(boundary_edge_mask, loose_mask)
-        except Exception:
-            loose_indices = [
-                edge_index
-                for edge_index, edge in enumerate(mesh.edges)
-                if bool(getattr(edge, "is_loose", False))
-            ]
-            if loose_indices:
-                boundary_edge_mask[np.asarray(loose_indices, dtype=np.int64)] = True
+    loose_mask = np.zeros(edge_count, dtype=bool)
+    mesh.edges.foreach_get("is_loose", loose_mask)
+    boundary_edge_mask = np.logical_or(boundary_edge_mask, loose_mask)
 
-        if not bool(boundary_edge_mask.any()):
-            return []
+    if not bool(boundary_edge_mask.any()):
+        return []
 
-        edge_vertices = np.empty(edge_count * 2, dtype=np.int64)
-        mesh.edges.foreach_get("vertices", edge_vertices)
-        edge_vertices = edge_vertices.reshape((edge_count, 2))
-        boundary_indices = np.unique(edge_vertices[boundary_edge_mask].reshape(-1))
-        if boundary_indices.size == 0:
-            return []
+    edge_vertices = np.empty(edge_count * 2, dtype=np.int64)
+    mesh.edges.foreach_get("vertices", edge_vertices)
+    edge_vertices = edge_vertices.reshape((edge_count, 2))
+    boundary_indices = np.unique(edge_vertices[boundary_edge_mask].reshape(-1))
+    if boundary_indices.size == 0:
+        return []
 
-        coords = np.empty(vertex_count * 3, dtype=np.float64)
-        mesh.vertices.foreach_get("co", coords)
-        coords = coords.reshape((vertex_count, 3))[boundary_indices]
-        matrix = _matrix_world_numpy(mesh_obj.matrix_world, np)
-        world_coords = coords @ matrix[:3, :3].T + matrix[:3, 3]
-        order = np.lexsort((
-            boundary_indices,
-            world_coords[:, 2],
-            world_coords[:, 1],
-            world_coords[:, 0],
-        ))
-        boundary_indices = boundary_indices[order]
-        world_coords = world_coords[order]
-        return [
+    coords = np.empty(vertex_count * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coords)
+    coords = coords.reshape((vertex_count, 3))[boundary_indices]
+    matrix = _matrix_world_numpy(mesh_obj.matrix_world, np)
+    world_coords = coords @ matrix[:3, :3].T + matrix[:3, 3]
+    order = np.lexsort((
+        boundary_indices,
+        world_coords[:, 2],
+        world_coords[:, 1],
+        world_coords[:, 0],
+    ))
+    boundary_indices = boundary_indices[order]
+    world_coords = world_coords[order]
+    return [
+        (
+            int(vertex_index),
             (
-                int(vertex_index),
-                (
-                    float(world_co[0]),
-                    float(world_co[1]),
-                    float(world_co[2]),
-                ),
-            )
-            for vertex_index, world_co in zip(boundary_indices, world_coords)
-        ]
-    except Exception:
-        return None
+                float(world_co[0]),
+                float(world_co[1]),
+                float(world_co[2]),
+            ),
+        )
+        for vertex_index, world_co in zip(boundary_indices, world_coords)
+    ]
 
 
 def _matrix_world_numpy(matrix_world, np):
@@ -513,28 +499,6 @@ def _matrix_world_numpy(matrix_world, np):
 
 def _world_coord_tuple(world_co) -> tuple[float, float, float]:
     return float(world_co[0]), float(world_co[1]), float(world_co[2])
-
-
-def _resolve_boundary_vertex_indices(mesh_obj):
-    mesh = mesh_obj.data
-    edge_face_counts = {}
-    for polygon in mesh.polygons:
-        for edge_key in polygon.edge_keys:
-            normalized_edge_key = _normalized_edge_key(edge_key)
-            edge_face_counts[normalized_edge_key] = edge_face_counts.get(normalized_edge_key, 0) + 1
-
-    boundary_indices = set()
-    for edge in mesh.edges:
-        edge_key = _normalized_edge_key(edge.vertices)
-        if edge.is_loose or edge_face_counts.get(edge_key, 0) == 1:
-            boundary_indices.update(edge.vertices)
-    return boundary_indices
-
-
-def _normalized_edge_key(edge_vertices) -> tuple[int, int]:
-    left = int(edge_vertices[0])
-    right = int(edge_vertices[1])
-    return (left, right) if left <= right else (right, left)
 
 
 def _build_sorted_vertex_weight_cache(mesh_obj, vertex_indices: set[int], group_index_to_number: dict[int, int]):
@@ -766,6 +730,20 @@ def _cell_key(world_co, tolerance):
     return _generic_cell_key(world_co, tolerance)
 
 
+def _cell_key_codes(cell_keys):
+    np = require_numpy()
+    if not cell_keys:
+        return np.zeros((0,), dtype=_cell_code_dtype(np))
+    values = np.asarray(list(cell_keys), dtype=np.int64).reshape((-1, 3))
+    values = np.ascontiguousarray(values)
+    codes = values.view(_cell_code_dtype(np)).reshape((-1,))
+    return np.unique(codes)
+
+
+def _cell_code_dtype(np):
+    return np.dtype([("x", "<i8"), ("y", "<i8"), ("z", "<i8")])
+
+
 def _neighbor_keys(base_key):
     yield from _generic_neighbor_keys(base_key)
 
@@ -865,26 +843,33 @@ def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: f
 def _allowed_group_pairs_from_caches(source_cache: dict, target_cache: dict) -> set[tuple[int, int]]:
     source_group_clouds = source_cache["group_clouds"]
     target_group_clouds = target_cache["group_clouds"]
-    target_group_cell_index = target_cache["group_neighbor_cell_index"]
-    if not source_group_clouds or not target_group_clouds or not target_group_cell_index:
+    source_index = source_cache["group_array_index"]
+    target_index = target_cache["group_array_index"]
+    np = require_numpy()
+    source_groups = source_index["groups"]
+    target_groups = target_index["groups"]
+    if source_groups.size == 0 or target_groups.size == 0:
+        return set()
+    source_mins = source_index["bounds_min"]
+    source_maxs = source_index["bounds_max"]
+    target_mins = target_index["bounds_min"]
+    target_maxs = target_index["bounds_max"]
+    gap = float(_GROUP_BBOX_GAP_TOLERANCE)
+    overlaps = np.all(
+        (source_mins[:, None, :] <= target_maxs[None, :, :] + gap)
+        & (target_mins[None, :, :] <= source_maxs[:, None, :] + gap),
+        axis=2,
+    )
+    source_positions, target_positions = np.nonzero(overlaps)
+    if source_positions.size == 0:
         return set()
     allowed: set[tuple[int, int]] = set()
-    for source_group, source_cloud in sorted(source_group_clouds.items()):
-        target_groups = set()
-        for cell_key in source_cloud["cell_keys"]:
-            target_groups.update(target_group_cell_index.get(cell_key, ()))
-        for target_group in target_groups:
-            target_cloud = target_group_clouds.get(int(target_group))
-            if target_cloud is None:
-                continue
-            if not _bounds_overlap_with_gap(
-                source_cloud["bounds_min"],
-                source_cloud["bounds_max"],
-                target_cloud["bounds_min"],
-                target_cloud["bounds_max"],
-                _GROUP_BBOX_GAP_TOLERANCE,
-            ):
-                continue
+    for source_position, target_position in zip(source_positions.tolist(), target_positions.tolist()):
+        source_group = int(source_groups[int(source_position)])
+        target_group = int(target_groups[int(target_position)])
+        source_cloud = source_group_clouds[source_group]
+        target_cloud = target_group_clouds[target_group]
+        if np.intersect1d(source_cloud["cell_codes"], target_cloud["expanded_cell_codes"], assume_unique=True).size:
             allowed.add((int(source_group), int(target_group)))
     return allowed
 

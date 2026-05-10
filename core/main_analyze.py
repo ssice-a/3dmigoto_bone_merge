@@ -12,14 +12,13 @@ from typing import Iterable
 
 from ..constants import CAPTURE_MANIFEST_FILE_NAME
 from .data_types import annotate_vertex_layout
-from .draw_arrays import read_index_array, used_skin_slots
+from .draw_arrays import read_index_array, require_numpy, used_skin_slots
 from .io import write_json
 from .numpy_buffers import (
     dxgi_format_size,
     max_interleaved_uint4,
     read_interleaved_fields_from_file,
 )
-from .numpy_compat import optional_numpy
 
 
 _HASH_RE = re.compile(r"^[0-9a-fA-F]{8}$")
@@ -1546,7 +1545,7 @@ def _read_used_local_bone_indices_from_import_draw(
         byte_offset=int(ib_header.byte_offset),
         first_index=int(ib_header.first_index),
     )
-    np = optional_numpy()
+    np = require_numpy()
     vertex_id_array = np.unique(indices[indices >= 0]) if indices.size else np.zeros((0,), dtype=np.int64)
     vertex_ids = [int(value) for value in vertex_id_array.tolist()]
     if not vertex_ids:

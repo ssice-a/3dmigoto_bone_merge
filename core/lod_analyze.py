@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ..constants import CAPTURE_MANIFEST_FILE_NAME
-from .draw_arrays import skin_signature
+from .draw_arrays import require_numpy, skin_signature
 from .import_candidates import (
     _load_slot_slice,
     _read_blend_indices,
@@ -24,7 +24,6 @@ from .import_candidates import (
 from .main_analyze import ANALYZER_VERSION, analyze_main_frameanalysis
 from .main_analyze import _parse_buffer_header
 from .numpy_buffers import positions_diag
-from .numpy_compat import optional_numpy
 from .spatial_index import (
     build_spatial_hash as _generic_build_spatial_hash,
     cell_key as _generic_cell_key,
@@ -756,14 +755,11 @@ def _compress_point_cloud(points: list[WeightedPoint], target_count: int, tolera
 
 def _aggregate_points_by_cell(points: list[WeightedPoint], cell_size: float) -> list[WeightedPoint]:
     buckets: dict[tuple[int, int, int, object], dict] = {}
-    np = optional_numpy()
+    np = require_numpy()
     cell_keys = None
-    if np is not None and points:
-        try:
-            positions = np.asarray([point.position for point in points], dtype=np.float64)
-            cell_keys = np.floor(positions / max(float(cell_size), 1.0e-6)).astype(np.int64)
-        except Exception:
-            cell_keys = None
+    if points:
+        positions = np.asarray([point.position for point in points], dtype=np.float64)
+        cell_keys = np.floor(positions / max(float(cell_size), 1.0e-6)).astype(np.int64)
     for point_index, point in enumerate(points):
         dominant_key = point.weights[0][0] if point.weights else None
         if cell_keys is not None:

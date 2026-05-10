@@ -41,7 +41,7 @@ class NumpyBuffersTests(unittest.TestCase):
         self.assertAlmostEqual(float(values[1][2]), 1.0)
 
     def test_assign_bytes_handles_2d_vectors(self):
-        np = numpy_buffers.optional_numpy()
+        np = draw_arrays.require_numpy()
         target = np.zeros((2, 16), dtype=np.uint8)
         values = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
         numpy_buffers.assign_bytes(target, 4, values)
@@ -52,7 +52,7 @@ class NumpyBuffersTests(unittest.TestCase):
             numpy_buffers.positions_diag([(0.0, 0.0, 0.0), (3.0, 4.0, 12.0)]),
             13.0,
         )
-        np = numpy_buffers.optional_numpy()
+        np = draw_arrays.require_numpy()
         self.assertAlmostEqual(
             numpy_buffers.positions_diag(np.asarray([(0.0, 0.0, 0.0), (0.0, 0.0, 5.0)])),
             5.0,

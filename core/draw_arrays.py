@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from .numpy_compat import optional_numpy
+import numpy as _np
 from .numpy_buffers import index_format_spec, positions_diag
 
 
@@ -12,10 +12,7 @@ _WEIGHT_EPSILON = 1.0e-5
 
 
 def require_numpy():
-    np = optional_numpy()
-    if np is None:  # pragma: no cover - numpy is a hard dependency in normal builds
-        raise RuntimeError("NumPy is required for Bone Merge buffer processing")
-    return np
+    return _np
 
 
 def read_index_array(path: str, fmt: str, index_count: int, *, byte_offset: int = 0, first_index: int = 0):

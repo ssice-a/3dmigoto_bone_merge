@@ -154,6 +154,143 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual(links[1]["status"], "matched")
         self.assertEqual(links[1]["lod_sources"][0]["lod_record_key"], "lod_hair-2-0")
 
+    def test_lod_links_do_not_broaden_from_raw_bone_candidates(self):
+        main_records = [
+            {
+                "source_key": "main_hair-200-0",
+                "ib_hash": "main_hair",
+                "match_first_index": 0,
+                "match_index_count": 200,
+                "global_bone_base": 200,
+                "local_bone_count": 8,
+            }
+        ]
+        lod_records = {
+            "lod_noise-1-0": {
+                "lod_record_key": "lod_noise-1-0",
+                "lod_ib_hash": "lod_noise",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 1,
+            },
+            "lod_hair-2-0": {
+                "lod_record_key": "lod_hair-2-0",
+                "lod_ib_hash": "lod_hair",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 2,
+            },
+        }
+        global_candidates = {
+            200: [
+                {"lod_record_key": "lod_noise-1-0", "lod_local_bone": 9, "score": 9.0, "votes": 9, "average_distance": 0.001},
+                {"lod_record_key": "lod_hair-2-0", "lod_local_bone": 0, "score": 3.0, "votes": 3, "average_distance": 0.01},
+            ],
+            201: [{"lod_record_key": "lod_hair-2-0", "lod_local_bone": 1, "score": 3.0, "votes": 3, "average_distance": 0.01}],
+            202: [{"lod_record_key": "lod_hair-2-0", "lod_local_bone": 2, "score": 3.0, "votes": 3, "average_distance": 0.01}],
+            203: [{"lod_record_key": "lod_hair-2-0", "lod_local_bone": 3, "score": 3.0, "votes": 3, "average_distance": 0.01}],
+        }
+
+        links = lod_analyze._build_lod_links(main_records, lod_records, global_candidates)
+
+        self.assertEqual(links[0]["status"], "matched")
+        self.assertEqual(links[0]["lod_sources"][0]["lod_record_key"], "lod_hair-2-0")
+
+        records = lod_analyze._build_lod_capture_records(
+            lod_records,
+            {
+                200: global_candidates[200][0],
+                201: global_candidates[201][0],
+                202: global_candidates[202][0],
+                203: global_candidates[203][0],
+            },
+        )
+        self.assertIn("lod_noise-1-0", {record["lod_record_key"] for record in records})
+        self.assertIn("lod_hair-2-0", {record["lod_record_key"] for record in records})
+
+    def test_lod_links_prefer_vb2_slot_signature_over_broad_bone_candidates(self):
+        main_records = [
+            {
+                "source_key": "main_body-100-0",
+                "ib_hash": "main_body",
+                "match_first_index": 0,
+                "match_index_count": 100,
+                "global_bone_base": 80,
+                "local_bone_count": 67,
+                "vb2_signature": {"slot_count": 67, "center": [0.0, 0.0, 0.0], "diag": 1.0},
+            },
+            {
+                "source_key": "main_hair-50-0",
+                "ib_hash": "main_hair",
+                "match_first_index": 0,
+                "match_index_count": 50,
+                "global_bone_base": 230,
+                "local_bone_count": 23,
+                "vb2_signature": {"slot_count": 23, "center": [0.0, 1.0, 0.0], "diag": 0.5},
+            },
+        ]
+        lod_records = {
+            "lod_body-70-0": {
+                "lod_record_key": "lod_body-70-0",
+                "lod_ib_hash": "lod_body",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 70,
+                "lod_local_bone_count": 70,
+                "vb2_signature": {"slot_count": 70, "center": [0.0, 0.0, 0.0], "diag": 1.1},
+            }
+        }
+        global_candidates = {
+            **{
+                global_bone: [
+                    {
+                        "lod_record_key": "lod_body-70-0",
+                        "lod_local_bone": global_bone - 80,
+                        "score": 1.0,
+                        "votes": 1,
+                        "average_distance": 0.0,
+                    }
+                ]
+                for global_bone in range(80, 147)
+            },
+            **{
+                global_bone: [
+                    {
+                        "lod_record_key": "lod_body-70-0",
+                        "lod_local_bone": global_bone - 230,
+                        "score": 1.0,
+                        "votes": 1,
+                        "average_distance": 0.0,
+                    }
+                ]
+                for global_bone in range(230, 253)
+            },
+        }
+
+        links = lod_analyze._build_lod_links(main_records, lod_records, global_candidates)
+
+        self.assertEqual(links[0]["status"], "matched")
+        self.assertEqual(links[0]["lod_sources"][0]["lod_record_key"], "lod_body-70-0")
+        self.assertEqual(links[0]["lod_sources"][0]["relation_method"], "vb2_slot_signature")
+        self.assertEqual(links[1]["status"], "unmatched")
+        self.assertEqual(links[1]["lod_sources"], [])
+
+    def test_bone_cloud_mapping_keeps_multiple_lod_candidates_for_one_global(self):
+        canonical_points = [
+            lod_analyze.WeightedPoint((0.0, 0.0, 0.0), ((200, 1.0),)),
+            lod_analyze.WeightedPoint((0.0, 0.1, 0.0), ((200, 1.0),)),
+        ]
+        lod_points = [
+            lod_analyze.WeightedPoint((0.0, 0.0, 0.0), ((("lod_noise-1-0", 9), 1.0),)),
+            lod_analyze.WeightedPoint((0.0, 0.1, 0.0), ((("lod_hair-2-0", 0), 1.0),)),
+        ]
+
+        result = lod_analyze.build_lod_bone_cloud_mapping(canonical_points, lod_points, 256)
+        candidate_keys = {
+            candidate["lod_record_key"]
+            for candidate in result["global_candidates"][200]
+        }
+
+        self.assertIn("lod_noise-1-0", candidate_keys)
+        self.assertIn("lod_hair-2-0", candidate_keys)
+
     def test_review_blocks_when_global_pool_is_not_filled(self):
         manifest = {
             "bone_pool_order": [

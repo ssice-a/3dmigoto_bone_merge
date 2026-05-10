@@ -277,6 +277,7 @@ local_bone_store_rows  = local_previous_row_offset  + 3 + max_local_bone_count *
 ### shadow_skip_records
 
 Only modified/exported source IBs are skipped at their original shadow draw. Unmodified game parts are left untouched.
+Main and LOD use the same skip rule; only their palette/capture maps differ.
 
 ```json
 {
@@ -290,7 +291,7 @@ Only modified/exported source IBs are skipped at their original shadow draw. Unm
 
 ### shadow_replay_plan
 
-The replay host is a late compatible shadow draw used to replay all delayed modified shadow parts after the global bone store is complete.
+The replay host is the final compatible shadow draw used to replay all delayed modified shadow parts after the global bone store is complete. Main and LOD use the same replay rule; LOD only differs in how its native palette scatters into the canonical global pool.
 
 ```json
 {
@@ -298,6 +299,7 @@ The replay host is a late compatible shadow draw used to replay all delayed modi
   "host_match_index_count": 21849,
   "host_vs_filter": 202,
   "host_draw_index": 420,
+  "host_has_exported_geometry": false,
   "batches": [
     {
       "name": "transparent_shadow",
@@ -312,6 +314,22 @@ The replay host is a late compatible shadow draw used to replay all delayed modi
   ]
 }
 ```
+
+The final host rule is strict:
+
+```text
+if final host has no exported geometry:
+    draw = from_caller
+    replay delayed exported shadow parts
+
+if final host has exported geometry:
+    handling = skip
+    replay the host replacement plus delayed exported shadow parts
+```
+
+Do not emit `draw = from_caller` for ordinary capture-only entries or earlier
+shadow entries. Capture-only entries simply record bones and leave the native
+draw untouched.
 
 Each part entry should include the exported mesh resources, draw calls, and palette record:
 
@@ -598,8 +616,8 @@ LOD automation is an optional phase after the main analyze/import/global-pool pa
 There is exactly one user-facing root collection. Import and export both use this same collection. Do not create separate import and export roots.
 
 This root collection is a large working collection containing imported source objects and export
-IB region subcollections. Export recursively walks mesh objects under valid region/part
-subcollections in this root and writes buffers/INI from that structure.
+IB region subcollections. Export walks valid region/part subcollections in this root and writes
+buffers/INI from that structure.
 
 The root contains IB region collections. Each region collection can export either one implicit
 part or multiple explicit parts. This mirrors the `mod_importer` rule while keeping BoneMerge's
@@ -608,7 +626,7 @@ single-root workflow:
 ```text
 ExportRoot
   <ib_hash>-<match_index_count>-<first_index>
-    mesh objects...            ; implicit part00
+    direct mesh objects...     ; implicit part00
   <ib_hash>-<match_index_count>-<first_index>
     part00
       mesh objects...
@@ -637,11 +655,18 @@ Examples:
 
 `match_index_count` is intentionally visible in the collection name so the exported draw identity
 is clear in Blender. The scanner still verifies it against the current FrameAnalysis and the
-latest capture manifest. Part collections are named `part00`, `part01`, etc. If an IB region uses
-direct mesh objects, they are treated as one implicit `part00`. If a region mixes direct mesh
-objects and explicit part collections, Prepare Export should either migrate direct meshes into
-`part00` or stop with a clear diagnostic; the preferred UI behavior is automatic migration because
-it preserves the user's visible result.
+latest capture manifest. Part collections are named `part00`, `part01`, etc. If an IB region has
+no `partNN` child collections, direct mesh objects are treated as one implicit `part00`. A single
+part produces one replacement buffer set and one palette; each mesh object inside that part keeps
+its own index range and runtime draw call. If a region has any explicit `partNN` collection, only
+mesh objects under those explicit part collections are exported. Mixing direct mesh objects on the
+region with explicit part collections is invalid; Prepare Export must stop with a clear diagnostic
+asking the user to move those direct meshes into an explicit `part00`. Nested child collections
+under a region are structural; if they contain meshes, they must be named `partNN`.
+
+Prepare Export must not create, link, unlink, or move Blender collections or objects. Collection
+membership is the user's source of truth. Auto-splitting over-large parts may create virtual part
+records and buffer names, but it must not mutate the Blender collection tree.
 
 ### Bone Localization
 
@@ -1864,6 +1889,11 @@ Unmodified LOD source IBs are left on the game's original path. Modified/exporte
 4. At the final compatible LOD shadow host, replay all delayed modified replacement parts.
 5. Draw transparent shadow batches first, then bind white shadow PS resources and draw normal shadow batches.
 ```
+
+At step 4, use `draw = from_caller` only when the final LOD host itself has no
+exported geometry. If the final LOD host is exported, skip it and include its
+equivalent replacement in the delayed replay batch. Earlier LOD capture entries
+must not use `draw = from_caller`.
 
 The replay host and resource bindings are LOD-stage-specific, but the replacement part resources and part-local `PartLocalToGlobalBoneMap` files still use canonical high-detail global bone semantics.
 

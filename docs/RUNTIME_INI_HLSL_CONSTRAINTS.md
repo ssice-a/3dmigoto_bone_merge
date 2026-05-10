@@ -16,6 +16,55 @@ Import/export, texture marking, mesh splitting, and palette construction are
 offline Blender responsibilities. Runtime shaders must not rediscover structure
 that the Blender exporter can validate and write into static buffers.
 
+## Export Collection Contract
+
+The Blender export collection tree is the only source of truth for exported
+geometry ownership. Mesh object names are descriptive metadata only; they must
+not decide which IB/part owns a buffer.
+
+Supported layouts:
+
+```text
+BMC Export Sources
+  <ib_hash>-<match_index_count>-<first_index>
+    direct mesh objects...           -> implicit part00
+
+BMC Export Sources
+  <ib_hash>-<match_index_count>-<first_index>
+    part00
+      mesh objects...                -> explicit part00
+    part01
+      mesh objects...                -> explicit part01
+```
+
+If a region has no `partNN` child collections, direct mesh objects on that
+region are exported together as implicit `part00`. A single part produces one
+replacement buffer set and one palette. Mesh objects inside that part are still
+recorded as separate index ranges, so runtime emits one `drawindexedinstanced`
+per mesh object while reusing the same IB/VB/palette resources.
+
+If a region has any `partNN` child collection, only meshes recursively under
+those explicit part collections are exported. Direct mesh objects on the region
+collection are invalid in this mode and the exporter must stop with an error
+that asks the user to move them into an explicit `part00`.
+
+Child collections under an IB region are structural. If they contain meshes,
+they must be named `partNN`; arbitrary nested child collections must not be
+silently swept into implicit `part00`.
+
+Only explicit `partNN` boundaries create additional buffer files and
+`PartLocalToGlobalBoneMap` palettes. Multiple mesh objects in one part do not.
+
+Prepare Export must not create, link, unlink, or move Blender collections or
+objects. Auto-splitting over-large parts may create virtual part records and
+buffer names, but it must not mutate the source collection tree.
+
+Generated `geometry_buffers[*].object_names` must come from the freshly built
+export plan for that buffer. Runtime regeneration must not backfill missing
+object names from stale manifest `objects` records; stale metadata is worse
+than no metadata because it can make the INI appear to draw objects that were
+not exported.
+
 ## Namespace And Multi-Mod Isolation
 
 One generated `BoneStore.ini` owns one Bone Merge runtime resource set.
@@ -101,12 +150,18 @@ checkbox `过滤残影`.
 
 ## TextureOverride Branch Contract
 
+Main and LOD overrides follow the same branch rules. The only difference is the
+capture palette source: main records use `ResourceMainCaptureBoneMap`; LOD
+records use `ResourceLodCaptureBoneMap` and scatter into the same canonical
+global pool.
+
 Each relevant IB override should have only two runtime branches:
 
 ```ini
 if vs == 200
-  ; capture native bones and, only when this source has exported shadow
-  ; replacement geometry, skip the original shadow draw.
+  ; shadow/capture branch. Capture bones here. Skip only when this IB has
+  ; exported replacement geometry; delayed shadow replay happens at the final
+  ; shadow draw, not at every source draw.
 endif
 
 if vs != 200
@@ -135,6 +190,243 @@ static buffers and by export/replay lists.
 `handling = skip` is generated only when the export collection actually contains
 replacement geometry for that source/host context. Capturing an IB does not by
 itself imply skipping it.
+
+`draw = from_caller` is not a general safety default. It is generated only on
+the final shadow scheduling draw, and only when that final IB has no exported
+replacement geometry of its own. This preserves the final native shadow draw
+before appending delayed replacement shadow parts.
+
+## Shadow/LOD Failure Postmortem And Hard INI Rules
+
+The 2026-05-10 `ply` shadow regression had two separate causes:
+
+```text
+main menu shadow:
+  a non-exported final shadow host was used for delayed replay
+  but the host's own native draw was not preserved
+  result: the host shadow, for example hair shadow, disappeared
+
+LOD shadow:
+  LOD shadow source draws were skipped and immediately replayed main exported
+  parts from a single partial LOD capture record
+  result: the original LOD shadow disappeared, and the replacement shadow could
+  twist because the global pool did not yet contain every required canonical bone
+```
+
+These are INI-generation bugs, not mesh-buffer bugs.
+
+Main and LOD use the same shadow replay contract. Their capture palettes differ,
+but the skip/replay decision tree does not.
+
+The hard rule is:
+
+```text
+For every main or LOD IB:
+  if the export collection has no mesh objects for this IB:
+      capture bones only
+      do not skip
+      do not replay replacement geometry for this IB
+
+  if the export collection has mesh objects for this IB:
+      in that IB's shadow branch, if vs == 200:
+          handling = skip
+      do not draw its shadow replacement immediately
+
+At the final shadow draw for the character/shadow cluster:
+  if the final host IB itself has no exported mesh objects:
+      draw = from_caller
+      then replay all delayed exported shadow parts
+
+  if the final host IB itself has exported mesh objects:
+      handling = skip
+      then replay the host's replacement plus all delayed exported shadow parts
+
+Visible/material/effect stages:
+  replace vs-t0/cb resources and draw normally in the visible branch
+```
+
+Capture can stay outside the `if` branch because `RecordBones` validates the
+current `cb1` window and `vs-t0` data before writing:
+
+```ini
+[TextureOverride_BMC_<source>]
+hash = <source_ib_hash>
+match_index_count = <source_index_count>
+run = CustomShader_ExtractCB1
+x100 = <record_index>
+cs-t2 = ResourceMainCaptureBoneMap ; or ResourceLodCaptureBoneMap
+run = CustomShader_RecordBones
+```
+
+But draw suppression and replay must remain branch-specific.
+
+Capture-only main or LOD source:
+
+```ini
+[TextureOverride_BMC_<capture_only_source>]
+hash = <ib_hash>
+match_index_count = <index_count>
+run = CustomShader_ExtractCB1
+x100 = <record_index>
+cs-t2 = ResourceMainCaptureBoneMap ; or ResourceLodCaptureBoneMap
+run = CustomShader_RecordBones
+
+; No handling = skip.
+; No delayed replay here.
+```
+
+Visible replacement source with exported geometry:
+
+```ini
+if vs != 200 && vs != 204
+  handling = skip
+  run = CustomShader_ExtractCB1
+  ; replay <exported_part>
+  x101 = <part_local_bone_count>
+  cs-t2 = ResourcePartLocalToGlobalBoneMap_<exported_part>
+  run = CustomShader_GatherLocalBones
+  vs-t0 = ResourceLocalBonePool_SRV
+  run = CustomShader_RedirectCB1
+  vs-cb1 = ResourceFakeCB1
+  ib = ResourcePart_<exported_part>_Index
+  vb0 = ResourcePart_<exported_part>_Position
+  vb1 = ResourcePart_<exported_part>_Texcoord
+  vb2 = ResourcePart_<exported_part>_Blend
+  vb3 = ResourcePart_<exported_part>_Position
+  drawindexedinstanced = <index_count>,INSTANCE_COUNT,0,0,FIRST_INSTANCE
+endif
+```
+
+Early shadow source whose own original shadow is replaced later:
+
+```ini
+if vs == 200
+  handling = skip
+endif
+```
+
+Final shadow host that is not itself exported must preserve exactly that native
+final draw before drawing delayed replacement parts:
+
+```ini
+[TextureOverride_BMC_<final_shadow_host>]
+hash = <host_ib_hash>
+match_index_count = <host_index_count>
+run = CustomShader_ExtractCB1
+x100 = <host_record_index>
+cs-t2 = ResourceMainCaptureBoneMap
+run = CustomShader_RecordBones
+
+if vs == 200
+  draw = from_caller
+  ; delayed transparent shadow replay, when present
+  ; replay <transparent_part>
+  ...
+  ps-t0 = ResourceBMCWhiteShadow
+  ; delayed normal shadow replay
+  ; replay <normal_part>
+  ...
+endif
+```
+
+Final shadow host that is itself exported does not preserve the native draw. It
+must skip and replay its own equivalent replacement as part of the delayed batch:
+
+```ini
+if vs == 200
+  handling = skip
+  ; replay <host_equivalent_part>
+  ; replay <other_delayed_parts>
+endif
+```
+
+The known bad LOD pattern is:
+
+```ini
+[TextureOverride_BMC_<lod_source>_LOD]
+hash = <lod_ib_hash>
+match_index_count = <lod_index_count>
+run = CustomShader_ExtractCB1
+x100 = <one_lod_record>
+cs-t2 = ResourceLodCaptureBoneMap
+run = CustomShader_RecordBones
+
+if vs == 200
+  handling = skip
+  ; BAD unless this single record already covers every required canonical bone.
+  ; replay <main_exported_part>
+endif
+```
+
+Generated LOD shadow replay must use a coverage proof:
+
+```text
+For every delayed replay part:
+  required_globals = all values in PartLocalToGlobalBoneMap_<part>
+  available_globals = union of all LodCaptureBoneMap records that are guaranteed
+                      to have executed before the selected LOD shadow host
+
+The LOD shadow host is valid only when:
+  required_globals is a subset of available_globals
+```
+
+If that proof fails, the generated INI must not skip the LOD shadow draw. Leave
+the native LOD shadow alone and generate capture-only LOD entries:
+
+```ini
+[TextureOverride_BMC_<lod_capture_only>_LOD]
+hash = <lod_ib_hash>
+match_index_count = <lod_index_count>
+run = CustomShader_ExtractCB1
+x100 = <lod_record_index>
+cs-t2 = ResourceLodCaptureBoneMap
+run = CustomShader_RecordBones
+
+; No if vs == 200 handling = skip.
+; No LOD shadow replay from this incomplete record.
+```
+
+When the proof succeeds, the LOD shadow replay is scheduled on the final LOD
+shadow host recorded by the analyzed LOD shadow stage. Earlier LOD entries are
+capture-only. The host branch is:
+
+```ini
+[TextureOverride_BMC_<verified_lod_shadow_host>_LOD]
+hash = <lod_host_ib_hash>
+match_index_count = <lod_host_index_count>
+; Optional capture lines appear here only if this final host also has a LOD
+; capture record. Scheduling replay on the final host does not require inventing
+; a capture record for it.
+
+if vs == 200
+  ; Use draw = from_caller only when this host is not itself replaced.
+  draw = from_caller
+  ps-t0 = ResourceBMCWhiteShadow
+  ; delayed normal shadow replay
+  ; replay <main_exported_part_using_complete_global_pool>
+  ...
+endif
+```
+
+Or, if the verified host itself is one of the skipped LOD sources:
+
+```ini
+if vs == 200
+  handling = skip
+  ps-t0 = ResourceBMCWhiteShadow
+  ; delayed normal shadow replay, including the host equivalent part
+  ...
+endif
+```
+
+Do not generate immediate LOD shadow replay from every LOD source. LOD capture
+records often scatter different subsets of the same canonical skeleton; one LOD
+draw can legitimately need bones captured by other LOD draws.
+
+Do not generate `draw = from_caller` on non-final shadow/capture entries. A
+capture-only entry without exported geometry should simply capture and leave the
+game draw alone. An exported entry should skip its original shadow and wait for
+the final shadow replay host.
 
 ## CommandList Usage Contract
 
@@ -418,13 +710,14 @@ latest pass role, because that can drop one of the native shadow passes.
 The final host can draw replacement parts from other IBs because the global
 bone pool is complete by that point.
 
-For LOD shadow replay, the host must be selected from the actual LOD shadow
-capture cluster, not from the main/high-detail shadow stage. When LOD capture
-records contain draw indices, choose the latest valid LOD capture draw in the
-cluster as the scheduling host. The host may be a LOD IB that is not itself an
-exported part; if the generated block binds replacement resources under that
-host, skip the host draw as the scheduling carrier and replay the exported
-canonical parts there.
+For LOD shadow replay, the host must be the actual final LOD shadow host from
+the analyzed LOD shadow stage, not merely the latest LOD capture record. The
+coverage proof in `Shadow/LOD Failure Postmortem And Hard INI Rules` must still
+succeed before any LOD shadow skip/replay is emitted. The LOD host uses the same
+final-shadow rule as main: if the final LOD host has no exported geometry, emit
+one `draw = from_caller` before replay; if the final LOD host has exported
+geometry, skip it and replay its equivalent replacement in the delayed batch.
+Earlier LOD capture entries must not use `draw = from_caller`.
 
 ## Visible Pass Contract
 
@@ -600,8 +893,10 @@ main source local bone -> canonical global bone
 lod source local bone  -> one or more canonical global bones
 ```
 
-After capture, replay is identical for main and LOD because exported parts only
-read canonical global bones through `PartLocalToGlobalBoneMap`.
+After the required capture records are complete, replay is identical for main
+and LOD because exported parts only read canonical global bones through
+`PartLocalToGlobalBoneMap`. A single partial LOD capture record is not enough
+unless it covers every canonical global bone required by the replayed part.
 
 LOD and main IB hashes usually differ. Runtime generation must bridge them
 explicitly:
@@ -612,17 +907,44 @@ LOD capture key         -> LodCaptureBoneMap record
 canonical suffix        -> PartLocalToGlobalBoneMap + exported VB/IB buffers
 ```
 
+The first relationship is geometry ownership, not a bone-palette result. It is
+derived before INI generation from cheap LOD/main structure signatures:
+
+```text
+used VB2 bone-slot count
+BLENDWEIGHTS influence distribution
+IB/VB size and AABB metadata
+```
+
+When these signatures are close, the LOD IB is considered the corresponding
+runtime host for that main exported region. Bone-cloud or point-cloud matching
+may only be used for unresolved/ambiguous LOD candidates; it must not broaden a
+signature-resolved LOD source to unrelated main regions.
+
+The second relationship is bone scatter:
+
+```text
+LOD local bone -> canonical global bone
+```
+
+That scatter still uses the LOD's own capture palette and the shared canonical
+global pool. It is intentionally independent from the geometry ownership
+mapping, because LOD and main meshes can merge or split visual regions
+differently.
+
 The LOD override hosts replay with the LOD hash, but the draw resources stay the
 main high-detail exported resources. If a canonical main part maps to multiple
-LOD sources, only the strongest resolved LOD source hosts replay; the remaining
-LOD sources are capture-only. This prevents duplicate high-detail draws while
-still allowing all LOD scatter records to fill the shared global pool.
+LOD sources, only the resolved LOD source for that main region hosts visible
+replay; unrelated LOD sources are capture-only. This prevents duplicate
+high-detail draws while still allowing all LOD scatter records to fill the
+shared global pool.
 
 LOD shadow replay is scheduled separately from visible LOD replay. Visible replay
 uses the resolved LOD source for the exported main part. Shadow replay waits
-until the final LOD capture draw in the shadow cluster so that every LOD scatter
-record for that cluster has populated the canonical global pool before any
-replacement shadow part is drawn.
+until the final LOD shadow host, and the preceding capture cluster must cover
+every canonical global bone required by the delayed replay parts. If coverage
+cannot be proven, generated output must keep LOD entries capture-only for the
+shadow branch and must not skip the native LOD shadow.
 
 Main and LOD capture maps should remain separate files for clarity:
 

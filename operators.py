@@ -10,7 +10,6 @@ import time
 import bpy
 
 from .constants import (
-    BI4_MAX_BONE_COUNT,
     BMC_GLOBAL_POOL_GENERATION_PROP,
     BMC_GLOBAL_REMAP_PROP,
     BMC_GLOBAL_SOURCE_KEY_PROP,
@@ -28,7 +27,6 @@ from .core.mapping_payload import (
     store_mapping_payload_on_scene,
 )
 from .core.export_prepare import prepare_export_collection
-from .core.export_package import build_export_plan
 from .core.identity import infer_mesh_identity_from_name
 from .core.io import read_json, write_json
 from .core.import_candidates import import_selected_candidates
@@ -45,7 +43,6 @@ from .core.texture_marks import (
     validate_texture_hash,
 )
 from .core.texture_materials import apply_material_from_texture_bindings
-from .core.vertex_groups import collect_weighted_numeric_vertex_groups
 
 DEFAULT_EXPORT_COLLECTION_NAME = "BMC Export Sources"
 _EXPORT_REGION_NAME_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)[-_](?P<first>\d+)")
@@ -152,127 +149,11 @@ def _link_object_to_collection(mesh_obj, collection) -> None:
     collection.objects.link(mesh_obj)
 
 
-def _materialize_auto_export_part_collections(export_collection) -> dict[str, object]:
-    plan = build_export_plan(
-        export_collection,
-        _collect_weighted_numeric_vertex_groups_for_export,
-        max_bones_per_part=BI4_MAX_BONE_COUNT,
-    )
-    generated_region_keys = {part.region.key for part in plan.parts if bool(part.generated)}
-    if not generated_region_keys:
-        return {"created": 0, "linked": 0, "unlinked": 0, "regions": 0, "parts": 0, "warnings": []}
-
-    region_collections = {
-        identity: child
-        for child in export_collection.children
-        if (identity := _resolve_export_region_collection_identity(child)) is not None
-    }
-    created_count = 0
-    linked_count = 0
-    unlinked_count = 0
-    materialized_parts = 0
-
-    for part in plan.parts:
-        if part.region.key not in generated_region_keys:
-            continue
-        region_collection = region_collections.get(
-            (part.region.ib_hash, int(part.region.match_index_count), int(part.region.match_first_index))
-        )
-        if region_collection is None:
-            continue
-        part_collection, created = _ensure_export_part_collection(region_collection, part.part_name)
-        if created:
-            created_count += 1
-        materialized_parts += 1
-        for mesh_obj in part.mesh_objects:
-            if _link_object_to_collection_counted(mesh_obj, part_collection):
-                linked_count += 1
-            unlinked_count += _unlink_object_from_other_region_part_locations(region_collection, mesh_obj, part_collection)
-
-    return {
-        "created": created_count,
-        "linked": linked_count,
-        "unlinked": unlinked_count,
-        "regions": len(generated_region_keys),
-        "parts": materialized_parts,
-        "warnings": list(plan.warnings),
-    }
-
-
-def _collect_weighted_numeric_vertex_groups_for_export(mesh_obj) -> set[int]:
-    return collect_weighted_numeric_vertex_groups(mesh_obj)
-
-
-def _ensure_export_part_collection(region_collection, part_name: str):
-    requested_name = str(part_name or "part00")
-    requested_index = _parse_export_part_index(requested_name)
-    for child in region_collection.children:
-        if _parse_export_part_index(child.name) == requested_index:
-            return child, False
-    collection = bpy.data.collections.new(requested_name)
-    region_collection.children.link(collection)
-    return collection, True
-
-
 def _parse_export_part_index(collection_name: str) -> int | None:
     match = re.match(r"^part(?P<index>\d+)(?:\D.*)?$", str(collection_name or ""), re.IGNORECASE)
     if not match:
         return None
     return int(match.group("index"))
-
-
-def _link_object_to_collection_counted(mesh_obj, collection) -> bool:
-    if any(obj.name == mesh_obj.name for obj in collection.objects):
-        return False
-    collection.objects.link(mesh_obj)
-    return True
-
-
-def _unlink_object_from_other_region_part_locations(region_collection, mesh_obj, target_part_collection) -> int:
-    region_subtree_ids = {collection.as_pointer() for collection in _iter_collection_subtree(region_collection)}
-    removed = 0
-    for collection in tuple(getattr(mesh_obj, "users_collection", []) or []):
-        if collection == target_part_collection:
-            continue
-        if collection.as_pointer() not in region_subtree_ids:
-            continue
-        if any(obj.name == mesh_obj.name for obj in collection.objects):
-            collection.objects.unlink(mesh_obj)
-            removed += 1
-    return removed
-
-
-
-
-
-
-
-
-
-
-
-
-def _iter_collection_subtree(root_collection):
-    yield root_collection
-    for child_collection in root_collection.children:
-        yield from _iter_collection_subtree(child_collection)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1629,9 +1510,6 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         export_start = time.perf_counter()
         try:
             source_collection = _ensure_export_collection(context)
-            materialize_start = time.perf_counter()
-            part_materialize_result = _materialize_auto_export_part_collections(source_collection)
-            materialize_seconds = time.perf_counter() - materialize_start
             generate_ini = str(getattr(scene, "bmc_export_mode", "BUFFER_ONLY") or "BUFFER_ONLY") == "BUFFER_AND_INI"
             manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
             if manifest_path and os.path.exists(manifest_path):
@@ -1667,33 +1545,19 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
             total_seconds = time.perf_counter() - export_start
             message += (
                 f"; time {total_seconds:.1f}s"
-                f" (parts {materialize_seconds:.1f}s,"
-                f" plan {float(timings.get('plan', 0.0)):.1f}s,"
+                f" (plan {float(timings.get('plan', 0.0)):.1f}s,"
                 f" buffers {float(timings.get('geometry', 0.0)):.1f}s,"
                 f" runtime {float(timings.get('runtime', 0.0)):.1f}s)"
             )
-        if int(part_materialize_result.get("parts", 0) or 0) > 0:
-            message += (
-                f"; auto-parted {int(part_materialize_result.get('regions', 0) or 0)} region(s) "
-                f"into {int(part_materialize_result.get('parts', 0) or 0)} part collection(s)"
-            )
-        _print_export_performance_report(result, materialize_seconds=materialize_seconds)
+        _print_export_performance_report(result)
         self.report({"INFO"}, message)
-        if int(part_materialize_result.get("parts", 0) or 0) > 0:
-            self.report(
-                {"WARNING"},
-                (
-                    "Weighted global bones exceeded 256 in at least one export region; "
-                    "partNN child collections were created from actual mesh weight usage."
-                ),
-            )
-        materialize_warnings = list(part_materialize_result.get("warnings", []) or [])
-        if materialize_warnings:
-            self.report({"WARNING"}, " | ".join(str(item) for item in materialize_warnings[:3]))
+        manifest_warnings = list(result.get("warnings", []) or [])
+        if manifest_warnings:
+            self.report({"WARNING"}, " | ".join(str(item) for item in manifest_warnings[:3]))
         return {"FINISHED"}
 
 
-def _print_export_performance_report(result: dict, *, materialize_seconds: float) -> None:
+def _print_export_performance_report(result: dict) -> None:
     timings = dict(result.get("timings", {}) or {})
     performance = dict(result.get("performance", {}) or {})
     geometry = dict(performance.get("geometry", {}) or {})
@@ -1703,7 +1567,6 @@ def _print_export_performance_report(result: dict, *, materialize_seconds: float
         print(
             "[BMC Export] "
             f"total={float(timings.get('total', 0.0)):.3f}s "
-            f"auto_part={float(materialize_seconds):.3f}s "
             f"setup={float(timings.get('setup', 0.0)):.3f}s "
             f"plan={float(timings.get('plan', 0.0)):.3f}s "
             f"capture_manifest={float(timings.get('capture_manifest', 0.0)):.3f}s "

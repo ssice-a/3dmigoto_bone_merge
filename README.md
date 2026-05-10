@@ -14,7 +14,7 @@ The current workflow is manifest-driven. Presets, legacy target scans, and INI r
 6. Optionally set `LOD FrameAnalysis Dir`, then run `Analyze LOD`.
 7. Set `Output Dir`, choose `Buffer Only` or `Buffer + INI`, then run `Export`.
 
-The export root is the single source of truth. Child collections under the export root represent final runtime IB regions, and optional `partNN` children split a region when its actually weighted global vertex groups exceed 256.
+The export root is the single source of truth. Child collections under the export root represent final runtime IB regions. Direct meshes in a region become implicit `part00` sharing one buffer/palette, but each mesh keeps its own draw range. Optional `partNN` children define explicit exported parts and are required for nested mesh collections.
 
 ## Runtime Shape
 

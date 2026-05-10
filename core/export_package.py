@@ -175,6 +175,12 @@ def build_export_plan(
             used_part_indices_by_region.setdefault(source.region.key, set()),
             max_bones_per_part=max_bones_per_part,
         )
+        if len(split_sources) > 1:
+            warnings.append(
+                f"{source.region.collection_name}/{source.source_part_name}: "
+                f"virtually split into {len(split_sources)} exported part(s) because the palette exceeds "
+                f"{max_bones_per_part} bones; Blender collection membership was not changed"
+            )
         planned_parts.extend(split_sources)
 
     _validate_single_part_membership(planned_parts)
@@ -240,10 +246,12 @@ def _collect_region_part_sources(region_collection, identity: ExportRegionIdenti
     direct_meshes = tuple(obj for obj in getattr(region_collection, "objects", []) or [] if _is_mesh_object(obj))
     explicit_part_collections: dict[int, object] = {}
     duplicate_part_indices: set[int] = set()
+    non_part_children: list[object] = []
 
     for child in getattr(region_collection, "children", []) or []:
         part_index = parse_part_collection_index(getattr(child, "name", ""))
         if part_index is None:
+            non_part_children.append(child)
             continue
         if part_index in explicit_part_collections:
             duplicate_part_indices.add(part_index)
@@ -253,8 +261,28 @@ def _collect_region_part_sources(region_collection, identity: ExportRegionIdenti
         duplicate = min(duplicate_part_indices)
         raise ExportPlanError(f"{identity.collection_name}: duplicate part{duplicate:02d} collection")
 
+    child_mesh_collections = [
+        str(getattr(child, "name", "") or "")
+        for child in non_part_children
+        if _collection_has_meshes_recursive(child)
+    ]
+    if child_mesh_collections:
+        names = ", ".join(child_mesh_collections[:5])
+        suffix = "" if len(child_mesh_collections) <= 5 else ", ..."
+        raise ExportPlanError(
+            f"{identity.collection_name}: child collection(s) with meshes must be named partNN. "
+            f"Rename or move these collection(s): {names}{suffix}"
+        )
+
     sources: list[_PartSource] = []
     if explicit_part_collections:
+        if direct_meshes:
+            names = ", ".join(str(getattr(obj, "name", "") or "") for obj in direct_meshes[:5])
+            suffix = "" if len(direct_meshes) <= 5 else ", ..."
+            raise ExportPlanError(
+                f"{identity.collection_name}: direct mesh object(s) are not allowed when partNN collections exist. "
+                f"Move them into an explicit part00 collection: {names}{suffix}"
+            )
         for part_index, part_collection in sorted(explicit_part_collections.items()):
             mesh_objects = tuple(_iter_mesh_objects_recursive(part_collection))
             if not mesh_objects:
@@ -266,35 +294,10 @@ def _collect_region_part_sources(region_collection, identity: ExportRegionIdenti
                     source_part_name=str(getattr(part_collection, "name", "") or f"part{part_index:02d}"),
                     mesh_objects=mesh_objects,
                 )
-            )
-        if direct_meshes:
-            warnings.append(
-                f"{identity.collection_name}: direct mesh object(s) were planned as implicit part00; "
-                "Prepare Export may migrate them into part00."
-            )
-            existing = next((source for source in sources if source.part_index == 0), None)
-            if existing is None:
-                sources.append(
-                    _PartSource(
-                        region=identity,
-                        part_index=0,
-                        source_part_name="part00",
-                        mesh_objects=direct_meshes,
-                    )
-                )
-            else:
-                sources.remove(existing)
-                sources.append(
-                    _PartSource(
-                        region=existing.region,
-                        part_index=existing.part_index,
-                        source_part_name=existing.source_part_name,
-                        mesh_objects=tuple(existing.mesh_objects) + direct_meshes,
-                    )
-                )
+        )
         return sorted(sources, key=lambda source: source.part_index)
 
-    mesh_objects = tuple(_iter_mesh_objects_recursive(region_collection))
+    mesh_objects = direct_meshes
     if not mesh_objects:
         return []
     return [
@@ -323,6 +326,10 @@ def _iter_mesh_objects_recursive(collection):
             yield from walk(child)
 
     yield from walk(collection)
+
+
+def _collection_has_meshes_recursive(collection) -> bool:
+    return any(True for _obj in _iter_mesh_objects_recursive(collection))
 
 
 def _build_object_usages(source: _PartSource, collect_used_groups) -> tuple[ExportObjectUsage, ...]:

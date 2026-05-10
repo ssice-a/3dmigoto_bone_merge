@@ -112,8 +112,9 @@ def prepare_export_collection(
         "warnings": list(export_plan.warnings),
         "note": (
             "Export Root Collection child collections are final IB regions. "
-            "Each region exports one implicit part00 or explicit partNN collections. "
-            "Prepare Export writes per-part palettes without mutating source vertex groups."
+            "A region without partNN children exports its direct mesh objects as implicit part00 with per-object draw ranges. "
+            "A region with partNN children exports only mesh objects under those explicit part collections. "
+            "Prepare Export writes buffers without mutating collection membership or source vertex groups."
         ),
     }
     manifest_dir = ensure_directory(internal_manifest_dir or normalized_output_dir)
@@ -140,6 +141,7 @@ def prepare_export_collection(
         "hlsl_dir": hlsl_dir,
         "objects": len(object_records),
         "palettes": len(palette_records),
+        "warnings": list(export_plan.warnings),
         "timings": {name: round(seconds, 3) for name, seconds in timings.items()},
         "performance": {
             "geometry": _geometry_performance_summary(geometry_records),
@@ -250,7 +252,6 @@ def regenerate_bonestore_runtime_files(
         export_options = dict(export_manifest.get("export_options", {}) or {}) if isinstance(export_manifest, dict) else {}
         filter_residual = bool(export_options.get("filter_residual", True))
     geometry_records = list(export_manifest.get("geometry_buffers", []) or []) if isinstance(export_manifest, dict) else []
-    _attach_object_names_to_geometry_records(geometry_records, list(export_manifest.get("objects", []) or []))
     texture_mark_payload = dict(export_manifest.get("texture_marks", {}) or {}) if isinstance(export_manifest, dict) else {}
     runtime_plan = materialize_bonestore_runtime(
         output_dir,
@@ -316,39 +317,6 @@ def _read_texture_marks_for_export(context, source_collection) -> dict:
         raw_payload = str(context.scene.bmc_texture_marks_json or "")
     payload = load_texture_mark_payload(raw_payload)
     return payload if payload.get("marks") else {}
-
-
-def _attach_object_names_to_geometry_records(geometry_records: list[dict], object_records: list[dict]) -> None:
-    names_by_part: dict[tuple[str, int, int, int], list[str]] = {}
-    for object_record in object_records:
-        key = (
-            str(object_record.get("host_ib_hash", "") or object_record.get("ib_hash", "") or "").lower(),
-            int(object_record.get("host_match_first_index", object_record.get("match_first_index", 0)) or 0),
-            int(object_record.get("host_match_index_count", object_record.get("match_index_count", 0)) or 0),
-            int(object_record.get("part_index", object_record.get("chunk_index", 0)) or 0),
-        )
-        object_name = str(object_record.get("object", object_record.get("object_name", "")) or "").strip()
-        if not key[0] or key[2] <= 0 or not object_name:
-            continue
-        bucket = names_by_part.setdefault(key, [])
-        if object_name not in bucket:
-            bucket.append(object_name)
-
-    if not names_by_part:
-        return
-
-    for geometry_record in geometry_records:
-        if geometry_record.get("object_names"):
-            continue
-        key = (
-            str(geometry_record.get("ib_hash", "") or "").lower(),
-            int(geometry_record.get("match_first_index", 0) or 0),
-            int(geometry_record.get("match_index_count", 0) or 0),
-            int(geometry_record.get("part_index", geometry_record.get("chunk_index", 0)) or 0),
-        )
-        names = names_by_part.get(key)
-        if names:
-            geometry_record["object_names"] = list(names)
 
 
 def _local_palette_record_from_export_record(record: dict) -> LocalPaletteRecord:

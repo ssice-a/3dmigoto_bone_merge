@@ -234,6 +234,7 @@ def _build_lod_capture_bone_map(capture_manifest: dict) -> tuple[list[dict], lis
                 "match_index_count": int(lod_record.get("lod_match_index_count", 0) or 0),
                 "capture_draw_indices": _int_list(lod_record.get("lod_capture_draw_indices", lod_record.get("capture_draw_indices", []))),
                 "import_draw_index": int(lod_record.get("lod_import_draw_index", lod_record.get("import_draw_index", -1)) or -1),
+                "canonical_global_bones": sorted({int(canonical_global_bone) for _lod_local_bone, canonical_global_bone in pairs}),
                 "pair_base": pair_base,
                 "pair_count": len(pairs),
                 "dispatch_rows": len(pairs) * 3,
@@ -328,12 +329,37 @@ def _normalize_geometry_records(output_directory: str, geometry_records: list[di
                 "part_index": part_index,
                 "resource_suffix": suffix,
                 "index_count": int(index_buffer.get("index_count", 0) or 0),
+                "object_draws": _normalize_object_draws(record, int(index_buffer.get("index_count", 0) or 0)),
                 "index_resource_name": f"ResourcePart_{suffix}_Index",
                 "index_filename": _resource_filename(index_file_path, output_directory) if index_file_path else str(index_buffer.get("file_name", "") or ""),
                 "vertex_buffers": vertex_buffers,
             }
         )
     return normalized_records
+
+
+def _normalize_object_draws(record: dict, index_count: int) -> list[dict]:
+    draws: list[dict] = []
+    for raw_draw in record.get("object_draws", []) or []:
+        draw = dict(raw_draw or {})
+        count = int(draw.get("index_count", 0) or 0)
+        if count <= 0:
+            continue
+        start_index = int(draw.get("start_index", 0) or 0)
+        if start_index < 0 or start_index >= int(index_count):
+            continue
+        count = min(count, int(index_count) - start_index)
+        draws.append(
+            {
+                "object_name": str(draw.get("object_name", "") or ""),
+                "start_index": start_index,
+                "index_count": count,
+                "base_vertex": int(draw.get("base_vertex", 0) or 0),
+                "start_vertex": int(draw.get("start_vertex", 0) or 0),
+                "vertex_count": int(draw.get("vertex_count", 0) or 0),
+            }
+        )
+    return draws
 
 
 def _materialize_texture_records(output_directory: str, texture_mark_payload: dict) -> tuple[list[dict], list[str]]:
@@ -602,6 +628,11 @@ def _build_lod_shadow_replay_plan(
     host_key, host_draw_index, host_source = _select_lod_shadow_host(stage, lod_capture_records)
     if not _is_valid_override_key(host_key) or not geometry_records or not lod_replay_links:
         return {"enabled": False, "reason": "missing_lod_host_or_geometry"}
+    available_globals, coverage_records = _lod_shadow_available_globals_before_host(
+        lod_capture_records,
+        host_draw_index=int(host_draw_index),
+        stage=stage,
+    )
 
     roles_by_main_key = _shadow_roles_by_key(capture_manifest)
     geometry_by_suffix = {
@@ -611,30 +642,64 @@ def _build_lod_shadow_replay_plan(
     transparent_parts: list[str] = []
     normal_parts: list[str] = []
     skipped_keys: set[tuple[str, int, int]] = set()
+    missing_links: list[dict] = []
 
     for link in lod_replay_links:
         lod_key = _key_from_payload(dict(link.get("lod_key", {}) or {}))
         if not _is_valid_override_key(lod_key):
             continue
-        any_shadow_part = False
+        link_transparent_parts: list[str] = []
+        link_normal_parts: list[str] = []
+        required_globals: set[int] = set()
         for geometry_item in _lod_link_geometry_items(link):
             suffix = str(geometry_item.get("resource_suffix", "") or "")
-            if suffix not in geometry_by_suffix:
+            geometry_record = geometry_by_suffix.get(suffix)
+            if geometry_record is None:
                 continue
             main_key = _key_from_payload(dict(geometry_item.get("main_key", {}) or {}))
             main_roles = roles_by_main_key.get(main_key, set())
             if not main_roles.intersection({"transparent_shadow", "normal_shadow"}):
                 continue
-            any_shadow_part = True
-            if "transparent_shadow" in main_roles and suffix not in transparent_parts:
+            required_globals.update(_geometry_required_global_bones(geometry_record))
+            if "transparent_shadow" in main_roles and suffix not in link_transparent_parts:
+                link_transparent_parts.append(suffix)
+            if "normal_shadow" in main_roles and suffix not in link_normal_parts:
+                link_normal_parts.append(suffix)
+        if not link_transparent_parts and not link_normal_parts:
+            continue
+        missing_globals = sorted(required_globals.difference(available_globals))
+        if missing_globals:
+            missing_links.append(
+                {
+                    "lod_key": _key_payload(lod_key),
+                    "geometry_suffixes": [*link_transparent_parts, *[suffix for suffix in link_normal_parts if suffix not in link_transparent_parts]],
+                    "required_global_count": len(required_globals),
+                    "available_global_count": len(available_globals),
+                    "missing_global_bones": missing_globals[:64],
+                    "missing_global_count": len(missing_globals),
+                }
+            )
+            continue
+        for suffix in link_transparent_parts:
+            if suffix not in transparent_parts:
                 transparent_parts.append(suffix)
-            if "normal_shadow" in main_roles and suffix not in normal_parts:
+        for suffix in link_normal_parts:
+            if suffix not in normal_parts:
                 normal_parts.append(suffix)
-        if any_shadow_part:
-            skipped_keys.add(lod_key)
+        skipped_keys.add(lod_key)
 
     if not transparent_parts and not normal_parts:
-        return {"enabled": False, "reason": "no_lod_exported_shadow_parts"}
+        reason = "lod_shadow_coverage_incomplete" if missing_links else "no_lod_exported_shadow_parts"
+        return {
+            "enabled": False,
+            "reason": reason,
+            "host_key": _key_payload(host_key),
+            "host_draw_index": int(host_draw_index),
+            "host_source": host_source,
+            "available_global_count": len(available_globals),
+            "coverage_record_count": len(coverage_records),
+            "missing_links": missing_links,
+        }
 
     return {
         "enabled": True,
@@ -646,35 +711,66 @@ def _build_lod_shadow_replay_plan(
         "transparent_parts": transparent_parts,
         "normal_parts": normal_parts,
         "skip_keys": [_key_payload(key) for key in sorted(skipped_keys)],
+        "available_global_count": len(available_globals),
+        "coverage_record_count": len(coverage_records),
+        "missing_links": missing_links,
     }
 
 
-def _select_lod_shadow_host(stage: dict, lod_capture_records: list[dict]) -> tuple[tuple[str, int, int], int, str]:
-    fallback_key = (
+def _select_lod_shadow_host(stage: dict, _lod_capture_records: list[dict]) -> tuple[tuple[str, int, int], int, str]:
+    host_key = (
         str(stage.get("host_ib_hash", "") or "").lower(),
         int(stage.get("host_match_first_index", 0) or 0),
         int(stage.get("host_match_index_count", 0) or 0),
     )
-    fallback_draw = int(stage.get("host_draw_index", -1) or -1)
+    host_draw = int(stage.get("host_draw_index", -1) or -1)
+    return host_key, host_draw, "lod_shadow_stage_host"
+
+
+def _lod_shadow_available_globals_before_host(
+    lod_capture_records: list[dict],
+    *,
+    host_draw_index: int,
+    stage: dict,
+) -> tuple[set[int], list[dict]]:
+    if int(host_draw_index) < 0:
+        return set(), []
+
     stage_start = int(stage.get("stage_draw_start", -1) or -1)
     stage_end = int(stage.get("stage_draw_end", -1) or -1)
-    candidates: list[tuple[int, tuple[str, int, int]]] = []
+    available_globals: set[int] = set()
+    coverage_records: list[dict] = []
+
     for record in lod_capture_records or []:
-        key = _override_key(record)
-        if not _is_valid_override_key(key):
-            continue
         draw_indices = [
             int(value)
             for value in record.get("capture_draw_indices", []) or []
-            if int(value) >= 0 and _draw_index_in_optional_stage_window(int(value), stage_start, stage_end)
+            if int(value) >= 0
+            and int(value) <= int(host_draw_index)
+            and _draw_index_in_optional_stage_window(int(value), stage_start, stage_end)
         ]
         if not draw_indices:
             continue
-        candidates.append((max(draw_indices), key))
-    if candidates:
-        draw_index, key = max(candidates, key=lambda item: (int(item[0]), item[1]))
-        return key, int(draw_index), "latest_lod_capture_draw"
-    return fallback_key, fallback_draw, "lod_shadow_stage_fallback"
+
+        globals_for_record = {
+            int(value)
+            for value in record.get("canonical_global_bones", []) or []
+            if int(value) >= 0
+        }
+        if not globals_for_record:
+            continue
+
+        available_globals.update(globals_for_record)
+        coverage_records.append(
+            {
+                "record_index": int(record.get("record_index", -1) or -1),
+                "draw_index": max(draw_indices),
+                "key": _key_payload(_override_key(record)),
+                "global_count": len(globals_for_record),
+            }
+        )
+
+    return available_globals, coverage_records
 
 
 def _shadow_roles_by_key(capture_manifest: dict) -> dict[tuple[str, int, int], set[str]]:
@@ -810,22 +906,37 @@ def _key_payload(key: tuple[str, int, int]) -> dict:
 
 
 def _attach_palette_metadata_to_geometry(geometry_records: list[dict], palette_records: list[dict]) -> None:
-    local_counts = {
-        str(record.get("resource_suffix", "") or ""): int(record.get("local_bone_count", 0) or 0)
-        for record in palette_records
-    }
+    metadata_by_suffix: dict[str, dict] = {}
+    for record in palette_records:
+        suffix = str(record.get("resource_suffix", "") or "")
+        if not suffix:
+            continue
+        metadata_by_suffix[suffix] = {
+            "local_bone_count": int(record.get("local_bone_count", 0) or 0),
+            "palette_values": [int(value) for value in record.get("palette_values", []) or [] if int(value) >= 0],
+        }
     missing_suffixes: list[str] = []
     for record in geometry_records:
         suffix = str(record.get("resource_suffix", "") or "")
-        if suffix not in local_counts:
+        metadata = metadata_by_suffix.get(suffix)
+        if metadata is None:
             missing_suffixes.append(suffix)
             continue
-        record["local_bone_count"] = local_counts[suffix]
+        record["local_bone_count"] = int(metadata["local_bone_count"])
+        record["palette_values"] = list(metadata["palette_values"])
     if missing_suffixes:
         raise ValueError(
             "Geometry buffer(s) are missing matching PartLocalToGlobalBoneMap palette record(s): "
             + ", ".join(missing_suffixes[:8])
         )
+
+
+def _geometry_required_global_bones(geometry_record: dict) -> set[int]:
+    return {
+        int(value)
+        for value in geometry_record.get("palette_values", []) or []
+        if int(value) >= 0
+    }
 
 
 def _validate_palette_globals(capture_manifest: dict, palette_records: list[dict]) -> None:
@@ -1433,12 +1544,40 @@ def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
     vb0 = vertex_buffers.get("vb0")
     if vb0:
         lines.append(f"{indent}vb3 = {vb0.get('resource_name')}")
-    index_count = int(record.get("index_count", 0) or 0)
-    object_comment = _blender_object_comment(record)
-    if object_comment:
-        lines.append(f"{indent}; Blender objects: {object_comment}")
-    lines.append(f"{indent}drawindexedinstanced = {index_count},INSTANCE_COUNT,0,0,FIRST_INSTANCE")
+    for draw in _draw_ranges_for_record(record):
+        object_comment = _draw_object_comment(draw, record)
+        if object_comment:
+            lines.append(f"{indent}; Blender objects: {object_comment}")
+        index_count = int(draw.get("index_count", 0) or 0)
+        start_index = int(draw.get("start_index", 0) or 0)
+        base_vertex = int(draw.get("base_vertex", 0) or 0)
+        lines.append(f"{indent}drawindexedinstanced = {index_count},INSTANCE_COUNT,{start_index},{base_vertex},FIRST_INSTANCE")
     return lines
+
+
+def _draw_ranges_for_record(record: dict) -> list[dict]:
+    ranges = [
+        dict(draw or {})
+        for draw in record.get("object_draws", []) or []
+        if int(dict(draw or {}).get("index_count", 0) or 0) > 0
+    ]
+    if ranges:
+        return ranges
+    return [
+        {
+            "object_name": "",
+            "start_index": 0,
+            "index_count": int(record.get("index_count", 0) or 0),
+            "base_vertex": 0,
+        }
+    ]
+
+
+def _draw_object_comment(draw: dict, record: dict) -> str:
+    object_name = str(draw.get("object_name", "") or "").replace("\n", " ").replace("\r", " ")
+    if object_name:
+        return object_name
+    return _blender_object_comment(record)
 
 
 def _blender_object_comment(record: dict) -> str:

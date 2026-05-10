@@ -178,6 +178,15 @@ class _PreparedVertexSlot:
     output: bytearray
 
 
+@dataclass(frozen=True)
+class _ObjectDrawRange:
+    object_name: str
+    start_index: int
+    index_count: int
+    start_vertex: int
+    vertex_count: int
+
+
 def write_part_geometry_buffers(
     buffer_dir: str,
     parts: tuple[ExportPartPlan, ...],
@@ -233,7 +242,7 @@ def _write_part_geometry_buffers(
     )
 
     stage_start = time.perf_counter()
-    loop_vertices, indices = _collect_part_loop_vertices(part, export_cache)
+    loop_vertices, indices, object_draws = _collect_part_loop_vertices(part, export_cache)
     timings["collect_loops"] = time.perf_counter() - stage_start
     if not loop_vertices:
         raise ValueError(f"{part.region.key}/{part.part_name}: no triangles to export")
@@ -275,6 +284,17 @@ def _write_part_geometry_buffers(
         "region_collection": part.region.collection_name,
         "part_name": part.part_name,
         "object_names": [usage.name for usage in part.object_usages],
+        "object_draws": [
+            {
+                "object_name": draw.object_name,
+                "start_index": int(draw.start_index),
+                "index_count": int(draw.index_count),
+                "base_vertex": 0,
+                "start_vertex": int(draw.start_vertex),
+                "vertex_count": int(draw.vertex_count),
+            }
+            for draw in object_draws
+        ],
         "ib_hash": part.region.ib_hash,
         "match_first_index": int(part.region.match_first_index),
         "match_index_count": int(part.region.match_index_count),
@@ -358,11 +378,14 @@ def _normalize_vertex_layout(layout: dict) -> dict[str, dict]:
     return normalized
 
 
-def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartCache) -> tuple[list[_LoopVertex], list[int]]:
+def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartCache) -> tuple[list[_LoopVertex], list[int], list[_ObjectDrawRange]]:
     loop_vertices: list[_LoopVertex] = []
     indices: list[int] = []
+    object_draws: list[_ObjectDrawRange] = []
     next_index = 0
     for mesh_obj in part.mesh_objects:
+        object_start_index = len(indices)
+        object_start_vertex = len(loop_vertices)
         mesh = export_cache.object_mesh_cache(mesh_obj).mesh
         if mesh is None:
             continue
@@ -391,7 +414,18 @@ def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartC
                     polygon_loop_vertices[index + 1],
                 )
                 indices.extend(_reverse_triangle_winding(triangle))
-    return loop_vertices, indices
+        object_index_count = len(indices) - object_start_index
+        if object_index_count > 0:
+            object_draws.append(
+                _ObjectDrawRange(
+                    object_name=str(getattr(mesh_obj, "name", "") or ""),
+                    start_index=object_start_index,
+                    index_count=object_index_count,
+                    start_vertex=object_start_vertex,
+                    vertex_count=len(loop_vertices) - object_start_vertex,
+                )
+            )
+    return loop_vertices, indices, object_draws
 
 
 def _prepare_vertex_slot(

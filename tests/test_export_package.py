@@ -250,7 +250,7 @@ class ExportPackageTests(unittest.TestCase):
         self.assertEqual(plan.parts[0].palette_values, (5, 6))
         self.assertEqual(plan.parts[1].palette_values, (1, 6))
 
-    def test_direct_meshes_with_explicit_parts_are_planned_as_part00_with_warning(self):
+    def test_direct_meshes_with_explicit_parts_are_rejected(self):
         root = FakeCollection(
             "ExportRoot",
             children=[
@@ -262,10 +262,22 @@ class ExportPackageTests(unittest.TestCase):
             ],
         )
 
-        plan = export_package.build_export_plan(root, collect_groups)
+        with self.assertRaisesRegex(export_package.ExportPlanError, "Move them into an explicit part00"):
+            export_package.build_export_plan(root, collect_groups)
 
-        self.assertEqual([part.part_name for part in plan.parts], ["part00", "part01"])
-        self.assertIn("direct mesh object", plan.warnings[0])
+    def test_region_child_mesh_collections_must_be_explicit_parts(self):
+        root = FakeCollection(
+            "ExportRoot",
+            children=[
+                FakeCollection(
+                    "bbbbbbbb-20-0",
+                    children=[FakeCollection("loose_child", objects=[FakeObject("loose", [3])])],
+                )
+            ],
+        )
+
+        with self.assertRaisesRegex(export_package.ExportPlanError, "must be named partNN"):
+            export_package.build_export_plan(root, collect_groups)
 
     def test_object_level_split_when_implicit_part_exceeds_limit(self):
         root = FakeCollection(
@@ -311,6 +323,63 @@ class ExportPackageTests(unittest.TestCase):
                 data = handle.read()
 
         self.assertEqual(struct.unpack("<3I", data), (0, 65536, 3))
+
+    def test_one_part_records_per_object_draw_ranges(self):
+        mesh_a = FakeObject(
+            "body",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        mesh_b = FakeObject(
+            "hair",
+            [1],
+            positions=[(0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (0.0, 1.0, 1.0)],
+            triangles=[(0, 1, 2)],
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-6-0", objects=[mesh_a, mesh_b])],
+        )
+        layout = {
+            "640d1c0e-6-0": {
+                "buffers": {
+                    "vb0": {
+                        "slot": "vb0",
+                        "stride": 16,
+                        "elements": [],
+                    }
+                }
+            }
+        }
+
+        plan = export_package.build_export_plan(root, collect_groups)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            records = export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["index_buffer"]["index_count"], 6)
+        self.assertEqual(
+            records[0]["object_draws"],
+            [
+                {
+                    "object_name": "body",
+                    "start_index": 0,
+                    "index_count": 3,
+                    "base_vertex": 0,
+                    "start_vertex": 0,
+                    "vertex_count": 3,
+                },
+                {
+                    "object_name": "hair",
+                    "start_index": 3,
+                    "index_count": 3,
+                    "base_vertex": 0,
+                    "start_vertex": 3,
+                    "vertex_count": 3,
+                },
+            ],
+        )
 
     def test_prepare_export_buffer_only_writes_runtime_buffers_but_skips_ini_and_hlsl(self):
         with tempfile.TemporaryDirectory() as tmpdir:

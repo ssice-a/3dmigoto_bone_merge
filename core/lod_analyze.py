@@ -42,6 +42,9 @@ _MIN_BONE_MATCH_SCORE = 0.01
 _MIN_BONE_MATCH_VOTES = 1
 _LOD_BONE_MATCH_TOLERANCE_SCALES = (2.0, 4.0)
 _LOD_BONE_MATCH_FALLBACK_RATIO = 0.95
+_LOD_SLOT_DIRECT_ABS_TOLERANCE = 4
+_LOD_SLOT_DIRECT_RATIO_TOLERANCE = 0.20
+_LOD_SLOT_NEAR_RATIO_TOLERANCE = 0.35
 
 
 @dataclass(frozen=True)
@@ -109,8 +112,9 @@ def analyze_lod_for_manifest(
         canonical_global_count,
         ignored_global_bones=ignored_global_bones,
     )
+    global_candidates = _mapping_global_candidates(mapping)
+    links = _build_lod_links(main_records, lod_records, global_candidates)
     capture_records = _build_lod_capture_records(lod_records, mapping["global_to_lod"])
-    links = _build_lod_links(main_records, lod_records, mapping["global_to_lod"])
     review = review_lod_global_pool_coverage(canonical_manifest, capture_records)
     variant_id = _build_lod_variant_id(normalized_lod_dir, capture_records)
     generated_at = datetime.now(timezone.utc).isoformat()
@@ -185,12 +189,15 @@ def build_lod_scatter_mapping(
         if matched_count >= max(4, int(len(lod_points) * 0.2)):
             break
 
+    candidates_by_global: dict[int, list[dict]] = {}
     best_by_global: dict[int, tuple[tuple[str, int], dict]] = {}
     for (lod_key, lod_local_bone, canonical_global), stats in best_stats.items():
         if int(canonical_global) < 0 or int(canonical_global) >= int(canonical_global_count):
             continue
         if float(stats["score"]) < _MIN_PAIR_SCORE:
             continue
+        candidate = _lod_mapping_entry(canonical_global, lod_key, lod_local_bone, stats)
+        candidates_by_global.setdefault(int(canonical_global), []).append(candidate)
         current = best_by_global.get(int(canonical_global))
         if current is None or _pair_rank(stats) > _pair_rank(current[1]):
             best_by_global[int(canonical_global)] = ((str(lod_key), int(lod_local_bone)), stats)
@@ -224,17 +231,21 @@ def build_lod_scatter_mapping(
             )
             continue
         (lod_key, lod_local_bone), stats = selected
-        entry = {
-            "canonical_global_bone": int(canonical_global),
-            "lod_record_key": lod_key,
-            "lod_local_bone": int(lod_local_bone),
-            "score": float(stats["score"]),
-            "votes": int(stats["votes"]),
-            "average_distance": float(stats["distance_sum"]) / max(1, int(stats["votes"])),
-            "status": "matched",
-        }
+        entry = _lod_mapping_entry(canonical_global, lod_key, lod_local_bone, stats)
         mapping_entries.append(entry)
         global_to_lod[int(canonical_global)] = entry
+
+    for canonical_global, candidates in list(candidates_by_global.items()):
+        candidates_by_global[int(canonical_global)] = sorted(
+            candidates,
+            key=lambda entry: (
+                -float(entry.get("score", 0.0)),
+                -int(entry.get("votes", 0)),
+                float(entry.get("average_distance", 0.0)),
+                str(entry.get("lod_record_key", "")),
+                int(entry.get("lod_local_bone", -1)),
+            ),
+        )
 
     unmatched_count = sum(1 for entry in mapping_entries if str(entry["status"]) == "unmatched")
     required_global_count = max(0, int(canonical_global_count) - len(ignored_global_bones))
@@ -260,6 +271,7 @@ def build_lod_scatter_mapping(
 
     return {
         "global_to_lod": global_to_lod,
+        "global_candidates": candidates_by_global,
         "mapping_entries": mapping_entries,
         "validation": validation,
         "matched_vertex_count": best_matched_count,
@@ -303,6 +315,7 @@ def build_lod_bone_cloud_mapping(
         if matched_count >= max(1, int((canonical_global_count - len(ignored_global_bones)) * _LOD_BONE_MATCH_FALLBACK_RATIO)):
             break
 
+    candidates_by_global: dict[int, list[dict]] = {}
     best_by_global: dict[int, tuple[tuple[str, int], dict]] = {}
     for (lod_key, lod_local_bone, canonical_global), stats in best_stats.items():
         if int(canonical_global) < 0 or int(canonical_global) >= int(canonical_global_count):
@@ -311,6 +324,8 @@ def build_lod_bone_cloud_mapping(
             continue
         if not _bone_match_stats_accepted(stats):
             continue
+        candidate = _lod_mapping_entry(canonical_global, lod_key, lod_local_bone, stats)
+        candidates_by_global.setdefault(int(canonical_global), []).append(candidate)
         current = best_by_global.get(int(canonical_global))
         if current is None or _pair_rank(stats) > _pair_rank(current[1]):
             best_by_global[int(canonical_global)] = ((str(lod_key), int(lod_local_bone)), stats)
@@ -344,17 +359,21 @@ def build_lod_bone_cloud_mapping(
             )
             continue
         (lod_key, lod_local_bone), stats = selected
-        entry = {
-            "canonical_global_bone": int(canonical_global),
-            "lod_record_key": lod_key,
-            "lod_local_bone": int(lod_local_bone),
-            "score": float(stats["score"]),
-            "votes": int(stats["votes"]),
-            "average_distance": float(stats["distance_sum"]) / max(1, int(stats["votes"])),
-            "status": "matched",
-        }
+        entry = _lod_mapping_entry(canonical_global, lod_key, lod_local_bone, stats)
         mapping_entries.append(entry)
         global_to_lod[int(canonical_global)] = entry
+
+    for canonical_global, candidates in list(candidates_by_global.items()):
+        candidates_by_global[int(canonical_global)] = sorted(
+            candidates,
+            key=lambda entry: (
+                -float(entry.get("score", 0.0)),
+                -int(entry.get("votes", 0)),
+                float(entry.get("average_distance", 0.0)),
+                str(entry.get("lod_record_key", "")),
+                int(entry.get("lod_local_bone", -1)),
+            ),
+        )
 
     unmatched_count = sum(1 for entry in mapping_entries if str(entry["status"]) == "unmatched")
     required_global_count = max(0, int(canonical_global_count) - len(ignored_global_bones))
@@ -380,6 +399,7 @@ def build_lod_bone_cloud_mapping(
 
     return {
         "global_to_lod": global_to_lod,
+        "global_candidates": candidates_by_global,
         "mapping_entries": mapping_entries,
         "validation": validation,
         "matched_vertex_count": best_matched_count,
@@ -544,6 +564,19 @@ def _count_matched_globals_from_stats(
 
 def _bone_match_stats_accepted(stats: dict) -> bool:
     return float(stats.get("score", 0.0)) >= _MIN_BONE_MATCH_SCORE and int(stats.get("votes", 0)) >= _MIN_BONE_MATCH_VOTES
+
+
+def _lod_mapping_entry(canonical_global: int, lod_key: str, lod_local_bone: int, stats: dict) -> dict:
+    votes = max(1, int(stats.get("votes", 0)))
+    return {
+        "canonical_global_bone": int(canonical_global),
+        "lod_record_key": str(lod_key),
+        "lod_local_bone": int(lod_local_bone),
+        "score": float(stats.get("score", 0.0)),
+        "votes": int(stats.get("votes", 0)),
+        "average_distance": float(stats.get("distance_sum", 0.0)) / votes,
+        "status": "matched",
+    }
 
 
 def _analyze_main_frameanalysis_cached(frameanalysis_dir: str) -> dict:
@@ -798,6 +831,7 @@ def _build_canonical_point_cloud(canonical_manifest: dict) -> tuple[list[Weighte
         if candidate is None or not remap:
             continue
         geometry = _load_candidate_point_geometry(candidate, frameanalysis_dir)
+        vb2_signature = _vb2_signature_from_geometry(geometry, record.get("used_local_bone_indices"))
         points.extend(_geometry_points(geometry, _canonical_weight_resolver(remap)))
         main_records.append(
             {
@@ -807,6 +841,8 @@ def _build_canonical_point_cloud(canonical_manifest: dict) -> tuple[list[Weighte
                 "match_index_count": int(record.get("match_index_count", 0) or 0),
                 "global_bone_base": global_base,
                 "local_bone_count": local_count,
+                "used_local_bone_indices": [int(value) for value in record.get("used_local_bone_indices", []) or []],
+                "vb2_signature": vb2_signature,
             }
         )
     result = (points, canonical_global_count, main_records)
@@ -843,8 +879,9 @@ def _build_lod_point_cloud(
             continue
         source_key = _source_key_from_candidate(candidate)
         geometry = _load_candidate_point_geometry(candidate, frameanalysis_dir)
+        vb2_signature = _vb2_signature_from_geometry(geometry, candidate.get("used_local_bone_indices"))
         points.extend(_geometry_points(geometry, _lod_weight_resolver(source_key)))
-        lod_records[source_key] = _lod_record_payload(candidate, source_key)
+        lod_records[source_key] = _lod_record_payload(candidate, source_key, vb2_signature=vb2_signature)
     result = (points, lod_records, skipped_main_hash_count)
     _POINT_CLOUD_CACHE[cache_key] = result
     return result
@@ -980,6 +1017,83 @@ def _load_candidate_point_geometry(candidate: dict, frameanalysis_dir: str) -> P
     )
     _POINT_GEOMETRY_CACHE[cache_key] = geometry
     return geometry
+
+
+def _vb2_signature_from_geometry(geometry: PointGeometry, declared_used_slots=None) -> dict:
+    declared_slots = sorted({int(value) for value in (declared_used_slots or []) if int(value) >= 0})
+    np = optional_numpy()
+    if np is None:
+        used_slots: set[int] = set()
+        weighted_vertex_count = 0
+        influence_hist = [0, 0, 0, 0, 0]
+        for indices, weights in zip(geometry.blend_indices, geometry.blend_weights):
+            influence_count = 0
+            for local_bone, weight in zip(indices[:4], weights[:4]):
+                if float(weight) <= _WEIGHT_EPSILON:
+                    continue
+                influence_count += 1
+                used_slots.add(int(local_bone))
+            if influence_count:
+                weighted_vertex_count += 1
+            influence_hist[min(4, influence_count)] += 1
+        used_list = sorted(used_slots) if used_slots else declared_slots
+        return _vb2_signature_payload(geometry.positions, used_list, weighted_vertex_count, influence_hist)
+
+    weights = np.asarray(geometry.blend_weights, dtype=np.float64).reshape((-1, 4)) if len(geometry.blend_weights) else np.zeros((0, 4), dtype=np.float64)
+    indices = np.asarray(geometry.blend_indices, dtype=np.int64).reshape((-1, 4)) if len(geometry.blend_indices) else np.zeros((0, 4), dtype=np.int64)
+    valid = weights > float(_WEIGHT_EPSILON)
+    if valid.size:
+        used = indices[valid]
+        used = used[used >= 0]
+        used_slots = sorted(int(value) for value in np.unique(used)) if used.size else declared_slots
+        influence_counts = valid.sum(axis=1).astype(np.int64)
+        influence_hist_array = np.bincount(np.minimum(influence_counts, 4), minlength=5)
+        influence_hist = [int(value) for value in influence_hist_array[:5]]
+        weighted_vertex_count = int(np.count_nonzero(influence_counts))
+    else:
+        used_slots = declared_slots
+        influence_hist = [0, 0, 0, 0, 0]
+        weighted_vertex_count = 0
+    return _vb2_signature_payload(geometry.positions, used_slots, weighted_vertex_count, influence_hist)
+
+
+def _vb2_signature_payload(
+    positions,
+    used_slots: list[int],
+    weighted_vertex_count: int,
+    influence_hist: list[int],
+) -> dict:
+    position_count = len(positions)
+    center = (0.0, 0.0, 0.0)
+    diag = 0.0
+    np = optional_numpy()
+    if np is not None and position_count:
+        values = np.asarray(positions, dtype=np.float64).reshape((-1, 3))
+        center_values = values.mean(axis=0)
+        center = (float(center_values[0]), float(center_values[1]), float(center_values[2]))
+        mins = values.min(axis=0)
+        maxs = values.max(axis=0)
+        delta = maxs - mins
+        diag = float(np.sqrt(float(np.dot(delta, delta))))
+    elif position_count:
+        center = (
+            sum(float(position[0]) for position in positions) / position_count,
+            sum(float(position[1]) for position in positions) / position_count,
+            sum(float(position[2]) for position in positions) / position_count,
+        )
+        diag = _positions_diag(list(positions))
+    return {
+        "slot_count": int(len(used_slots)),
+        "used_slots": [int(value) for value in used_slots],
+        "slot_min": int(min(used_slots)) if used_slots else -1,
+        "slot_max": int(max(used_slots)) if used_slots else -1,
+        "slot_span": int(max(used_slots) - min(used_slots) + 1) if used_slots else 0,
+        "vertex_count": int(position_count),
+        "weighted_vertex_count": int(weighted_vertex_count),
+        "influence_hist": [int(value) for value in (influence_hist + [0, 0, 0, 0, 0])[:5]],
+        "center": [float(center[0]), float(center[1]), float(center[2])],
+        "diag": float(diag),
+    }
 
 
 def _point_geometry_cache_key(candidate: dict, frameanalysis_dir: str, ib_txt_path: str, ib_buf_path: str) -> tuple:
@@ -1221,21 +1335,149 @@ def _build_lod_capture_records(lod_records: dict[str, dict], global_to_lod: dict
     return records
 
 
-def _build_lod_links(main_records: list[dict], lod_records: dict[str, dict], global_to_lod: dict[int, dict]) -> list[dict]:
+def _mapping_global_candidates(mapping: dict) -> dict[int, list[dict]]:
+    candidates = mapping.get("global_candidates")
+    if isinstance(candidates, dict):
+        return {
+            int(canonical_global): [
+                dict(candidate)
+                for candidate in _iter_mapping_candidates(raw_candidates)
+                if str(candidate.get("lod_record_key", "") or "")
+            ]
+            for canonical_global, raw_candidates in candidates.items()
+        }
+    return {
+        int(canonical_global): [dict(entry)]
+        for canonical_global, entry in dict(mapping.get("global_to_lod", {}) or {}).items()
+        if str(dict(entry).get("lod_record_key", "") or "")
+    }
+
+
+def _iter_mapping_candidates(raw_candidates) -> list[dict]:
+    if raw_candidates is None:
+        return []
+    if isinstance(raw_candidates, dict):
+        return [raw_candidates]
+    if isinstance(raw_candidates, (list, tuple)):
+        return [candidate for candidate in raw_candidates if isinstance(candidate, dict)]
+    return []
+
+
+def _best_candidate_by_lod(candidates: list[dict]) -> dict[str, dict]:
+    best: dict[str, dict] = {}
+    for candidate in candidates:
+        lod_key = str(candidate.get("lod_record_key", "") or "")
+        if not lod_key:
+            continue
+        current = best.get(lod_key)
+        if current is None or _mapping_entry_rank(candidate) > _mapping_entry_rank(current):
+            best[lod_key] = dict(candidate)
+    return best
+
+
+def _mapping_entry_rank(entry: dict) -> tuple[float, int, float]:
+    return (
+        float(entry.get("score", 0.0)),
+        int(entry.get("votes", 0)),
+        -float(entry.get("average_distance", 0.0)),
+    )
+
+
+def _build_lod_links(main_records: list[dict], lod_records: dict[str, dict], global_to_lod: dict[int, object]) -> list[dict]:
+    direct_links = _build_lod_links_from_vb2_signatures(main_records, lod_records)
+    used_lod_keys = {
+        str(source.get("lod_record_key", "") or "")
+        for link in direct_links
+        for source in link.get("lod_sources", []) or []
+        if str(source.get("lod_record_key", "") or "")
+    }
+    fallback_allowed = set(lod_records).difference(used_lod_keys)
+    fallback_links = _build_lod_links_from_bone_candidates(
+        main_records,
+        lod_records,
+        global_to_lod,
+        allowed_lod_keys=fallback_allowed if used_lod_keys else None,
+    )
+    fallback_by_main = {str(link.get("source_key", "") or ""): link for link in fallback_links}
+
+    links: list[dict] = []
+    for direct_link in direct_links:
+        if direct_link.get("lod_sources"):
+            links.append(direct_link)
+            continue
+        fallback = fallback_by_main.get(str(direct_link.get("source_key", "") or ""))
+        if fallback is not None and fallback.get("lod_sources"):
+            links.append(fallback)
+        else:
+            links.append(direct_link)
+    return links
+
+
+def _build_lod_links_from_vb2_signatures(main_records: list[dict], lod_records: dict[str, dict]) -> list[dict]:
+    links = []
+    for main_record in main_records:
+        main_slot_count = _relation_slot_count(main_record)
+        candidates = []
+        if main_slot_count > 0:
+            for lod_key, lod_record in lod_records.items():
+                lod_slot_count = _relation_slot_count(lod_record)
+                score = _slot_relation_score(main_record, lod_record)
+                if score is None:
+                    continue
+                candidates.append((score, str(lod_key), lod_record, lod_slot_count))
+        if not candidates:
+            links.append({**main_record, "lod_sources": [], "status": "unmatched"})
+            continue
+        candidates.sort(
+            key=lambda item: (
+                -float(item[0]["score"]),
+                int(item[0]["slot_delta"]),
+                -int(item[3]),
+                str(item[1]),
+            )
+        )
+        best_score, best_lod_key, best_lod_record, best_lod_slot_count = candidates[0]
+        lod_sources = [
+            {
+                "lod_record_key": best_lod_key,
+                "lod_ib_hash": str(best_lod_record.get("lod_ib_hash", "") or ""),
+                "lod_match_first_index": int(best_lod_record.get("lod_match_first_index", 0) or 0),
+                "lod_match_index_count": int(best_lod_record.get("lod_match_index_count", 0) or 0),
+                "mapped_global_count": int(min(main_slot_count, best_lod_slot_count)),
+                "score": float(best_score["score"]),
+                "votes": int(min(main_slot_count, best_lod_slot_count)),
+                "relation_method": "vb2_slot_signature",
+                "main_slot_count": int(main_slot_count),
+                "lod_slot_count": int(best_lod_slot_count),
+                "slot_delta": int(best_score["slot_delta"]),
+                "slot_delta_ratio": float(best_score["slot_delta_ratio"]),
+            }
+        ]
+        links.append({**main_record, "lod_sources": lod_sources, "status": "matched"})
+    return links
+
+
+def _build_lod_links_from_bone_candidates(
+    main_records: list[dict],
+    lod_records: dict[str, dict],
+    global_to_lod: dict[int, object],
+    *,
+    allowed_lod_keys: set[str] | None = None,
+) -> list[dict]:
+    allowed = {str(value) for value in allowed_lod_keys} if allowed_lod_keys is not None else None
     links = []
     for main_record in main_records:
         base = int(main_record.get("global_bone_base", 0) or 0)
         count = int(main_record.get("local_bone_count", 0) or 0)
         by_lod: dict[str, dict] = {}
         for canonical_global in range(base, base + count):
-            mapping = global_to_lod.get(canonical_global)
-            if not mapping:
-                continue
-            lod_key = str(mapping.get("lod_record_key", "") or "")
-            bucket = by_lod.setdefault(lod_key, {"mapped_global_count": 0, "score": 0.0, "votes": 0})
-            bucket["mapped_global_count"] += 1
-            bucket["score"] += float(mapping.get("score", 0.0))
-            bucket["votes"] += int(mapping.get("votes", 0))
+            for lod_key, mapping in _best_candidate_by_lod(_iter_mapping_candidates(global_to_lod.get(canonical_global))).items():
+                if allowed is not None and str(lod_key) not in allowed:
+                    continue
+                bucket = by_lod.setdefault(lod_key, {"mapped_global_count": 0, "score": 0.0, "votes": 0})
+                bucket["mapped_global_count"] += 1
+                bucket["score"] += float(mapping.get("score", 0.0))
+                bucket["votes"] += int(mapping.get("votes", 0))
         if not by_lod:
             links.append({**main_record, "lod_sources": [], "status": "unmatched"})
             continue
@@ -1253,10 +1495,66 @@ def _build_lod_links(main_records: list[dict], lod_records: dict[str, dict], glo
                     "mapped_global_count": int(bucket["mapped_global_count"]),
                     "score": float(bucket["score"]),
                     "votes": int(bucket["votes"]),
+                    "relation_method": "bone_cloud_fallback",
                 }
             )
         links.append({**main_record, "lod_sources": lod_sources, "status": "matched" if lod_sources else "unmatched"})
     return links
+
+
+def _relation_slot_count(record: dict) -> int:
+    signature = dict(record.get("vb2_signature", {}) or {})
+    signature_count = int(signature.get("slot_count", 0) or 0)
+    if signature_count > 0:
+        return signature_count
+    used_slots = record.get("used_local_bone_indices") or record.get("lod_used_local_bone_indices") or []
+    if used_slots:
+        return len({int(value) for value in used_slots if int(value) >= 0})
+    return int(record.get("local_bone_count", record.get("lod_local_bone_count", 0)) or 0)
+
+
+def _slot_relation_score(main_record: dict, lod_record: dict) -> dict | None:
+    main_slot_count = _relation_slot_count(main_record)
+    lod_slot_count = _relation_slot_count(lod_record)
+    if main_slot_count <= 0 or lod_slot_count <= 0:
+        return None
+    slot_delta = abs(int(main_slot_count) - int(lod_slot_count))
+    base_count = max(int(main_slot_count), int(lod_slot_count), 1)
+    slot_delta_ratio = float(slot_delta) / float(base_count)
+    direct_limit = max(_LOD_SLOT_DIRECT_ABS_TOLERANCE, math.ceil(float(main_slot_count) * _LOD_SLOT_DIRECT_RATIO_TOLERANCE))
+    if slot_delta > direct_limit and slot_delta_ratio > _LOD_SLOT_NEAR_RATIO_TOLERANCE:
+        return None
+    geometry_bonus = _signature_geometry_affinity(main_record, lod_record)
+    slot_score = 1.0 - min(1.0, slot_delta_ratio)
+    return {
+        "score": float(slot_score * 100.0 + geometry_bonus),
+        "slot_delta": int(slot_delta),
+        "slot_delta_ratio": float(slot_delta_ratio),
+        "geometry_bonus": float(geometry_bonus),
+    }
+
+
+def _signature_geometry_affinity(main_record: dict, lod_record: dict) -> float:
+    main_signature = dict(main_record.get("vb2_signature", {}) or {})
+    lod_signature = dict(lod_record.get("vb2_signature", {}) or {})
+    main_center = main_signature.get("center")
+    lod_center = lod_signature.get("center")
+    if not isinstance(main_center, (list, tuple)) or not isinstance(lod_center, (list, tuple)):
+        return 0.0
+    if len(main_center) < 3 or len(lod_center) < 3:
+        return 0.0
+    main_diag = float(main_signature.get("diag", 0.0) or 0.0)
+    lod_diag = float(lod_signature.get("diag", 0.0) or 0.0)
+    diag = max(main_diag, lod_diag, 1.0e-5)
+    center_distance = math.sqrt(
+        (float(main_center[0]) - float(lod_center[0])) ** 2
+        + (float(main_center[1]) - float(lod_center[1])) ** 2
+        + (float(main_center[2]) - float(lod_center[2])) ** 2
+    )
+    center_score = 1.0 / (1.0 + center_distance / diag)
+    diag_delta = abs(main_diag - lod_diag) / max(main_diag, lod_diag, 1.0e-5)
+    diag_score = 1.0 - min(1.0, diag_delta)
+    return float(center_score + diag_score)
 
 
 def _minimum_lod_link_global_count(local_bone_count: int) -> int:
@@ -1266,7 +1564,7 @@ def _minimum_lod_link_global_count(local_bone_count: int) -> int:
     return min(count, max(_MIN_LOD_LINK_GLOBALS, math.ceil(count * _MIN_LOD_LINK_COVERAGE_RATIO)))
 
 
-def _lod_record_payload(candidate: dict, source_key: str) -> dict:
+def _lod_record_payload(candidate: dict, source_key: str, *, vb2_signature: dict | None = None) -> dict:
     return {
         "lod_record_key": source_key,
         "lod_ib_hash": str(candidate.get("ib_hash", "") or "").lower(),
@@ -1279,6 +1577,7 @@ def _lod_record_payload(candidate: dict, source_key: str) -> dict:
         "lod_used_local_bone_indices": [int(value) for value in candidate.get("used_local_bone_indices", []) or []],
         "lod_import_vs_hash": str(candidate.get("import_vs_hash", "") or "").lower(),
         "lod_import_ps_hash": str(candidate.get("import_ps_hash", "") or "").lower(),
+        "vb2_signature": dict(vb2_signature or {}),
     }
 
 

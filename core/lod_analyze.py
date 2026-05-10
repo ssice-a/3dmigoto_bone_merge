@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ..constants import CAPTURE_MANIFEST_FILE_NAME
+from .draw_arrays import skin_signature
 from .import_candidates import (
     _load_slot_slice,
     _read_blend_indices,
@@ -1020,80 +1021,13 @@ def _load_candidate_point_geometry(candidate: dict, frameanalysis_dir: str) -> P
 
 
 def _vb2_signature_from_geometry(geometry: PointGeometry, declared_used_slots=None) -> dict:
-    declared_slots = sorted({int(value) for value in (declared_used_slots or []) if int(value) >= 0})
-    np = optional_numpy()
-    if np is None:
-        used_slots: set[int] = set()
-        weighted_vertex_count = 0
-        influence_hist = [0, 0, 0, 0, 0]
-        for indices, weights in zip(geometry.blend_indices, geometry.blend_weights):
-            influence_count = 0
-            for local_bone, weight in zip(indices[:4], weights[:4]):
-                if float(weight) <= _WEIGHT_EPSILON:
-                    continue
-                influence_count += 1
-                used_slots.add(int(local_bone))
-            if influence_count:
-                weighted_vertex_count += 1
-            influence_hist[min(4, influence_count)] += 1
-        used_list = sorted(used_slots) if used_slots else declared_slots
-        return _vb2_signature_payload(geometry.positions, used_list, weighted_vertex_count, influence_hist)
-
-    weights = np.asarray(geometry.blend_weights, dtype=np.float64).reshape((-1, 4)) if len(geometry.blend_weights) else np.zeros((0, 4), dtype=np.float64)
-    indices = np.asarray(geometry.blend_indices, dtype=np.int64).reshape((-1, 4)) if len(geometry.blend_indices) else np.zeros((0, 4), dtype=np.int64)
-    valid = weights > float(_WEIGHT_EPSILON)
-    if valid.size:
-        used = indices[valid]
-        used = used[used >= 0]
-        used_slots = sorted(int(value) for value in np.unique(used)) if used.size else declared_slots
-        influence_counts = valid.sum(axis=1).astype(np.int64)
-        influence_hist_array = np.bincount(np.minimum(influence_counts, 4), minlength=5)
-        influence_hist = [int(value) for value in influence_hist_array[:5]]
-        weighted_vertex_count = int(np.count_nonzero(influence_counts))
-    else:
-        used_slots = declared_slots
-        influence_hist = [0, 0, 0, 0, 0]
-        weighted_vertex_count = 0
-    return _vb2_signature_payload(geometry.positions, used_slots, weighted_vertex_count, influence_hist)
-
-
-def _vb2_signature_payload(
-    positions,
-    used_slots: list[int],
-    weighted_vertex_count: int,
-    influence_hist: list[int],
-) -> dict:
-    position_count = len(positions)
-    center = (0.0, 0.0, 0.0)
-    diag = 0.0
-    np = optional_numpy()
-    if np is not None and position_count:
-        values = np.asarray(positions, dtype=np.float64).reshape((-1, 3))
-        center_values = values.mean(axis=0)
-        center = (float(center_values[0]), float(center_values[1]), float(center_values[2]))
-        mins = values.min(axis=0)
-        maxs = values.max(axis=0)
-        delta = maxs - mins
-        diag = float(np.sqrt(float(np.dot(delta, delta))))
-    elif position_count:
-        center = (
-            sum(float(position[0]) for position in positions) / position_count,
-            sum(float(position[1]) for position in positions) / position_count,
-            sum(float(position[2]) for position in positions) / position_count,
-        )
-        diag = _positions_diag(list(positions))
-    return {
-        "slot_count": int(len(used_slots)),
-        "used_slots": [int(value) for value in used_slots],
-        "slot_min": int(min(used_slots)) if used_slots else -1,
-        "slot_max": int(max(used_slots)) if used_slots else -1,
-        "slot_span": int(max(used_slots) - min(used_slots) + 1) if used_slots else 0,
-        "vertex_count": int(position_count),
-        "weighted_vertex_count": int(weighted_vertex_count),
-        "influence_hist": [int(value) for value in (influence_hist + [0, 0, 0, 0, 0])[:5]],
-        "center": [float(center[0]), float(center[1]), float(center[2])],
-        "diag": float(diag),
-    }
+    return skin_signature(
+        geometry.positions,
+        geometry.blend_indices,
+        geometry.blend_weights,
+        declared_used_slots=declared_used_slots,
+        epsilon=_WEIGHT_EPSILON,
+    )
 
 
 def _point_geometry_cache_key(candidate: dict, frameanalysis_dir: str, ib_txt_path: str, ib_buf_path: str) -> tuple:

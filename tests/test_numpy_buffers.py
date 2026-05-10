@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import numpy_buffers
+from core import draw_arrays, numpy_buffers
 
 
 class NumpyBuffersTests(unittest.TestCase):
@@ -57,6 +57,26 @@ class NumpyBuffersTests(unittest.TestCase):
             numpy_buffers.positions_diag(np.asarray([(0.0, 0.0, 0.0), (0.0, 0.0, 5.0)])),
             5.0,
         )
+
+    def test_build_topology_arrays_remaps_sparse_vertices(self):
+        np = draw_arrays.require_numpy()
+        triangles, original_vertex_ids, source_triangles = draw_arrays.build_topology_arrays(
+            np.asarray([9, 4, 7, 9, 7, 4], dtype=np.int64)
+        )
+        self.assertEqual(original_vertex_ids.tolist(), [4, 7, 9])
+        self.assertEqual(triangles.tolist(), [[2, 0, 1], [2, 1, 0]])
+        self.assertEqual(source_triangles.tolist(), [[9, 4, 7], [9, 7, 4]])
+
+    def test_skin_signature_uses_weighted_slots(self):
+        signature = draw_arrays.skin_signature(
+            [(0.0, 0.0, 0.0), (0.0, 3.0, 4.0)],
+            [(5, 2, 9, 0), (9, 0, 0, 0)],
+            [(0.5, 0.0, 0.5, 0.0), (1.0, 0.0, 0.0, 0.0)],
+        )
+        self.assertEqual(signature["used_slots"], [5, 9])
+        self.assertEqual(signature["slot_count"], 2)
+        self.assertEqual(signature["weighted_vertex_count"], 2)
+        self.assertEqual(signature["diag"], 5.0)
 
 
 if __name__ == "__main__":

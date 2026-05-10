@@ -10,9 +10,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable
 
+from .draw_arrays import build_topology_arrays, read_index_array, require_numpy, row_tuple_list
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
 from .numpy_compat import optional_numpy
-from .numpy_buffers import index_format_spec, read_index_file, read_interleaved_field, read_interleaved_fields
+from .numpy_buffers import read_interleaved_field, read_interleaved_fields
 from .texcoord_attrs import texcoord_color_attr_names
 from .uv_transform import DEFAULT_UV_FLIP_V, game_uv_to_blender
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
@@ -123,22 +124,21 @@ def load_candidate_geometry(
 
     stage_start = time.perf_counter()
     ib_header = _parse_buffer_header(ib_txt_path)
-    indices = _read_index_buffer(ib_buf_path, ib_header)
-    if len(indices) < 3:
+    indices = read_index_array(
+        ib_buf_path,
+        str(ib_header.fmt or ""),
+        int(ib_header.index_count),
+        byte_offset=int(ib_header.byte_offset),
+        first_index=int(ib_header.first_index),
+    )
+    if int(indices.size) < 3:
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no triangles")
     timings["ib"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
-    raw_triangles = [
-        (int(indices[index]), int(indices[index + 1]), int(indices[index + 2]))
-        for index in range(0, len(indices) - 2, 3)
-    ]
-    original_vertex_ids = sorted({vertex_index for triangle in raw_triangles for vertex_index in triangle})
-    remap = {old_vertex_index: new_vertex_index for new_vertex_index, old_vertex_index in enumerate(original_vertex_ids)}
-    triangles = [
-        (remap[triangle[0]], remap[triangle[1]], remap[triangle[2]])
-        for triangle in raw_triangles
-    ]
+    triangle_array, original_vertex_id_array, _source_triangles = build_topology_arrays(indices)
+    original_vertex_ids = [int(value) for value in original_vertex_id_array.tolist()]
+    triangles = row_tuple_list(triangle_array, dtype="int64")
     timings["topology"] = time.perf_counter() - stage_start
 
     warnings: list[str] = []
@@ -666,25 +666,14 @@ def _resolve_path(path: str, frameanalysis_dir: str = "") -> str:
 
 def _read_index_buffer(path: str, header: BufferHeader) -> list[int]:
     index_count = int(header.index_count)
-    if index_count <= 0:
-        return []
-    index_spec = index_format_spec(str(header.fmt or ""))
-    if index_spec is None:
-        raise ValueError(f"Unsupported IB format: {header.fmt}")
-    _dtype_name, stride = index_spec
-    expected_end = int(header.byte_offset) + int(header.first_index) * int(stride) + index_count * int(stride)
-    if not path or not os.path.exists(path) or os.path.getsize(path) < expected_end:
-        raise ValueError(f"IB buffer is shorter than expected: {path}")
-    values = read_index_file(
+    values = read_index_array(
         path,
         str(header.fmt or ""),
         index_count,
         byte_offset=int(header.byte_offset),
         first_index=int(header.first_index),
     )
-    if len(values) > 0:
-        return [int(value) for value in values]
-    raise ValueError(f"IB buffer is shorter than expected: {path}")
+    return [int(value) for value in values.tolist()]
 
 
 def _load_slot_slice(
@@ -931,48 +920,28 @@ def _read_vb0_position_normal(
         fields=fields,
         vertex_count=int(slot.header.vertex_count),
     )
-    if batch is not None:
-        positions = batch["positions"]
-        if normal_mode == "packed":
-            normal_packed = batch["normal_packed"].reshape(-1)
-            normals = _decode_game_packed_normals(normal_packed)
-            tangents, bitangent_signs = _decode_game_packed_tangent_frames(normal_packed)
-            return positions, normals, normal_packed, tangents, bitangent_signs
-        if normal_mode == "float3":
-            normals = _normalize_vectors(batch["normals"])
-            normal_packed = _zeros_like_vertex_ids(vertex_ids, dtype="uint32")
-            tangents = _default_tangents(vertex_ids)
-            bitangent_signs = _default_bitangent_signs(vertex_ids)
-            return positions, normals, normal_packed, tangents, bitangent_signs
-        warnings.append(f"{slot.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
-        return (
-            positions,
-            _default_normals(vertex_ids),
-            _zeros_like_vertex_ids(vertex_ids, dtype="uint32"),
-            _default_tangents(vertex_ids),
-            _default_bitangent_signs(vertex_ids),
-        )
-
-    positions = _read_required_float3(slot, "POSITION", 0, vertex_ids)
-    if normal_element is not None and _is_format(normal_element.fmt, "R32_FLOAT"):
-        normal_packed = _read_uint32_records(slot, normal_element, vertex_ids)
-        normals = [decode_game_packed_normal(value) for value in normal_packed]
+    if batch is None:
+        raise ValueError(f"{slot.slot_name}: failed to read POSITION/NORMAL fields with numpy")
+    positions = batch["positions"]
+    if normal_mode == "packed":
+        normal_packed = batch["normal_packed"].reshape(-1)
+        normals = _decode_game_packed_normals(normal_packed)
         tangents, bitangent_signs = _decode_game_packed_tangent_frames(normal_packed)
-    elif normal_element is not None and _is_format(normal_element.fmt, "R32G32B32_FLOAT"):
-        normals = [
-            _normalize_vector((float(record[0]), float(record[1]), float(record[2])))
-            for record in _read_format_records(slot, normal_element, vertex_ids)
-        ]
-        normal_packed = [0 for _ in vertex_ids]
-        tangents = [(1.0, 0.0, 0.0) for _ in vertex_ids]
-        bitangent_signs = [1.0 for _ in vertex_ids]
-    else:
-        warnings.append(f"{slot.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
-        normal_packed = [0 for _ in vertex_ids]
-        normals = [(0.0, 0.0, 1.0) for _ in vertex_ids]
-        tangents = [(1.0, 0.0, 0.0) for _ in vertex_ids]
-        bitangent_signs = [1.0 for _ in vertex_ids]
-    return positions, normals, normal_packed, tangents, bitangent_signs
+        return positions, normals, normal_packed, tangents, bitangent_signs
+    if normal_mode == "float3":
+        normals = _normalize_vectors(batch["normals"])
+        normal_packed = _zeros_like_vertex_ids(vertex_ids, dtype="uint32")
+        tangents = _default_tangents(vertex_ids)
+        bitangent_signs = _default_bitangent_signs(vertex_ids)
+        return positions, normals, normal_packed, tangents, bitangent_signs
+    warnings.append(f"{slot.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
+    return (
+        positions,
+        _default_normals(vertex_ids),
+        _zeros_like_vertex_ids(vertex_ids, dtype="uint32"),
+        _default_tangents(vertex_ids),
+        _default_bitangent_signs(vertex_ids),
+    )
 
 
 def _read_vb1_uv_layers(slot: _SlotSlice, vertex_ids: list[int]):
@@ -991,41 +960,10 @@ def _read_vb1_uv_layers(slot: _SlotSlice, vertex_ids: list[int]):
             fields=fields,
             vertex_count=int(slot.header.vertex_count),
         )
-        if batch is not None:
-            return batch.get("uv0"), batch.get("uv1")
-    return (
-        _read_float2_if_present(slot, "TEXCOORD", 0, vertex_ids),
-        _read_float2_if_present(slot, "TEXCOORD", 1, vertex_ids),
-    )
-
-
-def _read_float2_or_default(
-    slot: _SlotSlice,
-    semantic_name: str,
-    semantic_index: int,
-    vertex_ids: list[int],
-    default: tuple[float, float],
-) -> list[tuple[float, float]]:
-    element = _find_element(slot, semantic_name, semantic_index)
-    if element is None:
-        return [default for _ in vertex_ids]
-    values = _read_format_records(slot, element, vertex_ids)
-    return [(float(record[0]), float(record[1])) for record in values]
-
-
-def _read_float2_if_present(
-    slot: _SlotSlice,
-    semantic_name: str,
-    semantic_index: int,
-    vertex_ids: list[int],
-) -> list[tuple[float, float]] | None:
-    element = _find_element(slot, semantic_name, semantic_index)
-    if element is None:
-        return None
-    if not _is_format(element.fmt, "R32G32_FLOAT"):
-        return None
-    values = _read_format_records(slot, element, vertex_ids)
-    return [(float(record[0]), float(record[1])) for record in values]
+        if batch is None:
+            raise ValueError(f"{slot.slot_name}: failed to read TEXCOORD UV fields with numpy")
+        return batch.get("uv0"), batch.get("uv1")
+    return None, None
 
 
 def _read_texcoord_semantics(slots: list[_SlotSlice], vertex_ids: list[int]) -> list[dict]:
@@ -1150,14 +1088,6 @@ def _element_layout_payload(element: HeaderElement) -> dict:
     }
 
 
-def _read_uint32_records(slot: _SlotSlice, element: HeaderElement, vertex_ids: list[int]) -> list[int]:
-    _validate_vertex_record_range(slot, element, vertex_ids, 4)
-    numpy_values = _read_numpy_scalar_records(slot, element, vertex_ids, "<u4")
-    if numpy_values is None:
-        raise ValueError(f"{slot.slot_name}: failed to read uint32 records for {element.semantic_name}{element.semantic_index}")
-    return [int(value) for value in numpy_values]
-
-
 def _read_int8x4_records(
     slot: _SlotSlice,
     element: HeaderElement,
@@ -1203,15 +1133,16 @@ def _read_skin_weights_indices(slot: _SlotSlice, vertex_ids: list[int]):
             fields=fields,
             vertex_count=int(slot.header.vertex_count),
         )
-        if batch is not None:
-            weights = batch.get("weights")
-            indices = batch.get("indices")
-            if weights is None:
-                weights = _default_blend_weights(vertex_ids)
-            if indices is None:
-                indices = _default_blend_indices(vertex_ids)
-            return weights, indices
-    return _read_blend_weights(slot, vertex_ids), _read_blend_indices(slot, vertex_ids)
+        if batch is None:
+            raise ValueError(f"{slot.slot_name}: failed to read BLEND fields with numpy")
+        weights = batch.get("weights")
+        indices = batch.get("indices")
+        if weights is None:
+            weights = _default_blend_weights(vertex_ids)
+        if indices is None:
+            indices = _default_blend_indices(vertex_ids)
+        return weights, indices
+    return _default_blend_weights(vertex_ids), _default_blend_indices(vertex_ids)
 
 
 def _read_blend_indices(
@@ -1340,24 +1271,6 @@ def _normalize_dxgi_format(fmt: str) -> str:
     return normalized
 
 
-def _read_raw_records(
-    slot: _SlotSlice,
-    element: HeaderElement,
-    vertex_ids: list[int],
-    size: int,
-) -> list[bytes]:
-    _validate_vertex_record_range(slot, element, vertex_ids, size)
-    data = slot.data
-    records: list[bytes] = []
-    for vertex_id in vertex_ids:
-        offset = int(vertex_id) * int(slot.header.stride) + int(element.aligned_byte_offset)
-        end_offset = offset + size
-        if end_offset > len(data):
-            raise ValueError(f"{slot.slot_name}: record read exceeds loaded slice")
-        records.append(data[offset:end_offset])
-    return records
-
-
 def _validate_vertex_record_range(
     slot: _SlotSlice,
     element: HeaderElement,
@@ -1411,10 +1324,10 @@ def _apply_uv_layer(mesh, layer_name: str, values: list[tuple[float, float]], *,
 
 
 def _apply_uv_layer_numpy(mesh, uv_layer, values, *, uv_flip_v: bool = DEFAULT_UV_FLIP_V) -> bool:
-    np = optional_numpy()
+    np = require_numpy()
     loops = getattr(mesh, "loops", [])
     loop_count = len(loops)
-    if np is None or loop_count <= 0:
+    if loop_count <= 0:
         return False
     foreach_get = getattr(loops, "foreach_get", None)
     if not callable(foreach_get):

@@ -12,11 +12,11 @@ from typing import Iterable
 
 from ..constants import CAPTURE_MANIFEST_FILE_NAME
 from .data_types import annotate_vertex_layout
+from .draw_arrays import read_index_array, used_skin_slots
 from .io import write_json
 from .numpy_buffers import (
     dxgi_format_size,
     max_interleaved_uint4,
-    read_index_file,
     read_interleaved_fields_from_file,
 )
 from .numpy_compat import optional_numpy
@@ -1504,8 +1504,6 @@ def _infer_candidate_used_local_bone_indices(
     candidate: dict,
     warnings: list[dict],
 ) -> list[int]:
-    source_local_bone_count = int(candidate.get("source_local_bone_count", candidate.get("local_bone_count", 0)) or 0)
-    fallback = list(range(min(max(0, source_local_bone_count), 256)))
     try:
         used_indices = _read_used_local_bone_indices_from_import_draw(
             files_by_draw.get(import_hit.draw_index, []),
@@ -1524,7 +1522,7 @@ def _infer_candidate_used_local_bone_indices(
                 "draw_indices": [int(candidate.get("import_draw_index", -1) or -1)],
             }
         )
-        return fallback
+        return []
 
     if used_indices:
         return sorted({int(value) for value in used_indices if int(value) >= 0})
@@ -1541,11 +1539,16 @@ def _read_used_local_bone_indices_from_import_draw(
         return []
     ib_header_path = import_hit.data_path if import_hit.data_path and import_hit.data_path.endswith(".txt") else import_hit.path
     ib_header = _parse_buffer_header(ib_header_path)
-    indices = _read_index_values(
-        data_path=ib_buf_path,
-        header=ib_header,
+    indices = read_index_array(
+        ib_buf_path,
+        str(ib_header.fmt or ""),
+        int(ib_header.index_count),
+        byte_offset=int(ib_header.byte_offset),
+        first_index=int(ib_header.first_index),
     )
-    vertex_ids = sorted({int(index) for index in indices if int(index) >= 0})
+    np = optional_numpy()
+    vertex_id_array = np.unique(indices[indices >= 0]) if indices.size else np.zeros((0,), dtype=np.int64)
+    vertex_ids = [int(value) for value in vertex_id_array.tolist()]
     if not vertex_ids:
         return []
 
@@ -1607,56 +1610,9 @@ def _read_used_local_bone_indices_from_import_draw(
         ],
         converted=True,
     )
-    if numpy_fields is not None:
-        try:
-            np = optional_numpy()
-            if np is None:
-                raise ValueError("numpy unavailable")
-            weights = np.asarray(numpy_fields["weights"], dtype=np.float64)
-            indices_array = np.asarray(numpy_fields["indices"], dtype=np.int64)
-            used = indices_array[weights > 0.0]
-            if used.size:
-                return sorted(int(value) for value in np.unique(used) if int(value) >= 0)
-            return []
-        except Exception:
-            pass
-    with open(data_path, "rb") as file_handle:
-        file_handle.seek(base_offset)
-        raw_vertex_data = file_handle.read(int(header.vertex_count) * int(header.stride))
-
-    used_indices: set[int] = set()
-    for vertex_id in vertex_ids:
-        if vertex_id >= int(header.vertex_count):
-            continue
-        vertex_offset = int(vertex_id) * int(header.stride)
-        weight_offset = vertex_offset + int(weight_element.aligned_byte_offset)
-        index_offset = vertex_offset + int(index_element.aligned_byte_offset)
-        weight_bytes = raw_vertex_data[weight_offset : weight_offset + weight_size]
-        index_bytes = raw_vertex_data[index_offset : index_offset + index_size]
-        if len(weight_bytes) < weight_size or len(index_bytes) < index_size:
-            continue
-        weights = _unpack_vertex_format(weight_bytes, weight_element.fmt)
-        blend_indices = _unpack_vertex_format(index_bytes, index_element.fmt)
-        for weight, palette_index in zip(weights[:4], blend_indices[:4]):
-            if float(weight) > 0.0:
-                used_indices.add(int(palette_index))
-    return sorted(used_indices)
-
-
-def _read_index_values(data_path: str, header: BufferHeader) -> list[int]:
-    index_count = int(header.index_count)
-    if not data_path or not os.path.exists(data_path) or index_count <= 0:
-        return []
-    return [
-        int(value)
-        for value in read_index_file(
-            data_path,
-            str(header.fmt or ""),
-            index_count,
-            byte_offset=int(header.byte_offset),
-            first_index=int(header.first_index),
-        )
-    ]
+    if numpy_fields is None:
+        raise ValueError(f"{slot_name}: failed to read compact palette skin fields with numpy")
+    return used_skin_slots(numpy_fields["indices"], numpy_fields["weights"], epsilon=0.0)
 
 
 def _infer_candidate_local_bone_count(

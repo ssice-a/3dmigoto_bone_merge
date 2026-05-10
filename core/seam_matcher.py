@@ -10,6 +10,7 @@ from .spatial_index import (
     cell_key as _generic_cell_key,
     neighbor_keys as _generic_neighbor_keys,
 )
+from .draw_arrays import require_numpy
 from .numpy_buffers import expanded_cell_key_set, point_bounds
 from .numpy_compat import optional_numpy
 
@@ -963,43 +964,12 @@ def _print_seam_performance_report(perf: dict, build_result: SeamBuildResult) ->
             )
 
 
-def _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance):
-    tolerance_squared = tolerance * tolerance
-    nearest_by_source = {}
-    for source_index, source_world_co in source_vertices:
-        nearest_match = None
-        nearest_distance_squared = None
-        for key in _neighbor_keys(_cell_key(source_world_co, tolerance)):
-            for target_index, target_world_co in target_spatial_hash.get(key, ()):
-                delta_x = source_world_co[0] - target_world_co[0]
-                delta_y = source_world_co[1] - target_world_co[1]
-                delta_z = source_world_co[2] - target_world_co[2]
-                distance_squared = delta_x * delta_x + delta_y * delta_y + delta_z * delta_z
-                if distance_squared > tolerance_squared:
-                    continue
-                if nearest_distance_squared is None or distance_squared < nearest_distance_squared:
-                    nearest_match = target_index
-                    nearest_distance_squared = distance_squared
-        if nearest_match is not None:
-            nearest_by_source[source_index] = (nearest_match, nearest_distance_squared ** 0.5)
-    return nearest_by_source
-
-
 def _build_nearest_vertex_map_from_hash(source_spatial_hash, target_spatial_hash, tolerance):
-    try:
-        return _build_nearest_vertex_map_from_hash_numpy(source_spatial_hash, target_spatial_hash, tolerance)
-    except Exception:
-        source_vertices = [
-            item
-            for cell_items in source_spatial_hash.values()
-            for item in cell_items
-        ]
-        source_vertices.sort(key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
-        return _build_nearest_vertex_map(source_vertices, target_spatial_hash, tolerance)
+    return _build_nearest_vertex_map_from_hash_numpy(source_spatial_hash, target_spatial_hash, tolerance)
 
 
 def _build_nearest_vertex_map_from_hash_numpy(source_spatial_hash, target_spatial_hash, tolerance):
-    np = optional_numpy()
+    np = require_numpy()
     tolerance_squared = float(tolerance) * float(tolerance)
     nearest_by_source = {}
     max_distance_values = 1_000_000

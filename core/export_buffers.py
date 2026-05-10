@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 
+from .draw_arrays import require_numpy
 from .texcoord_attrs import texcoord_color_attr_names
 from .export_package import ExportPartPlan, write_r32_index_buffer
 from .numpy_buffers import assign_bytes, foreach_get_array, object_attribute_array
@@ -536,8 +537,8 @@ def _write_numpy_position_packed_normal_slot16(
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
 ) -> bool:
-    np = optional_numpy()
-    if np is None or not loop_vertices or int(slot.stride) != 16:
+    np = require_numpy()
+    if not loop_vertices or int(slot.stride) != 16:
         return False
     records = np.empty(
         len(loop_vertices),
@@ -567,8 +568,8 @@ def _write_numpy_position_slot(
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
 ) -> bool:
-    np = optional_numpy()
-    if np is None or not loop_vertices:
+    np = require_numpy()
+    if not loop_vertices:
         return False
     if any(plan[0] not in {"position3", "normal_packed", "normal3"} for plan in field_plans):
         return False
@@ -625,8 +626,8 @@ def _write_numpy_texcoord_slot(
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
 ) -> bool:
-    np = optional_numpy()
-    if np is None or not loop_vertices:
+    np = require_numpy()
+    if not loop_vertices:
         return False
     uv_plans = [plan for plan in field_plans if plan[0] == "uv"]
     texcoord_snorm4_plans = [plan for plan in field_plans if plan[0] == "texcoord_snorm4"]
@@ -683,8 +684,8 @@ def _write_numpy_blend_slot(
     loop_vertices: list[_LoopVertex],
     export_cache: _ExportPartCache,
 ) -> bool:
-    np = optional_numpy()
-    if np is None or not loop_vertices:
+    np = require_numpy()
+    if not loop_vertices:
         return False
     weights_plan = _single_plan_detail(field_plans, "blend_weights")
     indices_plan = _single_plan_detail(field_plans, "blend_indices")
@@ -746,7 +747,7 @@ def _loop_vertex_mesh_ranges(loop_vertices: list[_LoopVertex]):
 
 
 def _loop_vertex_mesh_range_arrays(loop_vertices: list[_LoopVertex], export_cache: _ExportPartCache):
-    np = optional_numpy()
+    np = require_numpy()
     if not loop_vertices:
         return ()
     cache_key = (id(loop_vertices), len(loop_vertices))
@@ -775,9 +776,7 @@ def _numpy_texcoord_snorm4_values(
     loop_indices,
     vertex_indices=None,
 ) -> object | None:
-    np = optional_numpy()
-    if np is None:
-        return None
+    np = require_numpy()
     kind = source[0]
     count = end - start
     if kind == "zero":
@@ -1368,9 +1367,7 @@ def _decode_octahedral_quantized(quant_x: int, quant_y: int) -> tuple[float, flo
 
 
 def _decode_octahedral_quantized_numpy(quant_x, quant_y):
-    np = optional_numpy()
-    if np is None:
-        return []
+    np = require_numpy()
     x_raw = np.asarray(quant_x, dtype=np.int32) & 0x3FF
     y_raw = np.asarray(quant_y, dtype=np.int32) & 0x3FF
     x_values = np.where(x_raw >= 512, x_raw - 1024, x_raw).astype(np.float32) / 511.0
@@ -1396,9 +1393,7 @@ def _encode_tangent_roll(normal, tangent) -> int:
 
 
 def _encode_tangent_roll_numpy(normals, tangents):
-    np = optional_numpy()
-    if np is None:
-        return []
+    np = require_numpy()
     normal_values = _normalize_rows_numpy(np.asarray(normals, dtype=np.float32))
     tangent_values = _orthogonalize_numpy(np.asarray(tangents, dtype=np.float32), normal_values)
     basis_u, basis_v = _packed_tangent_basis_numpy(normal_values)
@@ -1411,9 +1406,7 @@ def _encode_tangent_roll_numpy(normals, tangents):
 
 
 def _packed_tangent_basis_numpy(normals):
-    np = optional_numpy()
-    if np is None:
-        return [], []
+    np = require_numpy()
     normal_values = _normalize_rows_numpy(np.asarray(normals, dtype=np.float32))
     basis_u = np.stack(
         (
@@ -1435,9 +1428,7 @@ def _packed_tangent_basis_numpy(normals):
 
 
 def _orthogonalize_numpy(vectors, normals):
-    np = optional_numpy()
-    if np is None:
-        return []
+    np = require_numpy()
     normal_values = _normalize_rows_numpy(np.asarray(normals, dtype=np.float32))
     vector_values = _normalize_rows_numpy(np.asarray(vectors, dtype=np.float32))
     projection = np.sum(vector_values * normal_values, axis=1, keepdims=True)
@@ -1451,9 +1442,7 @@ def _orthogonalize_numpy(vectors, normals):
 
 
 def _fallback_tangents_numpy(normals):
-    np = optional_numpy()
-    if np is None:
-        return []
+    np = require_numpy()
     normal_values = _normalize_rows_numpy(np.asarray(normals, dtype=np.float32))
     axes = np.zeros_like(normal_values)
     use_x = np.abs(normal_values[:, 0]) < 0.9
@@ -1470,9 +1459,7 @@ def _fallback_tangents_numpy(normals):
 
 
 def _normalize_rows_numpy(values):
-    np = optional_numpy()
-    if np is None:
-        return values
+    np = require_numpy()
     vectors = np.asarray(values, dtype=np.float32)
     if vectors.size == 0:
         return vectors.reshape((0, 3))
@@ -1593,7 +1580,7 @@ def _local_top4_packed(loop_vertex: _LoopVertex, export_cache: _ExportPartCache)
 
 
 def _local_top4_vertex_arrays(mesh, mesh_cache: _MeshExportCache, export_cache: _ExportPartCache):
-    np = optional_numpy()
+    np = require_numpy()
     vertex_count = len(getattr(mesh, "vertices", []) or [])
     cached_weights = mesh_cache.blend_weights_by_vertex
     cached_indices = mesh_cache.blend_indices_by_vertex
@@ -1812,9 +1799,7 @@ def _transform_point(mesh_obj, value: tuple[float, float, float]) -> tuple[float
 
 
 def _transform_points_numpy(mesh_obj, values):
-    np = optional_numpy()
-    if np is None:
-        return values
+    np = require_numpy()
     matrix = _matrix_world_numpy(mesh_obj)
     if matrix is None:
         return values
@@ -1849,9 +1834,7 @@ def _transform_normal(mesh_obj, value: tuple[float, float, float]) -> tuple[floa
 
 
 def _transform_normals_numpy(mesh_obj, values):
-    np = optional_numpy()
-    if np is None:
-        return values
+    np = require_numpy()
     matrix = _matrix_world_numpy(mesh_obj)
     if matrix is None:
         return values
@@ -1888,9 +1871,7 @@ def _mathutils_vector(value: tuple[float, float, float]):
 
 
 def _matrix_world_numpy(mesh_obj):
-    np = optional_numpy()
-    if np is None:
-        return None
+    np = require_numpy()
     matrix = getattr(mesh_obj, "matrix_world", None)
     if matrix is None:
         return None

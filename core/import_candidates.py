@@ -349,14 +349,8 @@ def create_blender_object_from_geometry(
 
     stage_start = time.perf_counter()
     _store_int_attribute(mesh, "bmc_orig_vertex_id", geometry.original_vertex_ids)
-    _store_uint32_split_attributes(mesh, "bmc_normal_packed", geometry.normal_packed)
     _store_texcoord_semantic_attributes(mesh, geometry.texcoord_semantics)
     for channel_index in range(4):
-        _store_int_attribute(
-            mesh,
-            f"bmc_texcoord4_raw_{channel_index}",
-            [record[channel_index] for record in geometry.texcoord4_raw],
-        )
         _store_int_attribute(
             mesh,
             f"bmc_blend_index_{channel_index}",
@@ -1475,19 +1469,17 @@ def _store_texcoord_semantic_attributes(mesh, records: list[dict]) -> None:
         if slot_index < 0 or semantic_index < 0 or component_count <= 0:
             continue
         base_name = f"bmc_vb{slot_index}_texcoord{semantic_index}"
-        for component_index in range(component_count):
-            component_values = _component_values(values, component_index)
-            attr_name = f"{base_name}_{component_index}"
-            if storage == "sint8_raw":
-                _store_int_attribute(mesh, attr_name, component_values)
-            else:
-                _store_float_attribute(mesh, attr_name, component_values)
         if storage == "sint8_raw" and component_count == 4:
             _store_snorm_byte_color_attribute(
                 mesh,
                 texcoord_color_attr_names(f"vb{slot_index}", semantic_index)[0],
                 values,
             )
+            continue
+        for component_index in range(component_count):
+            component_values = _component_values(values, component_index)
+            attr_name = f"{base_name}_{component_index}"
+            _store_float_attribute(mesh, attr_name, component_values)
 
 
 def _component_values(values, component_index: int):

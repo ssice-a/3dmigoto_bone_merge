@@ -108,6 +108,17 @@ class FakeAttribute:
         self.data = [FakeAttributeValue(value) for value in values]
 
 
+class FakeColorValue:
+    def __init__(self, color):
+        self.color = tuple(color)
+
+
+class FakeColorAttribute:
+    def __init__(self, values, *, domain="POINT"):
+        self.data = [FakeColorValue(value) for value in values]
+        self.domain = domain
+
+
 class FakeUVValue:
     def __init__(self, uv):
         self.uv = tuple(uv)
@@ -589,6 +600,176 @@ class ExportPackageTests(unittest.TestCase):
             )
             texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
             self.assertEqual(texcoord_path.read_bytes(), bytes([0] * 12))
+
+    def test_texcoord4_raw_point_attributes_are_not_reused_without_color(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        for component, values in enumerate(([1, 5, 9], [2, 6, 10], [3, 7, 11], [4, 8, 12])):
+            target.data.attributes[f"bmc_vb1_texcoord4_{component}"] = FakeAttribute(values)
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 4,
+                        "elements": [
+                            {
+                                "semantic_name": "TEXCOORD",
+                                "semantic_index": 4,
+                                "format": "R8G8B8A8_SNORM",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
+            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            self.assertEqual(texcoord_path.read_bytes(), bytes([0] * 12))
+
+    def test_texcoord4_color_attribute_is_encoded(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        target.data.attributes["bmc_vb1_texcoord4_color"] = FakeColorAttribute(
+            [
+                (1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 4.0 / 255.0),
+                (5.0 / 255.0, 6.0 / 255.0, 7.0 / 255.0, 8.0 / 255.0),
+                (9.0 / 255.0, 10.0 / 255.0, 11.0 / 255.0, 12.0 / 255.0),
+            ]
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 4,
+                        "elements": [
+                            {
+                                "semantic_name": "TEXCOORD",
+                                "semantic_index": 4,
+                                "format": "R8G8B8A8_SNORM",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
+            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            self.assertEqual(texcoord_path.read_bytes(), bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]))
+
+    def test_packed_normal_export_requires_tangent_frame(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb0": {
+                        "slot": "vb0",
+                        "stride": 16,
+                        "elements": [
+                            {
+                                "semantic_name": "POSITION",
+                                "semantic_index": 0,
+                                "format": "R32G32B32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            },
+                            {
+                                "semantic_name": "NORMAL",
+                                "semantic_index": 0,
+                                "format": "R32_FLOAT",
+                                "aligned_byte_offset": 12,
+                            },
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "packed NORMAL0 export requires"):
+                export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
+
+    def test_packed_normal_export_uses_loop_tangent_frame(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        for loop in target.data.loops:
+            loop.tangent = (-1.0, 0.0, 0.0)
+            loop.bitangent_sign = 1.0
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb0": {
+                        "slot": "vb0",
+                        "stride": 16,
+                        "elements": [
+                            {
+                                "semantic_name": "POSITION",
+                                "semantic_index": 0,
+                                "format": "R32G32B32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            },
+                            {
+                                "semantic_name": "NORMAL",
+                                "semantic_index": 0,
+                                "format": "R32_FLOAT",
+                                "aligned_byte_offset": 12,
+                            },
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout, mirror_flip_default=False)
+            position_path = Path(tmpdir) / "640d1c0e-3-0_part00-Position.buf"
+            packed = struct.unpack_from("<I", position_path.read_bytes(), 12)[0]
+            self.assertTrue(packed & 0x40000000)
+            self.assertTrue(packed & 0x80000000)
+            self.assertNotEqual((packed >> 20) & 0x3FF, 0)
 
     def test_external_mesh_without_mirror_property_uses_export_default(self):
         target = FakeObject(

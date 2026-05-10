@@ -17,7 +17,7 @@ from .export_package import ExportPartPlan, write_r32_index_buffer
 from .numpy_buffers import assign_bytes
 from .numpy_compat import optional_numpy
 from .uv_transform import DEFAULT_UV_FLIP_V, blender_uv_to_game
-from .vertex_format import encode_game_packed_normal, pack_vertex_format
+from .vertex_format import encode_game_packed_tangent_frame, pack_vertex_format
 
 
 @dataclass(frozen=True)
@@ -77,9 +77,13 @@ class _MeshExportCache:
     matrix_world_applied: bool
     vertex_position_values: list[tuple[float, float, float]] | None
     loop_normal_values: list[tuple[float, float, float]] | None
+    loop_tangent_values: list[tuple[float, float, float]] | None
+    loop_bitangent_sign_values: list[float] | None
     game_position_values: list[tuple[float, float, float]] | None
     game_normal_values: list[tuple[float, float, float]] | None
-    game_packed_normal_values: list[int] | None
+    game_tangent_values: list[tuple[float, float, float]] | None
+    game_bitangent_sign_values: list[float] | None
+    game_packed_tangent_frame_values: list[int] | None
     game_position_by_vertex: dict[int, tuple[float, float, float]]
     game_normal_by_loop: dict[int, tuple[float, float, float]]
     top4_by_vertex: dict[int, tuple[tuple[float, float, float, float], tuple[int, int, int, int]]]
@@ -139,9 +143,13 @@ class _ExportPartCache:
                 matrix_world_applied=mesh_record.matrix_world_applied,
                 vertex_position_values=None,
                 loop_normal_values=None,
+                loop_tangent_values=None,
+                loop_bitangent_sign_values=None,
                 game_position_values=None,
                 game_normal_values=None,
-                game_packed_normal_values=None,
+                game_tangent_values=None,
+                game_bitangent_sign_values=None,
+                game_packed_tangent_frame_values=None,
                 game_position_by_vertex={},
                 game_normal_by_loop={},
                 top4_by_vertex={},
@@ -473,7 +481,7 @@ def _write_fast_prepared_vertex_slot(
             if kind == "position3":
                 pack_into("<3f", output, offset, *_game_position(loop_vertex, export_cache))
             elif kind == "normal_packed":
-                pack_into("<I", output, offset, int(encode_game_packed_normal(_game_normal(loop_vertex, export_cache))))
+                pack_into("<I", output, offset, int(_game_packed_tangent_frame(loop_vertex, export_cache)))
             elif kind == "normal3":
                 pack_into("<3f", output, offset, *_game_normal(loop_vertex, export_cache))
             elif kind == "uv":
@@ -543,21 +551,21 @@ def _write_position_slot(
     pack_into = struct.pack_into
     current_key = None
     game_positions: list[tuple[float, float, float]] = []
-    packed_normals: list[int] = []
+    packed_tangent_frames: list[int] = []
     for record_index, loop_vertex in enumerate(loop_vertices):
         record_base = record_index * stride
         mesh_key = id(loop_vertex.mesh_obj)
         if mesh_key != current_key:
             mesh_cache = export_cache.mesh_cache(loop_vertex)
             game_positions = _game_position_values(loop_vertex.mesh, mesh_cache)
-            packed_normals = _game_packed_normal_values(loop_vertex.mesh, mesh_cache)
+            packed_tangent_frames = _game_packed_tangent_frame_values(loop_vertex.mesh, mesh_cache)
             current_key = mesh_key
         if position_offset is not None:
             position = game_positions[loop_vertex.vertex_index] if loop_vertex.vertex_index < len(game_positions) else _game_position(loop_vertex, export_cache)
             pack_into("<3f", output, record_base + position_offset, *position)
         if normal_packed_offset is not None:
-            packed_normal = packed_normals[loop_vertex.loop_index] if loop_vertex.loop_index < len(packed_normals) else int(encode_game_packed_normal(_game_normal(loop_vertex, export_cache)))
-            pack_into("<I", output, record_base + normal_packed_offset, int(packed_normal))
+            packed_frame = packed_tangent_frames[loop_vertex.loop_index] if loop_vertex.loop_index < len(packed_tangent_frames) else int(_game_packed_tangent_frame(loop_vertex, export_cache))
+            pack_into("<I", output, record_base + normal_packed_offset, int(packed_frame))
         if normal3_offset is not None:
             pack_into("<3f", output, record_base + normal3_offset, *_game_normal(loop_vertex, export_cache))
     return True
@@ -574,17 +582,17 @@ def _write_position_packed_normal_slot16(
     pack_into = struct.pack_into
     current_key = None
     game_positions: list[tuple[float, float, float]] = []
-    packed_normals: list[int] = []
+    packed_tangent_frames: list[int] = []
     for record_index, loop_vertex in enumerate(loop_vertices):
         mesh_key = id(loop_vertex.mesh_obj)
         if mesh_key != current_key:
             mesh_cache = export_cache.mesh_cache(loop_vertex)
             game_positions = _game_position_values(loop_vertex.mesh, mesh_cache)
-            packed_normals = _game_packed_normal_values(loop_vertex.mesh, mesh_cache)
+            packed_tangent_frames = _game_packed_tangent_frame_values(loop_vertex.mesh, mesh_cache)
             current_key = mesh_key
         position = game_positions[loop_vertex.vertex_index] if loop_vertex.vertex_index < len(game_positions) else _game_position(loop_vertex, export_cache)
-        packed_normal = packed_normals[loop_vertex.loop_index] if loop_vertex.loop_index < len(packed_normals) else int(encode_game_packed_normal(_game_normal(loop_vertex, export_cache)))
-        pack_into("<3fI", output, record_index * 16, float(position[0]), float(position[1]), float(position[2]), int(packed_normal))
+        packed_frame = packed_tangent_frames[loop_vertex.loop_index] if loop_vertex.loop_index < len(packed_tangent_frames) else int(_game_packed_tangent_frame(loop_vertex, export_cache))
+        pack_into("<3fI", output, record_index * 16, float(position[0]), float(position[1]), float(position[2]), int(packed_frame))
     return True
 
 
@@ -605,7 +613,7 @@ def _write_numpy_position_packed_normal_slot16(
             first = loop_vertices[start]
             mesh_cache = export_cache.mesh_cache(first)
             positions = np.asarray(_game_position_values(first.mesh, mesh_cache), dtype="<f4")
-            normals = np.asarray(_game_packed_normal_values(first.mesh, mesh_cache), dtype="<u4")
+            normals = np.asarray(_game_packed_tangent_frame_values(first.mesh, mesh_cache), dtype="<u4")
             vertex_indices = np.fromiter(
                 (loop_vertices[index].vertex_index for index in range(start, end)),
                 dtype=np.intp,
@@ -666,7 +674,7 @@ def _write_numpy_position_slot(
                     return False
                 _numpy_assign_bytes(records[start:end], int(position_offset), positions[vertex_indices])
             if normal_packed_offset is not None:
-                packed_normals = np.asarray(_game_packed_normal_values(first.mesh, mesh_cache), dtype=np.uint32)
+                packed_normals = np.asarray(_game_packed_tangent_frame_values(first.mesh, mesh_cache), dtype=np.uint32)
                 if loop_indices.size and int(loop_indices.max()) >= len(packed_normals):
                     return False
                 _numpy_assign_bytes(records[start:end], int(normal_packed_offset), packed_normals[loop_indices])
@@ -914,30 +922,6 @@ def _numpy_texcoord_snorm4_values(
     count = end - start
     if kind == "zero":
         return np.zeros((count, 4), dtype=np.uint8)
-    if kind == "point_array":
-        values = source[1]
-        if vertex_indices is None:
-            vertex_indices = np.fromiter(
-                (loop_vertices[index].vertex_index for index in range(start, end)),
-                dtype=np.intp,
-                count=count,
-            )
-        if vertex_indices.size and int(vertex_indices.max()) >= len(values):
-            return None
-        return np.asarray(values[vertex_indices], dtype=np.uint8)
-    if kind == "point":
-        component_data = source[1]
-        values = np.zeros((count, 4), dtype=np.uint8)
-        for component, data in enumerate(component_data):
-            values[:, component] = np.fromiter(
-                (
-                    _raw_byte_from_attribute_data(data, int(loop_vertices[index].vertex_index))
-                    for index in range(start, end)
-                ),
-                dtype=np.uint8,
-                count=count,
-            )
-        return values
     if kind == "color_array":
         values, use_loop_index = source[1], bool(source[2])
         if use_loop_index:
@@ -1030,20 +1014,6 @@ def _write_texcoord_snorm4_into(
     if kind == "zero":
         struct.pack_into("<I", output, offset, 0)
         return
-    if kind == "point_array":
-        values = source[1]
-        vertex_index = int(loop_vertex.vertex_index)
-        if vertex_index < len(values):
-            output[offset:offset + 4] = bytes(int(component) & 0xFF for component in values[vertex_index][:4])
-            return
-        struct.pack_into("<I", output, offset, 0)
-        return
-    if kind == "point":
-        attribute_data = source[1]
-        vertex_index = int(loop_vertex.vertex_index)
-        for component, data in enumerate(attribute_data):
-            output[offset + component] = _raw_byte_from_attribute_data(data, vertex_index)
-        return
     if kind == "color_array":
         values, use_loop_index = source[1], bool(source[2])
         data_index = int(loop_vertex.loop_index if use_loop_index else loop_vertex.vertex_index)
@@ -1071,51 +1041,21 @@ def _texcoord_snorm4_source(mesh, slot_name: str, semantic_index: int, mesh_cach
     if key in mesh_cache.texcoord_snorm4_sources:
         return mesh_cache.texcoord_snorm4_sources[key]
 
-    component_data = []
-    for component in range(4):
-        attribute = _point_attribute(mesh, texcoord_component_attr_names(slot_name, semantic_index, component), mesh_cache)
-        if attribute is None:
-            component_data = []
-            break
-        component_data.append(getattr(attribute, "data", []))
-    if len(component_data) == 4:
-        point_array = _texcoord_component_numpy_array(component_data)
-        if point_array is not None:
-            source = ("point_array", point_array)
-        else:
-            source = ("point", tuple(component_data))
+    color_attribute = _color_attribute(mesh, texcoord_color_attr_names(slot_name, semantic_index), mesh_cache)
+    if color_attribute is None:
+        source = ("zero",)
     else:
-        color_attribute = _color_attribute(mesh, texcoord_color_attr_names(slot_name, semantic_index), mesh_cache)
-        if color_attribute is None:
-            source = ("zero",)
+        data = getattr(color_attribute, "data", [])
+        domain = str(getattr(color_attribute, "domain", "") or "").upper()
+        use_loop_index = domain == "CORNER" or len(data) == len(getattr(mesh, "loops", []) or [])
+        color_array = _color_attribute_numpy_array(color_attribute)
+        if color_array is not None:
+            source = ("color_array", color_array, use_loop_index)
         else:
-            data = getattr(color_attribute, "data", [])
-            domain = str(getattr(color_attribute, "domain", "") or "").upper()
-            use_loop_index = domain == "CORNER" or len(data) == len(getattr(mesh, "loops", []) or [])
-            color_array = _color_attribute_numpy_array(color_attribute)
-            if color_array is not None:
-                source = ("color_array", color_array, use_loop_index)
-            else:
-                source = ("color", color_attribute, use_loop_index)
+            source = ("color", color_attribute, use_loop_index)
 
     mesh_cache.texcoord_snorm4_sources[key] = source
     return source
-
-
-def _texcoord_component_numpy_array(component_data: list) -> object | None:
-    np = optional_numpy()
-    if np is None or len(component_data) != 4:
-        return None
-    arrays = []
-    for data in component_data:
-        values = _scalar_attribute_numpy_array(data, np.int32)
-        if values is None:
-            return None
-        arrays.append(values)
-    try:
-        return (np.stack(arrays, axis=1).astype(np.int32) & 0xFF).astype(np.uint8)
-    except Exception:
-        return None
 
 
 def _color_attribute_numpy_array(attribute) -> object | None:
@@ -1138,55 +1078,6 @@ def _color_attribute_numpy_array(attribute) -> object | None:
         return None
 
 
-def _scalar_attribute_numpy_array(data, dtype) -> object | None:
-    np = optional_numpy()
-    if np is None:
-        return None
-    count = len(data)
-    if count <= 0:
-        return np.zeros((0,), dtype=dtype)
-    foreach_get = getattr(data, "foreach_get", None)
-    if not callable(foreach_get):
-        return None
-    try:
-        values = np.empty(count, dtype=dtype)
-        foreach_get("value", values)
-        return values
-    except Exception:
-        return None
-
-
-def _point_attribute(mesh, names: tuple[str, ...], mesh_cache: _MeshExportCache):
-    for name in names:
-        attribute = mesh_cache.attribute_refs.get(name)
-        if name not in mesh_cache.attribute_refs:
-            attributes = getattr(mesh, "attributes", None)
-            attribute = None
-            if attributes is not None:
-                getter = getattr(attributes, "get", None)
-                if callable(getter):
-                    attribute = getter(name)
-                elif isinstance(attributes, dict):
-                    attribute = attributes.get(name)
-            mesh_cache.attribute_refs[name] = attribute
-        if attribute is not None:
-            return attribute
-    return None
-
-
-def _raw_byte_from_attribute_data(data, index: int) -> int:
-    if index >= len(data):
-        return 0
-    item = data[index]
-    if hasattr(item, "value"):
-        return int(getattr(item, "value")) & 0xFF
-    if hasattr(item, "vector"):
-        vector = getattr(item, "vector")
-        if vector:
-            return int(vector[0]) & 0xFF
-    return 0
-
-
 def _field_bytes(
     slot_name: str,
     slot_layout: dict,
@@ -1202,7 +1093,7 @@ def _field_bytes(
     if semantic_name == "NORMAL" and semantic_index == 0:
         normal = _game_normal(loop_vertex, export_cache)
         if _normalize_format(fmt) == "R32_FLOAT":
-            return int(encode_game_packed_normal(normal)).to_bytes(4, "little", signed=False)
+            return int(_game_packed_tangent_frame(loop_vertex, export_cache)).to_bytes(4, "little", signed=False)
         return pack_vertex_format(fmt, normal)
     if semantic_name == "TEXCOORD" and semantic_index in {0, 1} and _normalize_format(fmt) == "R32G32_FLOAT":
         return pack_vertex_format(fmt, _uv(loop_vertex, f"UV{semantic_index}", export_cache))
@@ -1385,13 +1276,89 @@ def _game_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float,
     return result
 
 
-def _game_packed_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[int]:
-    if mesh_cache.game_packed_normal_values is not None:
-        return mesh_cache.game_packed_normal_values
+def _game_tangent(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> tuple[float, float, float]:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    values = _game_tangent_values(loop_vertex.mesh, mesh_cache)
+    if loop_vertex.loop_index < len(values):
+        return _vector3(values[loop_vertex.loop_index])
+    raise ValueError(f"{getattr(mesh_cache.mesh_obj, 'name', '<mesh>')}: missing loop tangent for packed NORMAL0 export")
+
+
+def _game_bitangent_sign(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> float:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    values = _game_bitangent_sign_values(loop_vertex.mesh, mesh_cache)
+    if loop_vertex.loop_index < len(values):
+        return float(values[loop_vertex.loop_index])
+    raise ValueError(f"{getattr(mesh_cache.mesh_obj, 'name', '<mesh>')}: missing bitangent sign for packed NORMAL0 export")
+
+
+def _game_tangent_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float, float, float]]:
+    if mesh_cache.game_tangent_values is not None:
+        return mesh_cache.game_tangent_values
     np = optional_numpy()
-    values = _game_normal_values(mesh, mesh_cache)
+    values = _loop_tangent_values(mesh, mesh_cache)
     if np is not None and hasattr(values, "shape"):
-        normals = np.asarray(values, dtype=np.float32)
+        tangents = np.asarray(values, dtype=np.float32)
+        if not mesh_cache.matrix_world_applied:
+            tangents = _transform_normals_numpy(mesh_cache.mesh_obj, tangents)
+        if mesh_cache.mirror_flip:
+            tangents = tangents.copy()
+            tangents[:, 0] *= -1.0
+        lengths = np.linalg.norm(tangents, axis=1, keepdims=True)
+        lengths = np.where(lengths <= 1e-12, 1.0, lengths)
+        tangents = tangents / lengths
+        mesh_cache.game_tangent_values = tangents
+        return tangents
+    result = []
+    for tangent in values:
+        game_tangent = tangent
+        if not mesh_cache.matrix_world_applied:
+            game_tangent = _transform_normal(mesh_cache.mesh_obj, game_tangent)
+        if mesh_cache.mirror_flip:
+            game_tangent = (-game_tangent[0], game_tangent[1], game_tangent[2])
+        result.append(_normalize3(game_tangent))
+    mesh_cache.game_tangent_values = result
+    return result
+
+
+def _game_bitangent_sign_values(mesh, mesh_cache: _MeshExportCache) -> list[float]:
+    if mesh_cache.game_bitangent_sign_values is not None:
+        return mesh_cache.game_bitangent_sign_values
+    values = _loop_bitangent_sign_values(mesh, mesh_cache)
+    np = optional_numpy()
+    if np is not None and hasattr(values, "shape"):
+        signs = np.asarray(values, dtype=np.float32)
+        if mesh_cache.mirror_flip:
+            signs = -signs
+        mesh_cache.game_bitangent_sign_values = signs
+        return signs
+    result = [(-float(value) if mesh_cache.mirror_flip else float(value)) for value in values]
+    mesh_cache.game_bitangent_sign_values = result
+    return result
+
+
+def _game_packed_tangent_frame(loop_vertex: _LoopVertex, export_cache: _ExportPartCache) -> int:
+    mesh_cache = export_cache.mesh_cache(loop_vertex)
+    packed_values = _game_packed_tangent_frame_values(loop_vertex.mesh, mesh_cache)
+    if loop_vertex.loop_index < len(packed_values):
+        return int(packed_values[loop_vertex.loop_index])
+    normal = _game_normal(loop_vertex, export_cache)
+    tangent = _game_tangent(loop_vertex, export_cache)
+    handedness = _game_bitangent_sign(loop_vertex, export_cache)
+    return int(encode_game_packed_tangent_frame(normal, tangent, handedness))
+
+
+def _game_packed_tangent_frame_values(mesh, mesh_cache: _MeshExportCache) -> list[int]:
+    if mesh_cache.game_packed_tangent_frame_values is not None:
+        return mesh_cache.game_packed_tangent_frame_values
+    np = optional_numpy()
+    normal_values = _game_normal_values(mesh, mesh_cache)
+    tangent_values = _game_tangent_values(mesh, mesh_cache)
+    handedness_values = _game_bitangent_sign_values(mesh, mesh_cache)
+    if np is not None and hasattr(normal_values, "shape") and hasattr(tangent_values, "shape"):
+        normals = np.asarray(normal_values, dtype=np.float32)
+        tangents = np.asarray(tangent_values, dtype=np.float32)
+        handedness = np.asarray(handedness_values, dtype=np.float32)
         if normals.size == 0:
             packed = np.zeros((0,), dtype=np.uint32)
         else:
@@ -1411,13 +1378,32 @@ def _game_packed_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[int]:
                 oct_y = np.where(fold_mask, folded_y, oct_y)
             quant_x = np.rint(np.clip(oct_x, -1.0, 1.0) * 511.0).astype(np.int32)
             quant_y = np.rint(np.clip(oct_y, -1.0, 1.0) * 511.0).astype(np.int32)
-            packed = (0x40000000 | (quant_x & 0x3FF) | ((quant_y & 0x3FF) << 10)).astype(np.uint32)
-        mesh_cache.game_packed_normal_values = packed
+            decoded_normals = np.asarray([_decode_octahedral_quantized(int(x), int(y)) for x, y in zip(quant_x, quant_y)], dtype=np.float32)
+            packed_roll = np.asarray(
+                [
+                    _encode_tangent_roll(normal, tangent)
+                    for normal, tangent in zip(decoded_normals, tangents)
+                ],
+                dtype=np.uint32,
+            )
+            sign_bits = np.where(handedness >= 0.0, np.uint32(0x80000000), np.uint32(0))
+            packed = (
+                np.uint32(0x40000000)
+                | (quant_x.astype(np.uint32) & np.uint32(0x3FF))
+                | ((quant_y.astype(np.uint32) & np.uint32(0x3FF)) << np.uint32(10))
+                | ((packed_roll & np.uint32(0x3FF)) << np.uint32(20))
+                | sign_bits
+            ).astype(np.uint32)
+        mesh_cache.game_packed_tangent_frame_values = packed
         return packed
     result = []
-    for normal in values:
-        result.append(int(encode_game_packed_normal(normal)))
-    mesh_cache.game_packed_normal_values = result
+    for loop_index, normal in enumerate(normal_values):
+        if loop_index >= len(tangent_values) or loop_index >= len(handedness_values):
+            raise ValueError(f"{getattr(mesh_cache.mesh_obj, 'name', '<mesh>')}: incomplete tangent frame for packed NORMAL0 export")
+        tangent = tangent_values[loop_index]
+        handedness = handedness_values[loop_index]
+        result.append(int(encode_game_packed_tangent_frame(normal, tangent, handedness)))
+    mesh_cache.game_packed_tangent_frame_values = result
     return result
 
 
@@ -1468,6 +1454,59 @@ def _loop_normal_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float,
     return mesh_cache.loop_normal_values
 
 
+def _loop_tangent_values(mesh, mesh_cache: _MeshExportCache) -> list[tuple[float, float, float]]:
+    _ensure_loop_tangent_values(mesh, mesh_cache)
+    return mesh_cache.loop_tangent_values if mesh_cache.loop_tangent_values is not None else []
+
+
+def _loop_bitangent_sign_values(mesh, mesh_cache: _MeshExportCache) -> list[float]:
+    _ensure_loop_tangent_values(mesh, mesh_cache)
+    return mesh_cache.loop_bitangent_sign_values if mesh_cache.loop_bitangent_sign_values is not None else []
+
+
+def _ensure_loop_tangent_values(mesh, mesh_cache: _MeshExportCache) -> None:
+    if mesh_cache.loop_tangent_values is not None and mesh_cache.loop_bitangent_sign_values is not None:
+        return
+    mesh_obj_name = getattr(mesh_cache.mesh_obj, "name", "<mesh>")
+    loops = getattr(mesh, "loops", []) or []
+    if not loops:
+        mesh_cache.loop_tangent_values = []
+        mesh_cache.loop_bitangent_sign_values = []
+        return
+    if not _calculate_mesh_tangents(mesh, mesh_cache):
+        raise ValueError(f"{mesh_obj_name}: packed NORMAL0 export requires a valid UV layer so tangents can be calculated")
+    tangents = _float_tuple_values(loops, "tangent", 3)
+    signs = _float_scalar_values(loops, "bitangent_sign")
+    if len(tangents) < len(loops) or len(signs) < len(loops):
+        raise ValueError(f"{mesh_obj_name}: packed NORMAL0 export could not read Blender loop tangents")
+    mesh_cache.loop_tangent_values = tangents
+    mesh_cache.loop_bitangent_sign_values = signs
+
+
+def _calculate_mesh_tangents(mesh, mesh_cache: _MeshExportCache) -> bool:
+    calc_tangents = getattr(mesh, "calc_tangents", None)
+    if not callable(calc_tangents):
+        first_loop = (getattr(mesh, "loops", []) or [None])[0]
+        return first_loop is not None and hasattr(first_loop, "tangent") and hasattr(first_loop, "bitangent_sign")
+    uv_layers = getattr(mesh, "uv_layers", None)
+    layer = _resolve_uv_layer(uv_layers, "UV0")
+    if layer is None:
+        return False
+    layer_name = str(getattr(layer, "name", "") or "")
+    try:
+        if layer_name:
+            calc_tangents(uvmap=layer_name)
+        else:
+            calc_tangents()
+        return True
+    except Exception:
+        try:
+            calc_tangents()
+            return True
+        except Exception:
+            return False
+
+
 def _uv_layer_values(layer, layer_name: str, mesh_cache: _MeshExportCache) -> list[tuple[float, float]]:
     if layer_name not in mesh_cache.uv_values_by_layer:
         mesh_cache.uv_values_by_layer[layer_name] = _float_tuple_values(getattr(layer, "data", []) or [], "uv", 2)
@@ -1512,6 +1551,102 @@ def _float_tuple_values(collection, attribute_name: str, component_count: int) -
     return values
 
 
+def _float_scalar_values(collection, attribute_name: str) -> list[float]:
+    count = len(collection)
+    if count <= 0:
+        return []
+    np = optional_numpy()
+    if np is not None:
+        try:
+            values = np.empty(count, dtype=np.float32)
+            foreach_get = getattr(collection, "foreach_get", None)
+            if callable(foreach_get):
+                foreach_get(attribute_name, values)
+                return values
+        except Exception:
+            pass
+    values = []
+    for item in collection:
+        values.append(float(getattr(item, attribute_name, 1.0)))
+    return values
+
+
+def _decode_octahedral_quantized(quant_x: int, quant_y: int) -> tuple[float, float, float]:
+    x_value = _signed10_float(quant_x)
+    y_value = _signed10_float(quant_y)
+    z_value = 1.0 - abs(x_value) - abs(y_value)
+    normal_x = x_value
+    normal_y = y_value
+    if z_value < 0.0:
+        normal_x = (1.0 - abs(y_value)) * (1.0 if x_value >= 0.0 else -1.0)
+        normal_y = (1.0 - abs(x_value)) * (1.0 if y_value >= 0.0 else -1.0)
+    return _normalize3((normal_x, normal_y, z_value))
+
+
+def _encode_tangent_roll(normal, tangent) -> int:
+    basis_u, basis_v = _packed_tangent_basis(_vector3(normal))
+    tangent = _normalize3(_vector3(tangent))
+    tangent = _orthogonalize(tangent, _vector3(normal))
+    roll_cos = _dot3(tangent, basis_u)
+    roll_sin = _dot3(tangent, basis_v)
+    denom = abs(roll_cos) + abs(roll_sin)
+    roll = 0.0 if denom <= 1e-12 else roll_sin / denom
+    return int(round(max(-1.0, min(1.0, roll)) * 511.0)) & 0x3FF
+
+
+def _packed_tangent_basis(normal: tuple[float, float, float]) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    normal = _normalize3(normal)
+    nx, ny, nz = normal
+    basis_u = (ny - nz, nz - nx, nx - ny)
+    projection = _dot3(basis_u, normal)
+    basis_u = _normalize3((basis_u[0] - projection, basis_u[1] - projection, basis_u[2] - projection))
+    if _length3(basis_u) <= 1e-6:
+        basis_u = _fallback_tangent(normal)
+    return basis_u, _normalize3(_cross3(normal, basis_u))
+
+
+def _orthogonalize(vector: tuple[float, float, float], normal: tuple[float, float, float]) -> tuple[float, float, float]:
+    normal = _normalize3(normal)
+    projection = _dot3(vector, normal)
+    tangent = (
+        vector[0] - projection * normal[0],
+        vector[1] - projection * normal[1],
+        vector[2] - projection * normal[2],
+    )
+    if _length3(tangent) <= 1e-6:
+        return _fallback_tangent(normal)
+    return _normalize3(tangent)
+
+
+def _fallback_tangent(normal: tuple[float, float, float]) -> tuple[float, float, float]:
+    axis = (1.0, 0.0, 0.0) if abs(normal[0]) < 0.9 else (0.0, 1.0, 0.0)
+    tangent = _cross3(axis, normal)
+    if _length3(tangent) <= 1e-6:
+        tangent = _cross3((0.0, 0.0, 1.0), normal)
+    return _normalize3(tangent)
+
+
+def _signed10_float(value: int) -> float:
+    signed = int(value) - 1024 if int(value) >= 512 else int(value)
+    return float(signed) / 511.0
+
+
+def _dot3(left: tuple[float, float, float], right: tuple[float, float, float]) -> float:
+    return float(left[0]) * float(right[0]) + float(left[1]) * float(right[1]) + float(left[2]) * float(right[2])
+
+
+def _cross3(left: tuple[float, float, float], right: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (
+        float(left[1]) * float(right[2]) - float(left[2]) * float(right[1]),
+        float(left[2]) * float(right[0]) - float(left[0]) * float(right[2]),
+        float(left[0]) * float(right[1]) - float(left[1]) * float(right[0]),
+    )
+
+
+def _length3(value: tuple[float, float, float]) -> float:
+    return math.sqrt(float(value[0]) * float(value[0]) + float(value[1]) * float(value[1]) + float(value[2]) * float(value[2]))
+
+
 def _optional_uv(loop_vertex: _LoopVertex, layer_name: str, export_cache: _ExportPartCache) -> tuple[float, float] | None:
     try:
         return _uv(loop_vertex, layer_name, export_cache)
@@ -1529,6 +1664,11 @@ def _texcoord_field_bytes(
     fmt = _normalize_format(str(field["format"]))
     semantic_index = int(field["semantic_index"])
     component_count = _format_component_count(fmt)
+    if fmt == "R8G8B8A8_SNORM":
+        color_bytes = _texcoord_color_bytes(slot_name, semantic_index, loop_vertex, export_cache)
+        if color_bytes is not None:
+            return color_bytes
+        return b"\x00\x00\x00\x00"
     values = [
         _point_attribute_value(
             loop_vertex.mesh,
@@ -1538,14 +1678,7 @@ def _texcoord_field_bytes(
         )
         for component in range(component_count)
     ]
-    if fmt == "R8G8B8A8_SNORM":
-        if not any(value is None for value in values):
-            return bytes((int(value) & 0xFF) for value in values)
-        color_bytes = _texcoord_color_bytes(slot_name, semantic_index, loop_vertex, export_cache)
-        if color_bytes is not None:
-            return color_bytes
-        return _default_texcoord_field_bytes(slot_layout, field, loop_vertex, export_cache)
-    elif not any(value is None for value in values):
+    if not any(value is None for value in values):
         return pack_vertex_format(fmt, [float(value) for value in values])
 
     return _default_texcoord_field_bytes(slot_layout, field, loop_vertex, export_cache)

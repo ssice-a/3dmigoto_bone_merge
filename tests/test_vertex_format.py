@@ -61,6 +61,17 @@ class VertexFormatTests(unittest.TestCase):
         dot = sum(a * b for a, b in zip(normalized_source, decoded))
         self.assertGreater(dot, 0.999)
 
+    def test_game_packed_tangent_frame_preserves_roll_and_sign(self):
+        normal = (0.0, 0.0, 1.0)
+        tangent = (-1.0, 0.0, 0.0)
+        packed = vertex_format.encode_game_packed_tangent_frame(normal, tangent, 1.0)
+        decoded_normal, decoded_tangent, decoded_sign = vertex_format.decode_game_packed_tangent_frame(packed)
+
+        self.assertGreater(sum(a * b for a, b in zip(normal, decoded_normal)), 0.999)
+        self.assertGreater(sum(a * b for a, b in zip(tangent, decoded_tangent)), 0.99)
+        self.assertEqual(decoded_sign, 1.0)
+        self.assertNotEqual((packed >> 20) & 0x3FF, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

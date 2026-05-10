@@ -1,8 +1,8 @@
-"""Shared helpers for raw TEXCOORD attribute storage.
+"""Shared helpers for editable non-UV TEXCOORD attribute storage.
 
-The game can bind packed auxiliary data as TEXCOORD semantics.  Those values
-are not Blender UV layers, so we keep exact point attributes and optionally
-mirror byte-packed TEXCOORD4 data into a color attribute for editing.
+The game can bind packed auxiliary data as TEXCOORD semantics.  R8G8B8A8_SNORM
+payloads are edited through color attributes and exported from the current
+mesh state; missing color attributes intentionally encode as zero.
 """
 
 from __future__ import annotations
@@ -10,10 +10,7 @@ from __future__ import annotations
 
 def texcoord_component_attr_names(slot_name: str, semantic_index: int, component: int) -> tuple[str, ...]:
     slot_index = _slot_index(slot_name)
-    names = [f"bmc_vb{slot_index}_texcoord{int(semantic_index)}_{int(component)}"]
-    if int(semantic_index) == 4:
-        names.append(f"bmc_texcoord4_raw_{int(component)}")
-    return tuple(names)
+    return (f"bmc_vb{slot_index}_texcoord{int(semantic_index)}_{int(component)}",)
 
 
 def texcoord_color_attr_names(slot_name: str, semantic_index: int) -> tuple[str, ...]:

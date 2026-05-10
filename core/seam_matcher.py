@@ -10,6 +10,7 @@ from .spatial_index import (
     cell_key as _generic_cell_key,
     neighbor_keys as _generic_neighbor_keys,
 )
+from .numpy_buffers import expanded_cell_key_set, point_bounds
 from .numpy_compat import optional_numpy
 
 try:
@@ -310,6 +311,7 @@ def _build_seam_cache(mesh_obj, *, perf: dict | None = None) -> dict | None:
     stage_start = time.perf_counter()
     spatial_hash = _build_spatial_hash(weighted_seam_vertices, _MATCH_TOLERANCE)
     cell_keys = frozenset(spatial_hash)
+    expanded_cell_keys = expanded_cell_key_set(cell_keys)
     if perf is not None:
         perf["spatial_hash"] = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
@@ -318,19 +320,23 @@ def _build_seam_cache(mesh_obj, *, perf: dict | None = None) -> dict | None:
         perf["group_clouds"] = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
     group_cell_index = _build_group_cell_index(group_clouds)
+    group_neighbor_cell_index = _build_group_cell_index(group_clouds, expanded=True)
     if perf is not None:
         perf["group_cell_index"] = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
-    bounds_min = _bounds_min(weighted_seam_vertices)
-    bounds_max = _bounds_max(weighted_seam_vertices)
+    bounds = point_bounds([world_co for _vertex_index, world_co in weighted_seam_vertices])
+    bounds_min = tuple(float(value) for value in bounds[0])
+    bounds_max = tuple(float(value) for value in bounds[1])
     if perf is not None:
         perf["bounds"] = time.perf_counter() - stage_start
     return {
         "seam_vertices": weighted_seam_vertices,
         "spatial_hash": spatial_hash,
         "cell_keys": cell_keys,
+        "expanded_cell_keys": expanded_cell_keys,
         "group_clouds": group_clouds,
         "group_cell_index": group_cell_index,
+        "group_neighbor_cell_index": group_neighbor_cell_index,
         "group_numbers": frozenset(group_clouds),
         "group_vertex_cache": {},
         "bounds_min": bounds_min,
@@ -385,14 +391,16 @@ def _build_group_clouds(weighted_seam_vertices, weight_items_by_vertex) -> dict[
                 float(accumulator["max_z"]),
             ),
             "cell_keys": frozenset(accumulator["cell_keys"]),
+            "expanded_cell_keys": expanded_cell_key_set(accumulator["cell_keys"]),
         }
     return clouds
 
 
-def _build_group_cell_index(group_clouds: dict[int, dict]) -> dict:
+def _build_group_cell_index(group_clouds: dict[int, dict], *, expanded: bool = False) -> dict:
     cell_index: dict[tuple[int, int, int], set[int]] = {}
     for group_number, cloud in group_clouds.items():
-        for cell_key in cloud["cell_keys"]:
+        key_name = "expanded_cell_keys" if expanded else "cell_keys"
+        for cell_key in cloud[key_name]:
             cell_index.setdefault(cell_key, set()).add(int(group_number))
     return cell_index
 
@@ -842,7 +850,7 @@ def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: f
                 max_gap,
             ):
                 continue
-            if not _cell_key_sets_touch(source_cache["cell_keys"], target_cache["cell_keys"]):
+            if source_cache["expanded_cell_keys"].isdisjoint(target_cache["cell_keys"]):
                 continue
             stage_start = time.perf_counter()
             allowed_group_pairs = _allowed_group_pairs_from_caches(source_cache, target_cache)
@@ -856,15 +864,14 @@ def _iter_bbox_candidate_pairs(caches: dict, object_names: list[str], max_gap: f
 def _allowed_group_pairs_from_caches(source_cache: dict, target_cache: dict) -> set[tuple[int, int]]:
     source_group_clouds = source_cache["group_clouds"]
     target_group_clouds = target_cache["group_clouds"]
-    target_group_cell_index = target_cache["group_cell_index"]
+    target_group_cell_index = target_cache["group_neighbor_cell_index"]
     if not source_group_clouds or not target_group_clouds or not target_group_cell_index:
         return set()
     allowed: set[tuple[int, int]] = set()
     for source_group, source_cloud in sorted(source_group_clouds.items()):
         target_groups = set()
         for cell_key in source_cloud["cell_keys"]:
-            for neighbor_key in _neighbor_keys(cell_key):
-                target_groups.update(target_group_cell_index.get(neighbor_key, ()))
+            target_groups.update(target_group_cell_index.get(cell_key, ()))
         for target_group in target_groups:
             target_cloud = target_group_clouds.get(int(target_group))
             if target_cloud is None:
@@ -915,17 +922,6 @@ def _vertices_for_groups(group_clouds: dict[int, dict], groups: set[int]):
         for vertex_index, world_co in cloud["points"]:
             by_vertex.setdefault(int(vertex_index), (int(vertex_index), world_co))
     return sorted(by_vertex.values(), key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
-
-
-def _cell_key_sets_touch(left_keys, right_keys) -> bool:
-    if not left_keys or not right_keys:
-        return False
-    probe_keys, target_keys = (left_keys, right_keys) if len(left_keys) <= len(right_keys) else (right_keys, left_keys)
-    for cell_key in probe_keys:
-        for neighbor_key in _neighbor_keys(cell_key):
-            if neighbor_key in target_keys:
-                return True
-    return False
 
 
 def _print_seam_performance_report(perf: dict, build_result: SeamBuildResult) -> None:
@@ -1070,30 +1066,6 @@ def _build_vertex_pairs(source_vertices, source_spatial_hash, target_vertices, t
             continue
         matched_pairs.append((source_index, target_index, distance))
     return matched_pairs
-
-
-def _bounds_min(vertices):
-    first_world_co = vertices[0][1]
-    min_x = float(first_world_co[0])
-    min_y = float(first_world_co[1])
-    min_z = float(first_world_co[2])
-    for _vertex_index, world_co in vertices[1:]:
-        min_x = min(min_x, float(world_co[0]))
-        min_y = min(min_y, float(world_co[1]))
-        min_z = min(min_z, float(world_co[2]))
-    return min_x, min_y, min_z
-
-
-def _bounds_max(vertices):
-    first_world_co = vertices[0][1]
-    max_x = float(first_world_co[0])
-    max_y = float(first_world_co[1])
-    max_z = float(first_world_co[2])
-    for _vertex_index, world_co in vertices[1:]:
-        max_x = max(max_x, float(world_co[0]))
-        max_y = max(max_y, float(world_co[1]))
-        max_z = max(max_z, float(world_co[2]))
-    return max_x, max_y, max_z
 
 
 def _points_bounds_min(points):

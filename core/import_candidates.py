@@ -6,7 +6,6 @@ import json
 import math
 import os
 import re
-import struct
 import time
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -14,7 +13,7 @@ from typing import Iterable
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
 from .numpy_compat import optional_numpy
 from .numpy_buffers import index_format_spec, read_index_file, read_interleaved_field, read_interleaved_fields
-from .texcoord_attrs import snorm_byte_to_color_component, texcoord_color_attr_names
+from .texcoord_attrs import texcoord_color_attr_names
 from .uv_transform import DEFAULT_UV_FLIP_V, game_uv_to_blender
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
 
@@ -38,6 +37,8 @@ class LoadedCandidateGeometry:
     uv1: list[tuple[float, float]] | None
     normals: list[tuple[float, float, float]]
     normal_packed: list[int]
+    tangents: list[tuple[float, float, float]]
+    bitangent_signs: list[float]
     texcoord4_raw: list[tuple[int, int, int, int]]
     texcoord_semantics: list[dict]
     vertex_layout: dict
@@ -72,8 +73,6 @@ class _RowTupleArray:
 
     def __array__(self, dtype=None):
         np = optional_numpy()
-        if np is None:
-            return self._values
         return np.asarray(self._values, dtype=dtype) if dtype is not None else np.asarray(self._values)
 
     def __getitem__(self, index):
@@ -95,14 +94,11 @@ class _RowTupleArray:
 
 def _row_tuple_array(values):
     np = optional_numpy()
-    if np is None or values is None:
+    if values is None:
         return values
-    try:
-        array = np.asarray(values)
-        if array.ndim >= 2:
-            return _RowTupleArray(array)
-    except Exception:
-        pass
+    array = np.asarray(values)
+    if array.ndim >= 2:
+        return _RowTupleArray(array)
     return values
 
 
@@ -158,7 +154,7 @@ def load_candidate_geometry(
     if vb0 is None:
         raise ValueError(f"Candidate {candidate.get('display_name') or candidate.get('ib_hash')} has no vb0 slice")
     stage_start = time.perf_counter()
-    positions, normals, normal_packed = _read_vb0_position_normal(vb0, original_vertex_ids, warnings)
+    positions, normals, normal_packed, tangents, bitangent_signs = _read_vb0_position_normal(vb0, original_vertex_ids, warnings)
     vb0_seconds = time.perf_counter() - stage_start
     timings["positions"] = vb0_seconds * 0.5
     timings["normals"] = vb0_seconds * 0.5
@@ -215,6 +211,8 @@ def load_candidate_geometry(
         uv1=_row_tuple_array(uv1),
         normals=_row_tuple_array(normals),
         normal_packed=normal_packed,
+        tangents=_row_tuple_array(tangents),
+        bitangent_signs=bitangent_signs,
         texcoord4_raw=texcoord4_raw,
         texcoord_semantics=texcoord_semantics,
         vertex_layout=vertex_layout,
@@ -325,6 +323,12 @@ def create_blender_object_from_geometry(
     stage_start = time.perf_counter()
     blender_positions = _positions_for_blender(geometry.positions, mirror_flip=mirror_flip)
     blender_normals = _normals_for_blender(geometry.normals, mirror_flip=mirror_flip)
+    blender_tangents = _normals_for_blender(geometry.tangents, mirror_flip=mirror_flip)
+    blender_bitangent_signs = _bitangent_signs_for_blender(
+        geometry.bitangent_signs,
+        mirror_flip=mirror_flip,
+        uv_flip_v=uv_flip_v,
+    )
     blender_triangles = _triangles_for_blender(geometry.triangles, mirror_flip=mirror_flip)
     timings["transform"] = time.perf_counter() - stage_start
 
@@ -349,6 +353,8 @@ def create_blender_object_from_geometry(
 
     stage_start = time.perf_counter()
     _store_int_attribute(mesh, "bmc_orig_vertex_id", geometry.original_vertex_ids)
+    if _has_packed_tangent_frame(geometry.normal_packed):
+        _store_tangent_frame_attributes(mesh, blender_tangents, blender_bitangent_signs)
     _store_texcoord_semantic_attributes(mesh, geometry.texcoord_semantics)
     for channel_index in range(4):
         _store_int_attribute(
@@ -443,6 +449,24 @@ def _normals_for_blender(
     return [_mirror_x_vector(normal) for normal in normals]
 
 
+def _bitangent_signs_for_blender(
+    signs: list[float],
+    *,
+    mirror_flip: bool,
+    uv_flip_v: bool,
+) -> list[float]:
+    flip_sign = bool(mirror_flip) ^ bool(uv_flip_v)
+    np = optional_numpy()
+    if np is not None and hasattr(signs, "shape"):
+        values = np.asarray(signs, dtype=np.float32)
+        if flip_sign and values.size:
+            values = -values
+        return values
+    if not flip_sign:
+        return list(signs)
+    return [-float(value) for value in signs]
+
+
 def _triangles_for_blender(
     triangles: list[tuple[int, int, int]],
     *,
@@ -456,86 +480,141 @@ def _triangles_for_blender(
 
 def _decode_game_packed_normals(values):
     np = optional_numpy()
-    if np is None:
-        return [decode_game_packed_normal(value) for value in values]
-    try:
-        packed = np.asarray(values, dtype=np.uint32).reshape(-1)
-        valid = (packed & np.uint32(0x40000000)) != 0
-        raw_x = (packed & np.uint32(0x3FF)).astype(np.int32)
-        raw_y = ((packed >> np.uint32(10)) & np.uint32(0x3FF)).astype(np.int32)
-        signed_x = np.where(raw_x >= 512, raw_x - 1024, raw_x).astype(np.float32) / 511.0
-        signed_y = np.where(raw_y >= 512, raw_y - 1024, raw_y).astype(np.float32) / 511.0
-        z_values = 1.0 - np.abs(signed_x) - np.abs(signed_y)
-        normal_x = signed_x.copy()
-        normal_y = signed_y.copy()
-        fold = z_values < 0.0
-        if np.any(fold):
-            sign_x = np.where(signed_x >= 0.0, 1.0, -1.0)
-            sign_y = np.where(signed_y >= 0.0, 1.0, -1.0)
-            normal_x = np.where(fold, (1.0 - np.abs(signed_y)) * sign_x, normal_x)
-            normal_y = np.where(fold, (1.0 - np.abs(signed_x)) * sign_y, normal_y)
-        normals = np.stack((normal_x, normal_y, z_values), axis=1).astype(np.float32)
-        normals[~valid] = (0.0, 0.0, 1.0)
-        return _normalize_vectors(normals)
-    except Exception:
-        return [decode_game_packed_normal(value) for value in values]
+    packed = np.asarray(values, dtype=np.uint32).reshape(-1)
+    valid = (packed & np.uint32(0x40000000)) != 0
+    raw_x = (packed & np.uint32(0x3FF)).astype(np.int32)
+    raw_y = ((packed >> np.uint32(10)) & np.uint32(0x3FF)).astype(np.int32)
+    signed_x = np.where(raw_x >= 512, raw_x - 1024, raw_x).astype(np.float32) / 511.0
+    signed_y = np.where(raw_y >= 512, raw_y - 1024, raw_y).astype(np.float32) / 511.0
+    z_values = 1.0 - np.abs(signed_x) - np.abs(signed_y)
+    normal_x = signed_x.copy()
+    normal_y = signed_y.copy()
+    fold = z_values < 0.0
+    if np.any(fold):
+        sign_x = np.where(signed_x >= 0.0, 1.0, -1.0)
+        sign_y = np.where(signed_y >= 0.0, 1.0, -1.0)
+        normal_x = np.where(fold, (1.0 - np.abs(signed_y)) * sign_x, normal_x)
+        normal_y = np.where(fold, (1.0 - np.abs(signed_x)) * sign_y, normal_y)
+    normals = np.stack((normal_x, normal_y, z_values), axis=1).astype(np.float32)
+    normals[~valid] = (0.0, 0.0, 1.0)
+    return _normalize_vectors(normals)
+
+
+def _decode_game_packed_tangent_frames(values):
+    np = optional_numpy()
+    packed = np.asarray(values, dtype=np.uint32).reshape(-1)
+    if packed.size == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+        )
+    valid = (packed & np.uint32(0x40000000)) != 0
+    normals = np.asarray(_decode_game_packed_normals(packed), dtype=np.float32)
+    roll_raw = ((packed >> np.uint32(20)) & np.uint32(0x3FF)).astype(np.int32)
+    roll = np.where(roll_raw >= 512, roll_raw - 1024, roll_raw).astype(np.float32) / 511.0
+    basis_u, basis_v = _packed_tangent_basis_numpy(normals)
+    roll_x = 1.0 - np.abs(roll)
+    roll_y = np.where(roll < 0.0, -1.0, 1.0) * (1.0 - np.abs(roll_x))
+    roll_length = np.sqrt((roll_x * roll_x) + (roll_y * roll_y))
+    roll_length = np.where(roll_length <= 1e-12, 1.0, roll_length)
+    cosine = roll_x / roll_length
+    sine = roll_y / roll_length
+    tangents = (basis_u * cosine[:, None]) + (basis_v * sine[:, None])
+    tangents = _normalize_vectors(tangents)
+    tangents = np.where(valid[:, None], tangents, np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    signs = np.where((packed & np.uint32(0x80000000)) != 0, 1.0, -1.0).astype(np.float32)
+    signs = np.where(valid, signs, 1.0).astype(np.float32)
+    return tangents, signs
+
+
+def _packed_tangent_basis_numpy(normals):
+    np = optional_numpy()
+    normal_values = _normalize_vectors(normals)
+    basis_u = np.stack(
+        (
+            normal_values[:, 1] - normal_values[:, 2],
+            normal_values[:, 2] - normal_values[:, 0],
+            normal_values[:, 0] - normal_values[:, 1],
+        ),
+        axis=1,
+    ).astype(np.float32)
+    projection = np.sum(basis_u * normal_values, axis=1, keepdims=True)
+    basis_u = basis_u - projection
+    lengths = np.linalg.norm(basis_u, axis=1)
+    fallback = lengths <= 1e-6
+    if np.any(fallback):
+        basis_u = basis_u.copy()
+        basis_u[fallback] = _fallback_tangents_numpy(normal_values[fallback])
+    basis_u = _normalize_vectors(basis_u)
+    basis_v = _normalize_vectors(np.cross(normal_values, basis_u))
+    return basis_u, basis_v
+
+
+def _fallback_tangents_numpy(normals):
+    np = optional_numpy()
+    normal_values = _normalize_vectors(normals)
+    axes = np.zeros_like(normal_values)
+    use_x = np.abs(normal_values[:, 0]) < 0.9
+    axes[use_x, 0] = 1.0
+    axes[~use_x, 1] = 1.0
+    tangents = np.cross(axes, normal_values)
+    lengths = np.linalg.norm(tangents, axis=1)
+    fallback = lengths <= 1e-6
+    if np.any(fallback):
+        z_axes = np.zeros_like(normal_values[fallback])
+        z_axes[:, 2] = 1.0
+        tangents[fallback] = np.cross(z_axes, normal_values[fallback])
+    return _normalize_vectors(tangents)
 
 
 def _normalize_vectors(values):
     np = optional_numpy()
-    if np is not None:
-        try:
-            vectors = np.asarray(values, dtype=np.float32)
-            if vectors.size == 0:
-                return vectors.reshape((0, 3))
-            lengths = np.linalg.norm(vectors[:, :3], axis=1, keepdims=True)
-            lengths = np.where(lengths <= 1e-12, 1.0, lengths)
-            return vectors[:, :3] / lengths
-        except Exception:
-            pass
-    return [_normalize_vector((float(record[0]), float(record[1]), float(record[2]))) for record in values]
+    vectors = np.asarray(values, dtype=np.float32)
+    if vectors.size == 0:
+        return vectors.reshape((0, 3))
+    lengths = np.linalg.norm(vectors[:, :3], axis=1, keepdims=True)
+    lengths = np.where(lengths <= 1e-12, 1.0, lengths)
+    return vectors[:, :3] / lengths
 
 
 def _default_normals(vertex_ids: list[int]):
     np = optional_numpy()
-    if np is not None:
-        try:
-            values = np.zeros((len(vertex_ids), 3), dtype=np.float32)
-            values[:, 2] = 1.0
-            return values
-        except Exception:
-            pass
-    return [(0.0, 0.0, 1.0) for _ in vertex_ids]
+    values = np.zeros((len(vertex_ids), 3), dtype=np.float32)
+    values[:, 2] = 1.0
+    return values
+
+
+def _default_tangents(vertex_ids: list[int]):
+    np = optional_numpy()
+    values = np.zeros((len(vertex_ids), 3), dtype=np.float32)
+    values[:, 0] = 1.0
+    return values
+
+
+def _default_bitangent_signs(vertex_ids: list[int]):
+    np = optional_numpy()
+    return np.ones((len(vertex_ids),), dtype=np.float32)
+
+
+def _has_packed_tangent_frame(values) -> bool:
+    np = optional_numpy()
+    packed = np.asarray(values, dtype=np.uint32)
+    return bool(packed.size and np.any((packed & np.uint32(0x40000000)) != 0))
 
 
 def _zeros_like_vertex_ids(vertex_ids: list[int], *, dtype: str):
     np = optional_numpy()
-    if np is not None:
-        try:
-            return np.zeros((len(vertex_ids),), dtype=np.dtype(dtype))
-        except Exception:
-            pass
-    return [0 for _ in vertex_ids]
+    return np.zeros((len(vertex_ids),), dtype=np.dtype(dtype))
 
 
 def _default_blend_weights(vertex_ids: list[int]):
     np = optional_numpy()
-    if np is not None:
-        try:
-            return np.zeros((len(vertex_ids), 4), dtype=np.float32)
-        except Exception:
-            pass
-    return [(0.0, 0.0, 0.0, 0.0) for _ in vertex_ids]
+    return np.zeros((len(vertex_ids), 4), dtype=np.float32)
 
 
 def _default_blend_indices(vertex_ids: list[int]):
     np = optional_numpy()
-    if np is not None:
-        try:
-            return np.zeros((len(vertex_ids), 4), dtype=np.uint32)
-        except Exception:
-            pass
-    return [(0, 0, 0, 0) for _ in vertex_ids]
+    return np.zeros((len(vertex_ids), 4), dtype=np.uint32)
 
 
 def decode_game_packed_normal(value: int) -> tuple[float, float, float]:
@@ -857,29 +936,43 @@ def _read_vb0_position_normal(
         if normal_mode == "packed":
             normal_packed = batch["normal_packed"].reshape(-1)
             normals = _decode_game_packed_normals(normal_packed)
-            return positions, normals, normal_packed
+            tangents, bitangent_signs = _decode_game_packed_tangent_frames(normal_packed)
+            return positions, normals, normal_packed, tangents, bitangent_signs
         if normal_mode == "float3":
             normals = _normalize_vectors(batch["normals"])
             normal_packed = _zeros_like_vertex_ids(vertex_ids, dtype="uint32")
-            return positions, normals, normal_packed
+            tangents = _default_tangents(vertex_ids)
+            bitangent_signs = _default_bitangent_signs(vertex_ids)
+            return positions, normals, normal_packed, tangents, bitangent_signs
         warnings.append(f"{slot.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
-        return positions, _default_normals(vertex_ids), _zeros_like_vertex_ids(vertex_ids, dtype="uint32")
+        return (
+            positions,
+            _default_normals(vertex_ids),
+            _zeros_like_vertex_ids(vertex_ids, dtype="uint32"),
+            _default_tangents(vertex_ids),
+            _default_bitangent_signs(vertex_ids),
+        )
 
     positions = _read_required_float3(slot, "POSITION", 0, vertex_ids)
     if normal_element is not None and _is_format(normal_element.fmt, "R32_FLOAT"):
         normal_packed = _read_uint32_records(slot, normal_element, vertex_ids)
         normals = [decode_game_packed_normal(value) for value in normal_packed]
+        tangents, bitangent_signs = _decode_game_packed_tangent_frames(normal_packed)
     elif normal_element is not None and _is_format(normal_element.fmt, "R32G32B32_FLOAT"):
         normals = [
             _normalize_vector((float(record[0]), float(record[1]), float(record[2])))
             for record in _read_format_records(slot, normal_element, vertex_ids)
         ]
         normal_packed = [0 for _ in vertex_ids]
+        tangents = [(1.0, 0.0, 0.0) for _ in vertex_ids]
+        bitangent_signs = [1.0 for _ in vertex_ids]
     else:
         warnings.append(f"{slot.slot_name}: NORMAL0 is missing; imported normals use +Z fallback")
         normal_packed = [0 for _ in vertex_ids]
         normals = [(0.0, 0.0, 1.0) for _ in vertex_ids]
-    return positions, normals, normal_packed
+        tangents = [(1.0, 0.0, 0.0) for _ in vertex_ids]
+        bitangent_signs = [1.0 for _ in vertex_ids]
+    return positions, normals, normal_packed, tangents, bitangent_signs
 
 
 def _read_vb1_uv_layers(slot: _SlotSlice, vertex_ids: list[int]):
@@ -1060,12 +1153,9 @@ def _element_layout_payload(element: HeaderElement) -> dict:
 def _read_uint32_records(slot: _SlotSlice, element: HeaderElement, vertex_ids: list[int]) -> list[int]:
     _validate_vertex_record_range(slot, element, vertex_ids, 4)
     numpy_values = _read_numpy_scalar_records(slot, element, vertex_ids, "<u4")
-    if numpy_values is not None:
-        return [int(value) for value in numpy_values]
-    stride = int(slot.header.stride)
-    element_offset = int(element.aligned_byte_offset)
-    data = slot.data
-    return [int(struct.unpack_from("<I", data, int(vertex_id) * stride + element_offset)[0]) for vertex_id in vertex_ids]
+    if numpy_values is None:
+        raise ValueError(f"{slot.slot_name}: failed to read uint32 records for {element.semantic_name}{element.semantic_index}")
+    return [int(value) for value in numpy_values]
 
 
 def _read_int8x4_records(
@@ -1075,21 +1165,12 @@ def _read_int8x4_records(
 ) -> list[tuple[int, int, int, int]]:
     _validate_vertex_record_range(slot, element, vertex_ids, 4)
     numpy_values = _read_numpy_vector_records(slot, element, vertex_ids, "u1", 4)
-    if numpy_values is not None:
-        try:
-            np = optional_numpy()
-            signed = numpy_values.astype(np.int16)
-            signed = np.where(signed >= 128, signed - 256, signed)
-            return [tuple(int(component) for component in row) for row in signed.tolist()]
-        except Exception:
-            pass
-    stride = int(slot.header.stride)
-    element_offset = int(element.aligned_byte_offset)
-    data = slot.data
-    return [
-        tuple(_signed_int8(byte_value) for byte_value in data[int(vertex_id) * stride + element_offset:int(vertex_id) * stride + element_offset + 4])
-        for vertex_id in vertex_ids
-    ]
+    if numpy_values is None:
+        raise ValueError(f"{slot.slot_name}: failed to read int8x4 records for {element.semantic_name}{element.semantic_index}")
+    np = optional_numpy()
+    signed = numpy_values.astype(np.int16)
+    signed = np.where(signed >= 128, signed - 256, signed)
+    return [tuple(int(component) for component in row) for row in signed.tolist()]
 
 
 def _read_blend_weights(
@@ -1168,15 +1249,9 @@ def _read_format_records(
     size = _format_size(element.fmt)
     _validate_vertex_record_range(slot, element, vertex_ids, size)
     numpy_records = _read_format_records_numpy(slot, element, vertex_ids)
-    if numpy_records is not None:
-        return numpy_records
-    stride = int(slot.header.stride)
-    element_offset = int(element.aligned_byte_offset)
-    data = slot.data
-    return [
-        _unpack_format(data, int(vertex_id) * stride + element_offset, element.fmt)
-        for vertex_id in vertex_ids
-    ]
+    if numpy_records is None:
+        raise ValueError(f"{slot.slot_name}: failed to read {element.semantic_name}{element.semantic_index} with numpy")
+    return numpy_records
 
 
 def _read_format_records_numpy(
@@ -1195,10 +1270,7 @@ def _read_format_records_numpy(
     )
     if values is None:
         return None
-    try:
-        return [tuple(float(component) for component in row) for row in values.tolist()]
-    except Exception:
-        return None
+    return [tuple(float(component) for component in row) for row in values.tolist()]
 
 
 def _read_numpy_scalar_records(
@@ -1224,46 +1296,41 @@ def _read_numpy_vector_records(
     component_count: int,
 ):
     np = optional_numpy()
-    if np is None:
-        return None
-    try:
-        fmt_by_dtype = {
-            ("<u4", 1): "R32_UINT",
-            ("<u4", 4): "R32G32B32A32_UINT",
-            ("<f4", 1): "R32_FLOAT",
-            ("<f4", 2): "R32G32_FLOAT",
-            ("<f4", 3): "R32G32B32_FLOAT",
-            ("<f4", 4): "R32G32B32A32_FLOAT",
-            ("<u2", 4): "R16G16B16A16_UNORM",
-            ("u1", 4): "R8G8B8A8_UINT",
-        }
-        fmt = fmt_by_dtype.get((str(dtype_name), int(component_count)))
-        if fmt is not None:
-            values = read_interleaved_field(
-                slot.data,
-                vertex_ids,
-                stride=int(slot.header.stride),
-                offset=int(element.aligned_byte_offset),
-                fmt=fmt,
-                vertex_count=int(slot.header.vertex_count),
-                converted=False,
-            )
-            if values is not None:
-                return values
-        field_dtype = np.dtype(dtype_name)
-        record_dtype = np.dtype(
-            {
-                "names": ["field"],
-                "formats": [(field_dtype, (int(component_count),))],
-                "offsets": [int(element.aligned_byte_offset)],
-                "itemsize": int(slot.header.stride),
-            }
+    fmt_by_dtype = {
+        ("<u4", 1): "R32_UINT",
+        ("<u4", 4): "R32G32B32A32_UINT",
+        ("<f4", 1): "R32_FLOAT",
+        ("<f4", 2): "R32G32_FLOAT",
+        ("<f4", 3): "R32G32B32_FLOAT",
+        ("<f4", 4): "R32G32B32A32_FLOAT",
+        ("<u2", 4): "R16G16B16A16_UNORM",
+        ("u1", 4): "R8G8B8A8_UINT",
+    }
+    fmt = fmt_by_dtype.get((str(dtype_name), int(component_count)))
+    if fmt is not None:
+        values = read_interleaved_field(
+            slot.data,
+            vertex_ids,
+            stride=int(slot.header.stride),
+            offset=int(element.aligned_byte_offset),
+            fmt=fmt,
+            vertex_count=int(slot.header.vertex_count),
+            converted=False,
         )
-        records = np.frombuffer(slot.data, dtype=record_dtype, count=int(slot.header.vertex_count))
-        indices = np.asarray(vertex_ids, dtype=np.intp)
-        return records["field"][indices]
-    except Exception:
-        return None
+        if values is not None:
+            return values
+    field_dtype = np.dtype(dtype_name)
+    record_dtype = np.dtype(
+        {
+            "names": ["field"],
+            "formats": [(field_dtype, (int(component_count),))],
+            "offsets": [int(element.aligned_byte_offset)],
+            "itemsize": int(slot.header.stride),
+        }
+    )
+    records = np.frombuffer(slot.data, dtype=record_dtype, count=int(slot.header.vertex_count))
+    indices = np.asarray(vertex_ids, dtype=np.intp)
+    return records["field"][indices]
 
 
 def _normalize_dxgi_format(fmt: str) -> str:
@@ -1323,10 +1390,6 @@ def _unpack_format(data: bytes, offset: int, fmt: str) -> tuple[float, ...]:
     return unpack_vertex_format(fmt, data, offset)
 
 
-def _signed_int8(value: int) -> int:
-    return int(value) - 256 if int(value) >= 128 else int(value)
-
-
 def _signed_10(value: int) -> int:
     masked = int(value) & 0x3FF
     return masked - 1024 if masked >= 512 else masked
@@ -1344,21 +1407,7 @@ def _apply_uv_layer(mesh, layer_name: str, values: list[tuple[float, float]], *,
     if _apply_uv_layer_numpy(mesh, uv_layer, values, uv_flip_v=uv_flip_v):
         mesh.uv_layers.active = mesh.uv_layers.get("UV0")
         return
-    flat_uvs: list[float] = []
-    for loop in mesh.loops:
-        vertex_index = int(loop.vertex_index)
-        uv = values[vertex_index] if vertex_index < len(values) else (0.0, 0.0)
-        uv = game_uv_to_blender(uv, flip_v=uv_flip_v)
-        flat_uvs.extend([float(uv[0]), float(uv[1])])
-    if _foreach_set(uv_layer.data, "uv", flat_uvs):
-        mesh.uv_layers.active = mesh.uv_layers.get("UV0")
-        return
-    for polygon in mesh.polygons:
-        for loop_index in polygon.loop_indices:
-            vertex_index = mesh.loops[loop_index].vertex_index
-            if vertex_index < len(values):
-                uv_layer.data[loop_index].uv = game_uv_to_blender(values[vertex_index], flip_v=uv_flip_v)
-    mesh.uv_layers.active = mesh.uv_layers.get("UV0")
+    raise ValueError(f"{layer_name}: numpy UV import path failed")
 
 
 def _apply_uv_layer_numpy(mesh, uv_layer, values, *, uv_flip_v: bool = DEFAULT_UV_FLIP_V) -> bool:
@@ -1406,8 +1455,7 @@ def _store_int_attribute(mesh, name: str, values: list[int]) -> None:
             payload = values
     if _foreach_set(attribute.data, "value", payload):
         return
-    for item, value in zip(attribute.data, values):
-        item.value = int(value)
+    raise ValueError(f"{name}: numpy INT attribute write failed")
 
 
 def _store_float_attribute(mesh, name: str, values: list[float]) -> None:
@@ -1421,8 +1469,18 @@ def _store_float_attribute(mesh, name: str, values: list[float]) -> None:
             payload = values
     if _foreach_set(attribute.data, "value", payload):
         return
-    for item, value in zip(attribute.data, values):
-        item.value = float(value)
+    raise ValueError(f"{name}: numpy FLOAT attribute write failed")
+
+
+def _store_tangent_frame_attributes(mesh, tangents, bitangent_signs) -> None:
+    np = optional_numpy()
+    tangent_values = np.asarray(tangents, dtype=np.float32)
+    if tangent_values.ndim < 2 or tangent_values.shape[1] < 3:
+        raise ValueError("packed tangent attribute payload is not an Nx3 array")
+    _store_float_attribute(mesh, "bmc_tangent_x", tangent_values[:, 0])
+    _store_float_attribute(mesh, "bmc_tangent_y", tangent_values[:, 1])
+    _store_float_attribute(mesh, "bmc_tangent_z", tangent_values[:, 2])
+    _store_float_attribute(mesh, "bmc_bitangent_sign", bitangent_signs)
 
 
 def _foreach_set(data, attribute_name: str, values: list[float | int]) -> bool:
@@ -1433,26 +1491,14 @@ def _foreach_set(data, attribute_name: str, values: list[float | int]) -> bool:
         setter(attribute_name, values)
         return True
     except Exception:
-        pass
-    try:
-        setter(attribute_name, list(values))
-        return True
-    except Exception:
         return False
 
 
 def _store_uint32_split_attributes(mesh, base_name: str, values: list[int]) -> None:
     np = optional_numpy()
-    if np is not None:
-        try:
-            array = np.asarray(values, dtype=np.uint32)
-            _store_int_attribute(mesh, f"{base_name}_lo16", (array & 0xFFFF).astype(np.int32))
-            _store_int_attribute(mesh, f"{base_name}_hi16", ((array >> 16) & 0xFFFF).astype(np.int32))
-            return
-        except Exception:
-            pass
-    _store_int_attribute(mesh, f"{base_name}_lo16", [int(value) & 0xFFFF for value in values])
-    _store_int_attribute(mesh, f"{base_name}_hi16", [(int(value) >> 16) & 0xFFFF for value in values])
+    array = np.asarray(values, dtype=np.uint32)
+    _store_int_attribute(mesh, f"{base_name}_lo16", (array & 0xFFFF).astype(np.int32))
+    _store_int_attribute(mesh, f"{base_name}_hi16", ((array >> 16) & 0xFFFF).astype(np.int32))
 
 
 def _store_texcoord_semantic_attributes(mesh, records: list[dict]) -> None:
@@ -1484,17 +1530,10 @@ def _store_texcoord_semantic_attributes(mesh, records: list[dict]) -> None:
 
 def _component_values(values, component_index: int):
     np = optional_numpy()
-    if np is not None:
-        try:
-            array = np.asarray(values)
-            if array.ndim >= 2 and int(component_index) < int(array.shape[1]):
-                return array[:, int(component_index)]
-        except Exception:
-            pass
-    return [
-        value[component_index] if component_index < len(value) else 0
-        for value in values
-    ]
+    array = np.asarray(values)
+    if array.ndim < 2 or int(component_index) >= int(array.shape[1]):
+        return np.zeros((len(values),), dtype=np.float32)
+    return array[:, int(component_index)]
 
 
 def _store_snorm_byte_color_attribute(mesh, name: str, values: list[tuple[int, ...]]) -> None:
@@ -1515,30 +1554,15 @@ def _store_snorm_byte_color_attribute(mesh, name: str, values: list[tuple[int, .
             except Exception:
                 return
     np = optional_numpy()
-    if np is not None:
-        try:
-            array = np.asarray(values, dtype=np.int16)
-            if array.ndim >= 2 and array.shape[1] >= 4:
-                colors = ((array[:, :4].astype(np.int16) & 0xFF).astype(np.float32) / 255.0).reshape(-1)
-            else:
-                colors = []
-        except Exception:
-            colors = []
+    array = np.asarray(values, dtype=np.int16)
+    if array.ndim < 2 or array.shape[1] < 4:
+        colors = np.zeros((0,), dtype=np.float32)
     else:
-        colors = []
-    if len(colors) <= 0:
-        colors = []
-        for record in values:
-            components = [int(record[index]) if index < len(record) else 0 for index in range(4)]
-            colors.extend(snorm_byte_to_color_component(component) for component in components)
+        colors = ((array[:, :4].astype(np.int16) & 0xFF).astype(np.float32) / 255.0).reshape(-1)
     data = getattr(attribute, "data", [])
     if _foreach_set(data, "color", colors):
         return
-    for item, offset in zip(data, range(0, len(colors), 4)):
-        try:
-            item.color = tuple(colors[offset:offset + 4])
-        except Exception:
-            continue
+    raise ValueError(f"{name}: numpy color attribute write failed")
 
 
 def _semantic_metadata(record: dict) -> dict:

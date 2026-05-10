@@ -20,15 +20,7 @@ def dxgi_format_size(fmt: str) -> int:
         return 0
     dtype_name, component_count, _conversion = spec
     np = optional_numpy()
-    if np is not None:
-        return int(np.dtype(dtype_name).itemsize) * int(component_count)
-    fallback_sizes = {
-        "u1": 1,
-        "<u2": 2,
-        "<u4": 4,
-        "<f4": 4,
-    }
-    return int(fallback_sizes.get(dtype_name, 0)) * int(component_count)
+    return int(np.dtype(dtype_name).itemsize) * int(component_count)
 
 
 def dxgi_format_spec(fmt: str):
@@ -66,19 +58,8 @@ def read_index_file(path: str, fmt: str, index_count: int, *, byte_offset: int =
         file_handle.seek(int(byte_offset) + int(first_index) * int(stride))
         data = file_handle.read(read_size)
     np = optional_numpy()
-    if np is not None:
-        try:
-            count = min(int(index_count), len(data) // int(stride))
-            return np.frombuffer(data, dtype=np.dtype(dtype_name), count=count).astype(np.int64, copy=False).tolist()
-        except Exception:
-            pass
-    import struct
-
-    unpack = "<H" if int(stride) == 2 else "<I"
-    return [
-        int(record[0])
-        for record in struct.iter_unpack(unpack, data[: len(data) - (len(data) % int(stride))])
-    ]
+    count = min(int(index_count), len(data) // int(stride))
+    return np.frombuffer(data, dtype=np.dtype(dtype_name), count=count).astype(np.int64, copy=False).tolist()
 
 
 def read_interleaved_field(
@@ -92,41 +73,36 @@ def read_interleaved_field(
     converted: bool = True,
 ):
     np = optional_numpy()
-    if np is None:
-        return None
     spec = dxgi_format_spec(fmt)
     if spec is None or int(stride) <= 0 or int(offset) < 0:
         return None
     dtype_name, component_count, conversion = spec
-    try:
-        field_dtype = np.dtype(dtype_name)
-        count = int(vertex_count) if vertex_count is not None else len(data) // int(stride)
-        record_dtype = np.dtype(
-            {
-                "names": ["field"],
-                "formats": [(field_dtype, (int(component_count),))],
-                "offsets": [int(offset)],
-                "itemsize": int(stride),
-            }
-        )
-        records = np.frombuffer(data, dtype=record_dtype, count=count)
-        indices = np.asarray(vertex_ids, dtype=np.intp)
-        values = records["field"][indices]
-        if not converted:
-            return values
-        if conversion == "unorm16":
-            return values.astype(np.float64) / 65535.0
-        if conversion == "unorm8":
-            return values.astype(np.float64) / 255.0
-        if conversion == "snorm8":
-            signed = values.astype(np.int16)
-            return np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
-        if values.dtype.kind in {"u", "i"}:
-            return values.copy()
-        with np.errstate(invalid="ignore", over="ignore"):
-            return values.astype(np.float64)
-    except Exception:
-        return None
+    field_dtype = np.dtype(dtype_name)
+    count = int(vertex_count) if vertex_count is not None else len(data) // int(stride)
+    record_dtype = np.dtype(
+        {
+            "names": ["field"],
+            "formats": [(field_dtype, (int(component_count),))],
+            "offsets": [int(offset)],
+            "itemsize": int(stride),
+        }
+    )
+    records = np.frombuffer(data, dtype=record_dtype, count=count)
+    indices = np.asarray(vertex_ids, dtype=np.intp)
+    values = records["field"][indices]
+    if not converted:
+        return values
+    if conversion == "unorm16":
+        return values.astype(np.float64) / 65535.0
+    if conversion == "unorm8":
+        return values.astype(np.float64) / 255.0
+    if conversion == "snorm8":
+        signed = values.astype(np.int16)
+        return np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
+    if values.dtype.kind in {"u", "i"}:
+        return values.copy()
+    with np.errstate(invalid="ignore", over="ignore"):
+        return values.astype(np.float64)
 
 
 def read_interleaved_fields(
@@ -138,45 +114,40 @@ def read_interleaved_fields(
     vertex_count: int | None = None,
 ) -> dict[str, object] | None:
     np = optional_numpy()
-    if np is None or int(stride) <= 0:
+    if int(stride) <= 0:
         return None
-    try:
-        names = []
-        formats = []
-        offsets = []
-        conversions = {}
-        for name, offset, fmt, converted in fields:
-            spec = dxgi_format_spec(fmt)
-            if spec is None or int(offset) < 0:
-                return None
-            dtype_name, component_count, conversion = spec
-            names.append(str(name))
-            formats.append((np.dtype(dtype_name), (int(component_count),)))
-            offsets.append(int(offset))
-            conversions[str(name)] = conversion if bool(converted) else None
-        count = int(vertex_count) if vertex_count is not None else len(data) // int(stride)
-        record_dtype = np.dtype(
-            {
-                "names": names,
-                "formats": formats,
-                "offsets": offsets,
-                "itemsize": int(stride),
-            }
-        )
-        records = np.frombuffer(data, dtype=record_dtype, count=count)
-        indices = np.asarray(vertex_ids, dtype=np.intp)
-        return {
-            name: _convert_interleaved_values(records[name][indices], conversions[name])
-            for name in names
+    names = []
+    formats = []
+    offsets = []
+    conversions = {}
+    for name, offset, fmt, converted in fields:
+        spec = dxgi_format_spec(fmt)
+        if spec is None or int(offset) < 0:
+            return None
+        dtype_name, component_count, conversion = spec
+        names.append(str(name))
+        formats.append((np.dtype(dtype_name), (int(component_count),)))
+        offsets.append(int(offset))
+        conversions[str(name)] = conversion if bool(converted) else None
+    count = int(vertex_count) if vertex_count is not None else len(data) // int(stride)
+    record_dtype = np.dtype(
+        {
+            "names": names,
+            "formats": formats,
+            "offsets": offsets,
+            "itemsize": int(stride),
         }
-    except Exception:
-        return None
+    )
+    records = np.frombuffer(data, dtype=record_dtype, count=count)
+    indices = np.asarray(vertex_ids, dtype=np.intp)
+    return {
+        name: _convert_interleaved_values(records[name][indices], conversions[name])
+        for name in names
+    }
 
 
 def _convert_interleaved_values(values, conversion):
     np = optional_numpy()
-    if np is None:
-        return values
     if conversion == "unorm16":
         return values.astype(np.float64) / 65535.0
     if conversion == "unorm8":
@@ -210,37 +181,18 @@ def read_interleaved_fields_from_file(
             data = file_handle.read(int(vertex_count) * int(stride))
     except OSError:
         return None
-    result = {}
     field_specs = [(str(name), int(offset), str(fmt), bool(converted)) for name, offset, fmt in fields]
-    batch = read_interleaved_fields(
+    return read_interleaved_fields(
         data,
         vertex_ids,
         stride=int(stride),
         fields=field_specs,
         vertex_count=int(vertex_count),
     )
-    if batch is not None:
-        return batch
-    for name, offset, fmt, item_converted in field_specs:
-        values = read_interleaved_field(
-            data,
-            vertex_ids,
-            stride=int(stride),
-            offset=int(offset),
-            fmt=str(fmt),
-            vertex_count=int(vertex_count),
-            converted=bool(item_converted),
-        )
-        if values is None:
-            return None
-        result[str(name)] = values
-    return result
 
 
 def assign_bytes(target, offset: int, values) -> None:
     np = optional_numpy()
-    if np is None:
-        raise ValueError("numpy is required for byte assignment")
     array = np.ascontiguousarray(values)
     if array.size == 0:
         return
@@ -248,49 +200,106 @@ def assign_bytes(target, offset: int, values) -> None:
     target[:, int(offset):int(offset) + byte_view.shape[1]] = byte_view
 
 
+def foreach_get_array(collection, attribute_name: str, *, dtype="float64", shape: tuple[int, ...] | None = None):
+    np = optional_numpy()
+    getter = getattr(collection, "foreach_get", None)
+    if not callable(getter):
+        raise ValueError(f"collection does not support foreach_get({attribute_name})")
+    count = len(collection)
+    flat_count = int(count)
+    if shape:
+        for dimension in shape:
+            flat_count *= int(dimension)
+    values = np.empty(flat_count, dtype=np.dtype(dtype))
+    getter(attribute_name, values)
+    if shape:
+        return values.reshape((int(count), *tuple(int(dimension) for dimension in shape)))
+    return values
+
+
+def object_attribute_array(items, attribute_name: str, *, dtype="int64", start: int = 0, end: int | None = None):
+    np = optional_numpy()
+    item_count = len(items)
+    start_index = max(0, int(start))
+    end_index = item_count if end is None else min(item_count, int(end))
+    if end_index < start_index:
+        end_index = start_index
+    return np.fromiter(
+        (getattr(items[index], attribute_name) for index in range(start_index, end_index)),
+        dtype=np.dtype(dtype),
+        count=end_index - start_index,
+    )
+
+
+def normalize_rows(values, *, columns: int = 3, dtype="float32"):
+    np = optional_numpy()
+    vectors = np.asarray(values, dtype=np.dtype(dtype))
+    if vectors.size == 0:
+        return vectors.reshape((0, int(columns)))
+    vectors = vectors[:, : int(columns)]
+    lengths = np.linalg.norm(vectors, axis=1, keepdims=True)
+    lengths = np.where(lengths <= 1.0e-12, 1.0, lengths)
+    return vectors / lengths
+
+
+def point_bounds(points):
+    np = optional_numpy()
+    values = np.asarray(points, dtype=np.float64)
+    if values.size == 0:
+        return None
+    values = values.reshape((-1, 3))
+    return values.min(axis=0), values.max(axis=0)
+
+
+def cell_key_array(points, tolerance: float):
+    np = optional_numpy()
+    values = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+    inverse = 1.0 / max(float(tolerance), 1.0e-6)
+    return np.floor(values * inverse).astype(np.int64)
+
+
+def cell_key_set_from_array(cell_keys) -> frozenset[tuple[int, int, int]]:
+    np = optional_numpy()
+    keys = np.asarray(cell_keys, dtype=np.int64).reshape((-1, 3))
+    if keys.size == 0:
+        return frozenset()
+    unique_keys = np.unique(keys, axis=0)
+    return frozenset((int(x), int(y), int(z)) for x, y, z in unique_keys)
+
+
+def expanded_cell_key_set(cell_keys) -> frozenset[tuple[int, int, int]]:
+    expanded: set[tuple[int, int, int]] = set()
+    for key in cell_keys or ():
+        base_x, base_y, base_z = key
+        for offset_x in (-1, 0, 1):
+            for offset_y in (-1, 0, 1):
+                for offset_z in (-1, 0, 1):
+                    expanded.add((int(base_x) + offset_x, int(base_y) + offset_y, int(base_z) + offset_z))
+    return frozenset(expanded)
+
+
 def max_interleaved_uint4(data: bytes, *, stride: int, offset: int, fmt: str, vertex_count: int) -> int:
     np = optional_numpy()
-    if np is not None:
-        values = read_interleaved_field(
-            data,
-            range(int(vertex_count)),
-            stride=int(stride),
-            offset=int(offset),
-            fmt=str(fmt),
-            vertex_count=int(vertex_count),
-            converted=False,
-        )
-        if values is not None and values.size:
-            return int(values.max())
+    values = read_interleaved_field(
+        data,
+        range(int(vertex_count)),
+        stride=int(stride),
+        offset=int(offset),
+        fmt=str(fmt),
+        vertex_count=int(vertex_count),
+        converted=False,
+    )
+    if values is not None and values.size:
+        return int(values.max())
     return -1
 
 
 def positions_diag(positions) -> float:
-    try:
-        if len(positions) <= 0:
-            return 0.0
-    except TypeError:
-        positions = list(positions)
-        if not positions:
-            return 0.0
     np = optional_numpy()
-    if np is not None:
-        try:
-            values = np.asarray(positions, dtype=np.float64)
-            if values.size == 0:
-                return 0.0
-            mins = values.min(axis=0)
-            maxs = values.max(axis=0)
-            delta = maxs - mins
-            return float(np.sqrt(np.dot(delta, delta)))
-        except Exception:
-            pass
-    import math
-
-    min_x = min(position[0] for position in positions)
-    min_y = min(position[1] for position in positions)
-    min_z = min(position[2] for position in positions)
-    max_x = max(position[0] for position in positions)
-    max_y = max(position[1] for position in positions)
-    max_z = max(position[2] for position in positions)
-    return math.sqrt((max_x - min_x) ** 2 + (max_y - min_y) ** 2 + (max_z - min_z) ** 2)
+    values = np.asarray(positions, dtype=np.float64)
+    if values.size == 0:
+        return 0.0
+    mins = values.min(axis=0)
+    maxs = values.max(axis=0)
+    delta = maxs - mins
+    return float(np.sqrt(np.dot(delta, delta)))

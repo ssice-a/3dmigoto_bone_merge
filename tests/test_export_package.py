@@ -17,6 +17,7 @@ if str(PACKAGE_PARENT) not in sys.path:
 export_package = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_package")
 export_buffers = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_buffers")
 export_prepare = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_prepare")
+vertex_format = importlib.import_module(f"{PACKAGE_DIR.name}.core.vertex_format")
 
 
 class FakeObject:
@@ -48,11 +49,31 @@ class FakeMatrix:
     def __matmul__(self, value):
         return tuple(float(value[index]) + float(self.offset[index]) for index in range(3))
 
+    def __iter__(self):
+        yield (1.0, 0.0, 0.0, float(self.offset[0]))
+        yield (0.0, 1.0, 0.0, float(self.offset[1]))
+        yield (0.0, 0.0, 1.0, float(self.offset[2]))
+        yield (0.0, 0.0, 0.0, 1.0)
+
 
 class FakeVertexGroup:
     def __init__(self, name: str, index: int):
         self.name = name
         self.index = index
+
+
+class FakeDataList(list):
+    def foreach_get(self, attribute_name, values):
+        offset = 0
+        for item in self:
+            raw_value = getattr(item, attribute_name)
+            if isinstance(raw_value, (tuple, list)):
+                for component in raw_value:
+                    values[offset] = component
+                    offset += 1
+            else:
+                values[offset] = raw_value
+                offset += 1
 
 
 class FakeGroupElement:
@@ -82,11 +103,11 @@ class FakePolygon:
 
 class FakeMeshData:
     def __init__(self, positions, triangles, group_count: int):
-        self.vertices = [
+        self.vertices = FakeDataList(
             FakeVertex(index, position, group_count)
             for index, position in enumerate(positions)
-        ]
-        self.loops = []
+        )
+        self.loops = FakeDataList()
         self.polygons = []
         self.attributes = {}
         self.uv_layers = {}
@@ -105,7 +126,7 @@ class FakeAttributeValue:
 
 class FakeAttribute:
     def __init__(self, values):
-        self.data = [FakeAttributeValue(value) for value in values]
+        self.data = FakeDataList(FakeAttributeValue(value) for value in values)
 
 
 class FakeColorValue:
@@ -115,7 +136,7 @@ class FakeColorValue:
 
 class FakeColorAttribute:
     def __init__(self, values, *, domain="POINT"):
-        self.data = [FakeColorValue(value) for value in values]
+        self.data = FakeDataList(FakeColorValue(value) for value in values)
         self.domain = domain
 
 
@@ -126,7 +147,7 @@ class FakeUVValue:
 
 class FakeUVLayer:
     def __init__(self, values):
-        self.data = [FakeUVValue(value) for value in values]
+        self.data = FakeDataList(FakeUVValue(value) for value in values)
 
 
 class FakeUVLayers:
@@ -764,12 +785,131 @@ class ExportPackageTests(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout, mirror_flip_default=False)
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                mirror_flip_default=False,
+                uv_flip_v_default=False,
+            )
             position_path = Path(tmpdir) / "640d1c0e-3-0_part00-Position.buf"
             packed = struct.unpack_from("<I", position_path.read_bytes(), 12)[0]
             self.assertTrue(packed & 0x40000000)
             self.assertTrue(packed & 0x80000000)
             self.assertNotEqual((packed >> 20) & 0x3FF, 0)
+
+    def test_packed_normal_handedness_accounts_for_uv_and_mirror_flip(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        for loop in target.data.loops:
+            loop.tangent = (-1.0, 0.0, 0.0)
+            loop.bitangent_sign = 1.0
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb0": {
+                        "slot": "vb0",
+                        "stride": 16,
+                        "elements": [
+                            {
+                                "semantic_name": "POSITION",
+                                "semantic_index": 0,
+                                "format": "R32G32B32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            },
+                            {
+                                "semantic_name": "NORMAL",
+                                "semantic_index": 0,
+                                "format": "R32_FLOAT",
+                                "aligned_byte_offset": 12,
+                            },
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                mirror_flip_default=True,
+                uv_flip_v_default=True,
+            )
+            position_path = Path(tmpdir) / "640d1c0e-3-0_part00-Position.buf"
+            packed = struct.unpack_from("<I", position_path.read_bytes(), 12)[0]
+            self.assertTrue(packed & 0x80000000)
+
+    def test_packed_normal_export_prefers_imported_tangent_frame_attributes(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        for loop in target.data.loops:
+            loop.tangent = (1.0, 0.0, 0.0)
+            loop.bitangent_sign = -1.0
+        target.data.attributes["bmc_tangent_x"] = FakeAttribute([-1.0, -1.0, -1.0])
+        target.data.attributes["bmc_tangent_y"] = FakeAttribute([0.0, 0.0, 0.0])
+        target.data.attributes["bmc_tangent_z"] = FakeAttribute([0.0, 0.0, 0.0])
+        target.data.attributes["bmc_bitangent_sign"] = FakeAttribute([1.0, 1.0, 1.0])
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb0": {
+                        "slot": "vb0",
+                        "stride": 16,
+                        "elements": [
+                            {
+                                "semantic_name": "POSITION",
+                                "semantic_index": 0,
+                                "format": "R32G32B32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            },
+                            {
+                                "semantic_name": "NORMAL",
+                                "semantic_index": 0,
+                                "format": "R32_FLOAT",
+                                "aligned_byte_offset": 12,
+                            },
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(
+                tmpdir,
+                plan.parts,
+                layout,
+                mirror_flip_default=False,
+                uv_flip_v_default=False,
+            )
+            position_path = Path(tmpdir) / "640d1c0e-3-0_part00-Position.buf"
+            packed = struct.unpack_from("<I", position_path.read_bytes(), 12)[0]
+            expected = vertex_format.encode_game_packed_tangent_frame(
+                (0.0, 0.0, 1.0),
+                (-1.0, 0.0, 0.0),
+                1.0,
+            )
+            self.assertEqual(packed, expected)
 
     def test_external_mesh_without_mirror_property_uses_export_default(self):
         target = FakeObject(

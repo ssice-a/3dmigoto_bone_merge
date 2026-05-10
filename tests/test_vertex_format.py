@@ -15,6 +15,8 @@ if str(PACKAGE_PARENT) not in sys.path:
 
 vertex_format = importlib.import_module(f"{PACKAGE_DIR.name}.core.vertex_format")
 import_candidates = importlib.import_module(f"{PACKAGE_DIR.name}.core.import_candidates")
+export_buffers = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_buffers")
+numpy_compat = importlib.import_module(f"{PACKAGE_DIR.name}.core.numpy_compat")
 
 
 class VertexFormatTests(unittest.TestCase):
@@ -71,6 +73,45 @@ class VertexFormatTests(unittest.TestCase):
         self.assertGreater(sum(a * b for a, b in zip(tangent, decoded_tangent)), 0.99)
         self.assertEqual(decoded_sign, 1.0)
         self.assertNotEqual((packed >> 20) & 0x3FF, 0)
+
+    def test_numpy_packed_tangent_frame_round_trips_roll(self):
+        np = numpy_compat.optional_numpy()
+        if np is None:
+            self.skipTest("numpy not available")
+        packed_values = np.asarray(
+            [0xFB979E48, 0x54B77DB8, 0xF8FDB181, 0xF7AD89B4],
+            dtype=np.uint32,
+        )
+
+        normals = np.asarray(import_candidates._decode_game_packed_normals(packed_values), dtype=np.float32)
+        tangents, signs = import_candidates._decode_game_packed_tangent_frames(packed_values)
+        x_values = normals[:, 0]
+        y_values = normals[:, 1]
+        z_values = normals[:, 2]
+        inv_l1 = 1.0 / np.maximum(np.abs(x_values) + np.abs(y_values) + np.abs(z_values), 1e-12)
+        oct_x = x_values * inv_l1
+        oct_y = y_values * inv_l1
+        fold_mask = z_values < 0.0
+        if np.any(fold_mask):
+            old_x = oct_x.copy()
+            old_y = oct_y.copy()
+            sign_x = np.where(old_x >= 0.0, 1.0, -1.0)
+            sign_y = np.where(old_y >= 0.0, 1.0, -1.0)
+            oct_x = np.where(fold_mask, (1.0 - np.abs(old_y)) * sign_x, old_x)
+            oct_y = np.where(fold_mask, (1.0 - np.abs(old_x)) * sign_y, old_y)
+        quant_x = np.rint(np.clip(oct_x, -1.0, 1.0) * 511.0).astype(np.int32)
+        quant_y = np.rint(np.clip(oct_y, -1.0, 1.0) * 511.0).astype(np.int32)
+        decoded_normals = export_buffers._decode_octahedral_quantized_numpy(quant_x, quant_y)
+        packed_roll = export_buffers._encode_tangent_roll_numpy(decoded_normals, tangents)
+        rebuilt = (
+            np.uint32(0x40000000)
+            | (quant_x.astype(np.uint32) & np.uint32(0x3FF))
+            | ((quant_y.astype(np.uint32) & np.uint32(0x3FF)) << np.uint32(10))
+            | ((packed_roll & np.uint32(0x3FF)) << np.uint32(20))
+            | np.where(np.asarray(signs, dtype=np.float32) >= 0.0, np.uint32(0x80000000), np.uint32(0))
+        ).astype(np.uint32)
+
+        self.assertEqual([int(value) for value in rebuilt], [int(value) for value in packed_values])
 
 
 if __name__ == "__main__":

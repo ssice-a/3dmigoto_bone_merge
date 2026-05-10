@@ -423,10 +423,10 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertEqual(
             [
                 {"ib_hash": "bbbbbbbb", "match_first_index": 0, "match_index_count": 20},
-                {"ib_hash": "cccccccc", "match_first_index": 0, "match_index_count": 30},
             ],
             runtime["lod_shadow_replay_plan"]["skip_keys"],
         )
+        self.assertTrue(runtime["lod_shadow_replay_plan"]["preserve_host_draw"])
         host_section = ini_text[
             ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]") :
             ini_text.index("[Present]")
@@ -438,7 +438,8 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("hash = cccccccc", host_section)
         self.assertIn("x100 = 1", host_section)
         self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", host_section)
-        self.assertIn("  handling = skip", host_section)
+        self.assertNotIn("  handling = skip", host_section)
+        self.assertIn("  draw = from_caller", host_section)
         self.assertIn("; delayed normal shadow replay", host_section)
         self.assertIn("; replay aaaaaaaa_10_0_part00", host_section)
         self.assertIn("  handling = skip", exported_lod_section)
@@ -784,6 +785,82 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertLess(white_pos, normal_pos)
         self.assertIn("; replay aaaaaaaa_10_0_part00", ini_text)
         self.assertIn("; replay bbbbbbbb_20_5_part00", ini_text)
+
+    def test_shadow_replay_preserves_non_replaced_host_draw(self):
+        manifest = {
+            "shadow_stage": {
+                "shadow_vs_hashes": ["1111111111111111"],
+                "normal_vs_hash": "1111111111111111",
+                "host_ib_hash": "bbbbbbbb",
+                "host_match_first_index": 5,
+                "host_match_index_count": 20,
+                "host_draw_index": 99,
+            },
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 10,
+                    "ib_hash": "aaaaaaaa",
+                    "first_index": 0,
+                    "index_count": 10,
+                    "pass_role": "normal_shadow",
+                },
+                {
+                    "draw_index": 99,
+                    "ib_hash": "bbbbbbbb",
+                    "first_index": 5,
+                    "index_count": 20,
+                    "pass_role": "normal_shadow",
+                },
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="normal",
+            ib_hash="aaaaaaaa",
+            match_index_count=10,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="aaaaaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_10_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("aaaaaaaa", 10, 0, 3)],
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertTrue(runtime["shadow_replay_plan"]["preserve_host_draw"])
+        self.assertEqual(
+            [{"ib_hash": "aaaaaaaa", "match_first_index": 0, "match_index_count": 10}],
+            runtime["shadow_replay_plan"]["skip_keys"],
+        )
+        host_section = ini_text[
+            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_5]") :
+            ini_text.index("[Present]")
+        ]
+        self.assertNotIn("  handling = skip", host_section)
+        self.assertIn("  draw = from_caller", host_section)
+        self.assertLess(
+            host_section.index("  draw = from_caller"),
+            host_section.index("; delayed normal shadow replay"),
+        )
 
     def test_shadow_replay_keeps_both_roles_when_one_ib_has_two_shadow_passes(self):
         manifest = {

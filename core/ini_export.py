@@ -498,6 +498,7 @@ def _build_shadow_replay_plan(capture_manifest: dict, geometry_records: list[dic
         "enabled": True,
         "host_key": _key_payload(host_key),
         "host_draw_index": int(stage["host_draw_index"]),
+        "preserve_host_draw": host_key not in skipped_keys,
         "white_shadow_resource": "ResourceBMCWhiteShadow",
         "transparent_parts": transparent_parts,
         "normal_parts": normal_parts,
@@ -635,12 +636,12 @@ def _build_lod_shadow_replay_plan(
     if not transparent_parts and not normal_parts:
         return {"enabled": False, "reason": "no_lod_exported_shadow_parts"}
 
-    skipped_keys.add(host_key)
     return {
         "enabled": True,
         "host_key": _key_payload(host_key),
         "host_draw_index": int(host_draw_index),
         "host_source": host_source,
+        "preserve_host_draw": host_key not in skipped_keys,
         "white_shadow_resource": "ResourceBMCWhiteShadow",
         "transparent_parts": transparent_parts,
         "normal_parts": normal_parts,
@@ -1397,6 +1398,8 @@ def _shadow_host_replay_lines(shadow_plan: dict, parts_by_suffix: dict[str, dict
         for suffix in shadow_plan.get("normal_parts", []) or []
         if suffix in parts_by_suffix
     ]
+    if _shadow_plan_preserves_host_draw(shadow_plan):
+        lines.append(f"{indent}draw = from_caller")
     if transparent_parts:
         lines.append(f"{indent}; delayed transparent shadow replay")
         for record in transparent_parts:
@@ -1477,6 +1480,13 @@ def _shadow_plan_skip_keys(shadow_plan: dict) -> set[tuple[str, int, int]]:
         if key[0] and key[2] > 0:
             keys.add(key)
     return keys
+
+
+def _shadow_plan_preserves_host_draw(shadow_plan: dict) -> bool:
+    if "preserve_host_draw" in shadow_plan:
+        return bool(shadow_plan.get("preserve_host_draw", False))
+    host_key = _shadow_plan_host_key(shadow_plan)
+    return host_key is not None and host_key not in _shadow_plan_skip_keys(shadow_plan)
 
 
 def _shadow_plan_needs_white_texture(shadow_plan: dict) -> bool:

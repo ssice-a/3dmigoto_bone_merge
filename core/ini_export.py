@@ -515,9 +515,9 @@ def _normalize_shadow_stage(capture_manifest: dict) -> dict:
         "host_ib_hash": str(stage.get("host_ib_hash", "") or "").lower(),
         "host_match_first_index": int(stage.get("host_match_first_index", 0) or 0),
         "host_match_index_count": int(stage.get("host_match_index_count", 0) or 0),
-        "host_draw_index": int(stage.get("host_draw_index", -1) or -1),
-        "stage_draw_start": int(stage.get("stage_draw_start", -1) or -1),
-        "stage_draw_end": int(stage.get("stage_draw_end", -1) or -1),
+        "host_draw_index": _int_default(stage.get("host_draw_index"), -1),
+        "stage_draw_start": _int_default(stage.get("stage_draw_start"), -1),
+        "stage_draw_end": _int_default(stage.get("stage_draw_end"), -1),
         "normal_vs_hash": str(stage.get("normal_vs_hash", "") or "").lower(),
         "transparent_vs_hash": str(stage.get("transparent_vs_hash", "") or "").lower(),
     }
@@ -716,7 +716,7 @@ def _build_lod_shadow_replay_plan_for_chain(
     chain: dict,
 ) -> dict:
     host_key = _key_from_payload(dict(chain.get("host_key", {}) or {}))
-    host_draw_index = int(chain.get("host_draw_index", -1) or -1)
+    host_draw_index = _int_default(chain.get("host_draw_index"), -1)
     if not _is_valid_override_key(host_key):
         return {"enabled": False, "reason": "missing_lod_host_or_geometry"}
 
@@ -729,8 +729,8 @@ def _build_lod_shadow_replay_plan_for_chain(
         lod_capture_records,
         chain_keys=chain_keys,
         host_draw_index=host_draw_index,
-        chain_draw_start=int(chain.get("draw_start", -1) or -1),
-        chain_draw_end=int(chain.get("draw_end", -1) or -1),
+        chain_draw_start=_int_default(chain.get("draw_start"), -1),
+        chain_draw_end=_int_default(chain.get("draw_end"), -1),
     )
 
     roles_by_main_key = _shadow_roles_by_key(capture_manifest)
@@ -797,9 +797,9 @@ def _build_lod_shadow_replay_plan_for_chain(
             "host_key": _key_payload(host_key),
             "host_draw_index": int(host_draw_index),
             "host_source": "lod_shadow_chain_host",
-            "chain_index": int(chain.get("chain_index", -1) or -1),
-            "chain_draw_start": int(chain.get("draw_start", -1) or -1),
-            "chain_draw_end": int(chain.get("draw_end", -1) or -1),
+            "chain_index": _int_default(chain.get("chain_index"), -1),
+            "chain_draw_start": _int_default(chain.get("draw_start"), -1),
+            "chain_draw_end": _int_default(chain.get("draw_end"), -1),
             "available_global_count": len(available_globals),
             "coverage_record_count": len(coverage_records),
             "missing_links": missing_links,
@@ -810,9 +810,9 @@ def _build_lod_shadow_replay_plan_for_chain(
         "host_key": _key_payload(host_key),
         "host_draw_index": int(host_draw_index),
         "host_source": "lod_shadow_chain_host",
-        "chain_index": int(chain.get("chain_index", -1) or -1),
-        "chain_draw_start": int(chain.get("draw_start", -1) or -1),
-        "chain_draw_end": int(chain.get("draw_end", -1) or -1),
+        "chain_index": _int_default(chain.get("chain_index"), -1),
+        "chain_draw_start": _int_default(chain.get("draw_start"), -1),
+        "chain_draw_end": _int_default(chain.get("draw_end"), -1),
         "preserve_host_draw": host_key not in skipped_keys,
         "white_shadow_resource": "ResourceBMCWhiteShadow",
         "transparent_parts": transparent_parts,
@@ -856,8 +856,8 @@ def _lod_capture_record_key(record: dict) -> tuple[str, int, int]:
 
 
 def _lod_shadow_capture_chains(raw_records: list[dict], stage: dict) -> list[dict]:
-    stage_start = int(stage.get("stage_draw_start", -1) or -1)
-    stage_end = int(stage.get("stage_draw_end", -1) or -1)
+    stage_start = _int_default(stage.get("stage_draw_start"), -1)
+    stage_end = _int_default(stage.get("stage_draw_end"), -1)
     entries: list[tuple[int, tuple[str, int, int]]] = []
     for record in raw_records or []:
         key = _key_from_payload(dict(record.get("key", {}) or {}))
@@ -917,7 +917,7 @@ def _merge_lod_shadow_plans_by_host(plans: list[dict]) -> list[dict]:
             merged_by_host[host_key]["transparent_parts"] = list(plan.get("transparent_parts", []) or [])
             merged_by_host[host_key]["normal_parts"] = list(plan.get("normal_parts", []) or [])
             merged_by_host[host_key]["skip_keys"] = list(plan.get("skip_keys", []) or [])
-            merged_by_host[host_key]["chain_indices"] = [int(plan.get("chain_index", -1) or -1)]
+            merged_by_host[host_key]["chain_indices"] = [_int_default(plan.get("chain_index"), -1)]
             order.append(host_key)
             continue
         bucket = merged_by_host[host_key]
@@ -935,7 +935,7 @@ def _merge_lod_shadow_plans_by_host(plans: list[dict]) -> list[dict]:
             if _is_valid_override_key(key) and key not in existing_skip:
                 bucket.setdefault("skip_keys", []).append(dict(payload))
                 existing_skip.add(key)
-        chain_index = int(plan.get("chain_index", -1) or -1)
+        chain_index = _int_default(plan.get("chain_index"), -1)
         if chain_index not in bucket.setdefault("chain_indices", []):
             bucket["chain_indices"].append(chain_index)
         bucket["available_global_count"] = max(int(bucket.get("available_global_count", 0) or 0), int(plan.get("available_global_count", 0) or 0))
@@ -2166,6 +2166,15 @@ def _int_list(values) -> list[int]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def _int_default(value, default: int = 0) -> int:
+    if value is None or value == "":
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _draw_index_in_optional_stage_window(draw_index: int, stage_start: int, stage_end: int) -> bool:

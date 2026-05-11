@@ -311,6 +311,52 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual(links[1]["status"], "unmatched")
         self.assertEqual(links[1]["lod_sources"], [])
 
+    def test_lod_links_are_split_by_recognized_chains(self):
+        main_records = [
+            {
+                "source_key": "main_body-100-0",
+                "ib_hash": "main_body",
+                "match_first_index": 0,
+                "match_index_count": 100,
+                "global_bone_base": 0,
+                "local_bone_count": 32,
+                "vb2_signature": {"slot_count": 32, "center": [0.0, 0.0, 0.0], "diag": 1.0},
+            }
+        ]
+        lod_records = {
+            "lod_body_a-80-0": {
+                "lod_record_key": "lod_body_a-80-0",
+                "lod_ib_hash": "lod_a",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 80,
+                "lod_capture_draw_indices": [10, 11],
+                "lod_local_bone_count": 32,
+                "vb2_signature": {"slot_count": 32, "center": [0.0, 0.0, 0.0], "diag": 1.0},
+            },
+            "lod_body_b-82-0": {
+                "lod_record_key": "lod_body_b-82-0",
+                "lod_ib_hash": "lod_b",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 82,
+                "lod_capture_draw_indices": [40],
+                "lod_local_bone_count": 33,
+                "vb2_signature": {"slot_count": 33, "center": [0.0, 0.0, 0.0], "diag": 1.0},
+            },
+        }
+
+        chains = lod_analyze._build_lod_record_chains(lod_records)
+        links = lod_analyze._build_lod_links(main_records, lod_records, {}, lod_chains=chains)
+
+        self.assertEqual([0, 1], [int(chain["chain_index"]) for chain in chains])
+        self.assertEqual(2, len(links))
+        self.assertEqual(["matched", "matched"], [link["status"] for link in links])
+        self.assertEqual(
+            ["lod_body_a-80-0", "lod_body_b-82-0"],
+            [link["lod_sources"][0]["lod_record_key"] for link in links],
+        )
+        self.assertEqual([0, 1], [link["lod_sources"][0]["lod_chain_index"] for link in links])
+        self.assertTrue(all(len(link["lod_sources"]) == 1 for link in links))
+
     def test_bone_cloud_mapping_keeps_multiple_lod_candidates_for_one_global(self):
         canonical_points = [
             lod_analyze.WeightedPoint((0.0, 0.0, 0.0), ((200, 1.0),)),

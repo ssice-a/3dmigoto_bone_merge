@@ -279,6 +279,8 @@ def regenerate_bonestore_runtime_files(
             "lod_capture_records": list(runtime_plan.get("lod_capture_records", []) or []),
             "lod_replay_links": list(runtime_plan.get("lod_replay_links", []) or []),
             "lod_key_annotations": list(runtime_plan.get("lod_key_annotations", []) or []),
+            "lod_profile_chains": list(runtime_plan.get("lod_profile_chains", []) or []),
+            "uses_lod_profile_flag": bool(runtime_plan.get("uses_lod_profile_flag", False)),
             "geometry": list(runtime_plan.get("geometry", []) or []),
             "textures": list(runtime_plan.get("textures", []) or []),
             "shader_filter_overrides": list(runtime_plan.get("shader_filter_overrides", []) or []),

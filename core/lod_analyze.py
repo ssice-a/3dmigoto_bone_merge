@@ -45,6 +45,7 @@ _LOD_BONE_MATCH_FALLBACK_RATIO = 0.95
 _LOD_SLOT_DIRECT_ABS_TOLERANCE = 4
 _LOD_SLOT_DIRECT_RATIO_TOLERANCE = 0.20
 _LOD_SLOT_NEAR_RATIO_TOLERANCE = 0.35
+_LOD_SHADOW_CHAIN_GAP = 12
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,8 @@ def analyze_lod_for_manifest(
         ignored_global_bones=ignored_global_bones,
     )
     global_candidates = _mapping_global_candidates(mapping)
-    links = _build_lod_links(main_records, lod_records, global_candidates)
+    lod_chains = _build_lod_record_chains(lod_records)
+    links = _build_lod_links(main_records, lod_records, global_candidates, lod_chains=lod_chains)
     capture_records = _build_lod_capture_records(lod_records, mapping["global_to_lod"])
     review = review_lod_global_pool_coverage(canonical_manifest, capture_records)
     variant_id = _build_lod_variant_id(normalized_lod_dir, capture_records)
@@ -141,6 +143,7 @@ def analyze_lod_for_manifest(
                 "match_tolerance": float(mapping["match_tolerance"]),
                 "matched_vertex_count": int(mapping["matched_vertex_count"]),
                 "lod_vertex_count": int(len(lod_points)),
+                "lod_chain_count": int(len(lod_chains)),
                 "skipped_main_hash_lod_candidate_count": int(skipped_main_hash_count),
                 "canonical_match_point_count": int(mapping["canonical_match_point_count"]),
                 "lod_match_point_count": int(mapping["lod_match_point_count"]),
@@ -149,6 +152,7 @@ def analyze_lod_for_manifest(
             }
         ],
         "lod_links": links,
+        "lod_chains": lod_chains,
         "lod_capture_records": capture_records,
         "lod_mapping": mapping["mapping_entries"],
         "lod_review": review,
@@ -1311,7 +1315,114 @@ def _mapping_entry_rank(entry: dict) -> tuple[float, int, float]:
     )
 
 
-def _build_lod_links(main_records: list[dict], lod_records: dict[str, dict], global_to_lod: dict[int, object]) -> list[dict]:
+def _build_lod_record_chains(lod_records: dict[str, dict]) -> list[dict]:
+    entries: list[tuple[int, str]] = []
+    for lod_key, lod_record in lod_records.items():
+        for draw_index in lod_record.get("lod_capture_draw_indices", lod_record.get("capture_draw_indices", [])) or []:
+            try:
+                draw = int(draw_index)
+            except (TypeError, ValueError):
+                continue
+            if draw >= 0:
+                entries.append((draw, str(lod_key)))
+    if not entries:
+        return []
+
+    entries.sort(key=lambda item: (int(item[0]), item[1]))
+    segments: list[list[tuple[int, str]]] = []
+    current: list[tuple[int, str]] = []
+    previous_draw: int | None = None
+    for entry in entries:
+        draw = int(entry[0])
+        if current and previous_draw is not None and draw - previous_draw > _LOD_SHADOW_CHAIN_GAP:
+            segments.append(current)
+            current = []
+        current.append(entry)
+        previous_draw = draw
+    if current:
+        segments.append(current)
+
+    chains: list[dict] = []
+    for chain_index, segment in enumerate(segments):
+        draw_start = min(draw for draw, _lod_key in segment)
+        draw_end = max(draw for draw, _lod_key in segment)
+        start_draw, start_lod_key = min(segment, key=lambda item: (int(item[0]), item[1]))
+        host_draw, host_lod_key = max(segment, key=lambda item: (int(item[0]), item[1]))
+        chain_lod_keys = sorted({lod_key for _draw, lod_key in segment})
+        host_record = lod_records.get(host_lod_key, {})
+        start_record = lod_records.get(start_lod_key, {})
+        chains.append(
+            {
+                "chain_index": int(chain_index),
+                "draw_start": int(draw_start),
+                "draw_end": int(draw_end),
+                "start_draw_index": int(start_draw),
+                "start_lod_record_key": str(start_lod_key),
+                "start_key": _lod_override_key_payload(start_record),
+                "host_draw_index": int(host_draw),
+                "host_lod_record_key": str(host_lod_key),
+                "host_key": _lod_override_key_payload(host_record),
+                "lod_record_keys": chain_lod_keys,
+            }
+        )
+    return chains
+
+
+def _build_lod_links(
+    main_records: list[dict],
+    lod_records: dict[str, dict],
+    global_to_lod: dict[int, object],
+    *,
+    lod_chains: list[dict] | None = None,
+) -> list[dict]:
+    chains = list(lod_chains or [])
+    if not chains:
+        return _build_lod_links_global(main_records, lod_records, global_to_lod)
+
+    links: list[dict] = []
+    matched_main_keys: set[str] = set()
+    for chain in chains:
+        chain_keys = {
+            str(value)
+            for value in chain.get("lod_record_keys", []) or []
+            if str(value) in lod_records
+        }
+        if not chain_keys:
+            continue
+        chain_lod_records = {lod_key: lod_records[lod_key] for lod_key in sorted(chain_keys)}
+        chain_links = _build_lod_links_global(main_records, chain_lod_records, global_to_lod)
+        for link in chain_links:
+            sources = [dict(source or {}) for source in link.get("lod_sources", []) or []]
+            if not sources:
+                continue
+            matched_main_keys.add(str(link.get("source_key", "") or ""))
+            for source in sources:
+                source["lod_chain_index"] = _int_default(chain.get("chain_index"), -1)
+                source["lod_chain_draw_start"] = _int_default(chain.get("draw_start"), -1)
+                source["lod_chain_draw_end"] = _int_default(chain.get("draw_end"), -1)
+                source["lod_chain_host_draw_index"] = _int_default(chain.get("host_draw_index"), -1)
+                source["lod_chain_host_key"] = dict(chain.get("host_key", {}) or {})
+                links.append(
+                    {
+                        **{key: value for key, value in link.items() if key != "lod_sources"},
+                        "lod_sources": [source],
+                        "status": "matched",
+                        "lod_chain_index": _int_default(chain.get("chain_index"), -1),
+                        "lod_chain_draw_start": _int_default(chain.get("draw_start"), -1),
+                        "lod_chain_draw_end": _int_default(chain.get("draw_end"), -1),
+                        "lod_chain_host_draw_index": _int_default(chain.get("host_draw_index"), -1),
+                        "lod_chain_host_key": dict(chain.get("host_key", {}) or {}),
+                    }
+                )
+
+    for main_index, main_record in enumerate(main_records):
+        main_key = str(main_record.get("source_key", "") or f"__main_{main_index}")
+        if main_key not in matched_main_keys:
+            links.append({**main_record, "lod_sources": [], "status": "unmatched"})
+    return links
+
+
+def _build_lod_links_global(main_records: list[dict], lod_records: dict[str, dict], global_to_lod: dict[int, object]) -> list[dict]:
     direct_links = _build_lod_links_from_vb2_signatures(main_records, lod_records)
     used_lod_keys = {
         str(source.get("lod_record_key", "") or "")
@@ -1499,6 +1610,15 @@ def _signature_geometry_affinity(main_record: dict, lod_record: dict) -> float:
     return float(center_score + diag_score)
 
 
+def _int_default(value, default: int = 0) -> int:
+    if value is None or value == "":
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _minimum_lod_link_global_count(local_bone_count: int) -> int:
     count = max(0, int(local_bone_count))
     if count <= 0:
@@ -1523,12 +1643,28 @@ def _lod_record_payload(candidate: dict, source_key: str, *, vb2_signature: dict
     }
 
 
+def _lod_override_key_payload(lod_record: dict) -> dict:
+    return {
+        "ib_hash": str(lod_record.get("lod_ib_hash", "") or "").lower(),
+        "match_first_index": int(lod_record.get("lod_match_first_index", 0) or 0),
+        "match_index_count": int(lod_record.get("lod_match_index_count", 0) or 0),
+    }
+
+
 def _lod_manifest_snapshot(lod_manifest: dict) -> dict:
+    lod_records = {
+        _source_key_from_candidate(candidate): _lod_record_payload(candidate, _source_key_from_candidate(candidate))
+        for candidate in lod_manifest.get("candidate_ibs", []) or []
+        if bool(candidate.get("enabled", True))
+        and bool(candidate.get("shadow_capture_ready", False))
+        and int(candidate.get("local_bone_count", 0) or 0) > 0
+    }
     return {
         "schema_version": int(lod_manifest.get("schema_version", 1) or 1),
         "analyzer_version": int(lod_manifest.get("analyzer_version", 0) or 0),
         "frameanalysis_dir": str(lod_manifest.get("frameanalysis_dir", "") or ""),
         "shadow_stage": dict(lod_manifest.get("shadow_stage", {}) or {}),
+        "lod_chains": _build_lod_record_chains(lod_records),
         "candidate_ibs": list(lod_manifest.get("candidate_ibs", []) or []),
         "validation": list(lod_manifest.get("validation", []) or []),
     }

@@ -178,6 +178,20 @@ keyed by the final host of its own recognized capture chain. A global
 must not be treated as the sole replay host when the frame contains several LOD
 capture chains or a later composite draw.
 
+The analyzer must carry recognized chains forward as explicit data. At minimum
+a chain records:
+
+```text
+chain_index
+draw_start / draw_end
+start_lod_record_key / start_key
+host_lod_record_key / host_key
+lod_record_keys
+```
+
+Runtime generation uses this data for profile markers and delayed shadow host
+selection.
+
 ## Chain Detection
 
 LOD chain detection must be based on draw order and pass state. A chain should
@@ -209,6 +223,9 @@ The matcher should be chain-scoped:
 - `vb2` slot count can be a fast first pass, but it is not authoritative.
 - `vb2` slot-signature matching is one-to-one. One LOD key must not be claimed
   by several unrelated main keys just because their slot counts are close.
+- When there are several recognized chains, matching is executed separately per
+  chain. A main key may therefore produce several LOD links, but each emitted
+  link contains one concrete LOD source and its chain metadata.
 - Geometry center/bounds/diag are supporting evidence.
 - Vertex-group point-cloud matching is the source of truth for one-to-many
   relationships. Small vertex-group clouds that fail direct matching may be

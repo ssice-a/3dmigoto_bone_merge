@@ -509,11 +509,11 @@ class RuntimeIniTests(unittest.TestCase):
 
         self.assertTrue(runtime["lod_shadow_replay_plan"]["enabled"])
         self.assertEqual(
-            {"ib_hash": "dddddddd", "match_first_index": 0, "match_index_count": 99},
+            {"ib_hash": "cccccccc", "match_first_index": 0, "match_index_count": 30},
             runtime["lod_shadow_replay_plan"]["host_key"],
         )
-        self.assertEqual(219, runtime["lod_shadow_replay_plan"]["host_draw_index"])
-        self.assertEqual("lod_shadow_stage_host", runtime["lod_shadow_replay_plan"]["host_source"])
+        self.assertEqual(39, runtime["lod_shadow_replay_plan"]["host_draw_index"])
+        self.assertEqual("lod_shadow_chain_host", runtime["lod_shadow_replay_plan"]["host_source"])
         self.assertEqual(
             [
                 {"ib_hash": "bbbbbbbb", "match_first_index": 0, "match_index_count": 20},
@@ -522,16 +522,16 @@ class RuntimeIniTests(unittest.TestCase):
         )
         self.assertTrue(runtime["lod_shadow_replay_plan"]["preserve_host_draw"])
         host_section = ini_text[
-            ini_text.index("[TextureOverride_BMC_dddddddd_99_0_LOD]") :
+            ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]") :
             ini_text.index("[Present]")
         ]
         exported_lod_section = ini_text[
             ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_0_LOD]") :
             ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]")
         ]
-        self.assertIn("hash = dddddddd", host_section)
-        self.assertNotIn("x100 = 1", host_section)
-        self.assertNotIn("cs-t2 = ResourceLodCaptureBoneMap", host_section)
+        self.assertIn("hash = cccccccc", host_section)
+        self.assertIn("x100 = 1", host_section)
+        self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", host_section)
         self.assertNotIn("  handling = skip", host_section)
         self.assertIn("  draw = from_caller", host_section)
         self.assertIn("; delayed normal shadow replay", host_section)

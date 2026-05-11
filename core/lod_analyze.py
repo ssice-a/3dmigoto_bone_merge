@@ -95,10 +95,8 @@ def analyze_lod_for_manifest(
 
     main_points, canonical_global_count, main_records = _build_canonical_point_cloud(canonical_manifest)
     lod_manifest = _analyze_main_frameanalysis_cached(normalized_lod_dir)
-    canonical_ib_hashes = {str(record.get("ib_hash", "") or "").lower() for record in main_records if str(record.get("ib_hash", "") or "")}
     lod_points, lod_records, skipped_main_hash_count = _build_lod_point_cloud(
         lod_manifest,
-        excluded_ib_hashes=canonical_ib_hashes,
     )
     if not main_points:
         raise ValueError("No canonical weighted point cloud could be built from the main manifest")
@@ -1344,29 +1342,43 @@ def _build_lod_links(main_records: list[dict], lod_records: dict[str, dict], glo
 
 
 def _build_lod_links_from_vb2_signatures(main_records: list[dict], lod_records: dict[str, dict]) -> list[dict]:
-    links = []
-    for main_record in main_records:
+    candidate_pairs: list[tuple[dict, str, dict, str, dict, int, int]] = []
+    for main_index, main_record in enumerate(main_records):
+        main_key = str(main_record.get("source_key", "") or f"__main_{main_index}")
         main_slot_count = _relation_slot_count(main_record)
-        candidates = []
         if main_slot_count > 0:
             for lod_key, lod_record in lod_records.items():
                 lod_slot_count = _relation_slot_count(lod_record)
                 score = _slot_relation_score(main_record, lod_record)
                 if score is None:
                     continue
-                candidates.append((score, str(lod_key), lod_record, lod_slot_count))
-        if not candidates:
+                candidate_pairs.append((score, main_key, main_record, str(lod_key), lod_record, main_slot_count, lod_slot_count))
+
+    candidate_pairs.sort(
+        key=lambda item: (
+            -float(item[0]["score"]),
+            int(item[0]["slot_delta"]),
+            -int(item[6]),
+            str(item[3]),
+        )
+    )
+
+    assigned_by_main: dict[str, tuple[dict, str, dict, int, int]] = {}
+    used_lod_keys: set[str] = set()
+    for score, main_key, _main_record, lod_key, lod_record, main_slot_count, lod_slot_count in candidate_pairs:
+        if main_key in assigned_by_main or lod_key in used_lod_keys:
+            continue
+        assigned_by_main[main_key] = (score, lod_key, lod_record, main_slot_count, lod_slot_count)
+        used_lod_keys.add(lod_key)
+
+    links = []
+    for main_index, main_record in enumerate(main_records):
+        main_key = str(main_record.get("source_key", "") or f"__main_{main_index}")
+        assigned = assigned_by_main.get(main_key)
+        if assigned is None:
             links.append({**main_record, "lod_sources": [], "status": "unmatched"})
             continue
-        candidates.sort(
-            key=lambda item: (
-                -float(item[0]["score"]),
-                int(item[0]["slot_delta"]),
-                -int(item[3]),
-                str(item[1]),
-            )
-        )
-        best_score, best_lod_key, best_lod_record, best_lod_slot_count = candidates[0]
+        best_score, best_lod_key, best_lod_record, main_slot_count, best_lod_slot_count = assigned
         lod_sources = [
             {
                 "lod_record_key": best_lod_key,

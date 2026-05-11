@@ -711,13 +711,15 @@ The final host can draw replacement parts from other IBs because the global
 bone pool is complete by that point.
 
 For LOD shadow replay, the host must be the actual final LOD shadow host from
-the analyzed LOD shadow stage, not merely the latest LOD capture record. The
-coverage proof in `Shadow/LOD Failure Postmortem And Hard INI Rules` must still
-succeed before any LOD shadow skip/replay is emitted. The LOD host uses the same
-final-shadow rule as main: if the final LOD host has no exported geometry, emit
-one `draw = from_caller` before replay; if the final LOD host has exported
-geometry, skip it and replay its equivalent replacement in the delayed batch.
-Earlier LOD capture entries must not use `draw = from_caller`.
+the recognized LOD capture chain, not a global singleton and not a later
+composite draw. A frame may contain several LOD capture chains; runtime export
+may therefore emit several LOD shadow replay plans, each attached to its own
+host key. The coverage proof in `Shadow/LOD Failure Postmortem And Hard INI
+Rules` must still succeed before any LOD shadow skip/replay is emitted. The LOD
+host uses the same final-shadow rule as main: if the final LOD host has no
+exported geometry, emit one `draw = from_caller` before replay; if the final LOD
+host has exported geometry, skip it and replay its equivalent replacement in the
+delayed batch. Earlier LOD capture entries must not use `draw = from_caller`.
 
 ## Visible Pass Contract
 

@@ -272,6 +272,45 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual(links[1]["status"], "unmatched")
         self.assertEqual(links[1]["lod_sources"], [])
 
+    def test_vb2_signature_links_do_not_claim_one_lod_for_many_main_records(self):
+        main_records = [
+            {
+                "source_key": "main_a-100-0",
+                "ib_hash": "main_a",
+                "match_first_index": 0,
+                "match_index_count": 100,
+                "global_bone_base": 0,
+                "local_bone_count": 32,
+                "vb2_signature": {"slot_count": 32, "center": [0.0, 0.0, 0.0], "diag": 1.0},
+            },
+            {
+                "source_key": "main_b-100-0",
+                "ib_hash": "main_b",
+                "match_first_index": 0,
+                "match_index_count": 100,
+                "global_bone_base": 64,
+                "local_bone_count": 31,
+                "vb2_signature": {"slot_count": 31, "center": [3.0, 0.0, 0.0], "diag": 1.0},
+            },
+        ]
+        lod_records = {
+            "lod_a-80-0": {
+                "lod_record_key": "lod_a-80-0",
+                "lod_ib_hash": "lod_a",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 80,
+                "lod_local_bone_count": 32,
+                "vb2_signature": {"slot_count": 32, "center": [0.0, 0.0, 0.0], "diag": 1.0},
+            }
+        }
+
+        links = lod_analyze._build_lod_links_from_vb2_signatures(main_records, lod_records)
+
+        self.assertEqual(links[0]["status"], "matched")
+        self.assertEqual(links[0]["lod_sources"][0]["lod_record_key"], "lod_a-80-0")
+        self.assertEqual(links[1]["status"], "unmatched")
+        self.assertEqual(links[1]["lod_sources"], [])
+
     def test_bone_cloud_mapping_keeps_multiple_lod_candidates_for_one_global(self):
         canonical_points = [
             lod_analyze.WeightedPoint((0.0, 0.0, 0.0), ((200, 1.0),)),

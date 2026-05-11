@@ -288,6 +288,7 @@ def regenerate_bonestore_runtime_files(
             "shadow_stage": dict(runtime_plan.get("shadow_stage", {}) or {}),
             "shadow_replay_plan": dict(runtime_plan.get("shadow_replay_plan", {}) or {}),
             "lod_shadow_replay_plan": dict(runtime_plan.get("lod_shadow_replay_plan", {}) or {}),
+            "lod_shadow_replay_plans": list(runtime_plan.get("lod_shadow_replay_plans", []) or []),
             "buffers": dict(runtime_plan.get("buffers", {}) or {}),
         }
         write_json(normalized_export_manifest_path, export_manifest)

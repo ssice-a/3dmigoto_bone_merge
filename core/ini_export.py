@@ -32,6 +32,7 @@ _GLOBAL_BONE_POOL_ROWS_PER_SLOT = 200000
 _LOCAL_BONE_POOL_ROWS_PER_SLOT = 2048
 _CB1_ROWS = 4096
 _RUNTIME_STATE_ROWS = 64
+_LOD_SHADOW_CHAIN_GAP = 12
 
 
 def materialize_bonestore_runtime(
@@ -47,11 +48,18 @@ def materialize_bonestore_runtime(
     normalized_output_dir = ensure_directory(output_directory)
     buffer_dir = ensure_directory(os.path.join(normalized_output_dir, BUFFER_EXPORT_DIR_NAME))
 
-    capture_records, main_capture_bone_map = _build_main_capture_bone_map(capture_manifest)
-    lod_records, lod_capture_bone_map = _build_lod_capture_bone_map(capture_manifest)
     palette_records = _normalize_palette_records(normalized_output_dir, local_palette_records)
     geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
     _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
+    required_globals = _runtime_required_global_bones(geometry_payloads, palette_records)
+    capture_records, main_capture_bone_map = _build_main_capture_bone_map(
+        capture_manifest,
+        required_globals=required_globals,
+    )
+    lod_records, lod_capture_bone_map = _build_lod_capture_bone_map(
+        capture_manifest,
+        required_globals=required_globals,
+    )
     texture_records, texture_warnings = _materialize_texture_records(normalized_output_dir, texture_mark_payload or {})
     shader_filter_overrides = _runtime_shader_filter_overrides(
         capture_manifest,
@@ -60,8 +68,11 @@ def materialize_bonestore_runtime(
     lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
     lod_key_annotations = _build_lod_key_annotations(capture_manifest, geometry_payloads)
     shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
-    lod_shadow_replay_plan = _build_lod_shadow_replay_plan(capture_manifest, geometry_payloads, lod_replay_links, lod_records)
-    if _shadow_plan_needs_white_texture(shadow_replay_plan) or _shadow_plan_needs_white_texture(lod_shadow_replay_plan):
+    lod_shadow_replay_plans = _build_lod_shadow_replay_plans(capture_manifest, geometry_payloads, lod_replay_links, lod_records)
+    lod_shadow_replay_plan = _primary_lod_shadow_replay_plan(lod_shadow_replay_plans)
+    if _shadow_plan_needs_white_texture(shadow_replay_plan) or any(
+        _shadow_plan_needs_white_texture(plan) for plan in lod_shadow_replay_plans
+    ):
         _write_white_shadow_texture(os.path.join(normalized_output_dir, _WHITE_SHADOW_TEXTURE_FILE))
     _validate_palette_globals(capture_manifest, palette_records)
 
@@ -109,6 +120,7 @@ def materialize_bonestore_runtime(
         "shadow_stage": _normalize_shadow_stage(capture_manifest),
         "shadow_replay_plan": shadow_replay_plan,
         "lod_shadow_replay_plan": lod_shadow_replay_plan,
+        "lod_shadow_replay_plans": lod_shadow_replay_plans,
         "buffers": buffers,
     }
 
@@ -163,10 +175,12 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _build_main_capture_bone_map(capture_manifest: dict) -> tuple[list[dict], list[int]]:
+def _build_main_capture_bone_map(capture_manifest: dict, *, required_globals: set[int] | None = None) -> tuple[list[dict], list[int]]:
     records: list[dict] = []
     record_uints: list[int] = []
     pair_uints: list[int] = []
+    filter_required = required_globals is not None
+    required = {int(value) for value in (required_globals or set()) if int(value) >= 0}
 
     for pool_record in capture_manifest.get("bone_pool_order", []) or []:
         if not bool(pool_record.get("bone_capture_available", pool_record.get("shadow_capture_ready", False))):
@@ -175,12 +189,21 @@ def _build_main_capture_bone_map(capture_manifest: dict) -> tuple[list[dict], li
         if not used_indices:
             continue
 
+        capture_store_base = int(pool_record.get("capture_store_base", pool_record.get("global_bone_base", 0)) or 0)
+        pairs: list[tuple[int, int]] = []
+        for compact_index, source_local_bone in enumerate(used_indices):
+            canonical_global_bone = int(capture_store_base) + compact_index
+            if filter_required and canonical_global_bone not in required:
+                continue
+            pairs.append((int(source_local_bone), canonical_global_bone))
+        if not pairs:
+            continue
+
         record_index = len(records)
         pair_base = len(pair_uints) // _CAPTURE_BONE_PAIR_STRIDE
-        capture_store_base = int(pool_record.get("capture_store_base", pool_record.get("global_bone_base", 0)) or 0)
-        for compact_index, source_local_bone in enumerate(used_indices):
-            pair_uints.extend([int(source_local_bone), int(capture_store_base) + compact_index])
-        record_uints.extend([pair_base, len(used_indices), len(used_indices), _CAPTURE_FLAG_MAIN])
+        for source_local_bone, canonical_global_bone in pairs:
+            pair_uints.extend([source_local_bone, canonical_global_bone])
+        record_uints.extend([pair_base, len(pairs), len(used_indices), _CAPTURE_FLAG_MAIN])
 
         records.append(
             {
@@ -189,11 +212,12 @@ def _build_main_capture_bone_map(capture_manifest: dict) -> tuple[list[dict], li
                 "match_first_index": int(pool_record.get("match_first_index", 0) or 0),
                 "match_index_count": int(pool_record.get("match_index_count", 0) or 0),
                 "capture_store_base": capture_store_base,
-                "local_bone_count": len(used_indices),
-                "source_local_indices": list(used_indices),
+                "local_bone_count": len(pairs),
+                "source_local_indices": [source_local_bone for source_local_bone, _global_bone in pairs],
+                "canonical_global_bones": sorted({canonical_global_bone for _source_local_bone, canonical_global_bone in pairs}),
                 "capture_pair_base": pair_base,
-                "capture_pair_count": len(used_indices),
-                "dispatch_rows": len(used_indices) * 3,
+                "capture_pair_count": len(pairs),
+                "dispatch_rows": len(pairs) * 3,
             }
         )
 
@@ -202,10 +226,12 @@ def _build_main_capture_bone_map(capture_manifest: dict) -> tuple[list[dict], li
     return records, header + record_uints + pair_uints
 
 
-def _build_lod_capture_bone_map(capture_manifest: dict) -> tuple[list[dict], list[int]]:
+def _build_lod_capture_bone_map(capture_manifest: dict, *, required_globals: set[int] | None = None) -> tuple[list[dict], list[int]]:
     records: list[dict] = []
     record_uints: list[int] = []
     pair_uints: list[int] = []
+    filter_required = required_globals is not None
+    required = {int(value) for value in (required_globals or set()) if int(value) >= 0}
 
     for lod_record in capture_manifest.get("lod_capture_records", []) or []:
         raw_pairs = list(lod_record.get("scatter_pairs", []) or [])
@@ -216,6 +242,7 @@ def _build_lod_capture_bone_map(capture_manifest: dict) -> tuple[list[dict], lis
             )
             for pair in raw_pairs
             if int(pair.get("lod_local_bone", -1)) >= 0 and int(pair.get("canonical_global_bone", -1)) >= 0
+            and (not filter_required or int(pair.get("canonical_global_bone", -1)) in required)
         ]
         if not pairs:
             continue
@@ -617,21 +644,82 @@ def _build_lod_key_annotations(capture_manifest: dict, geometry_records: list[di
     ]
 
 
+def _primary_lod_shadow_replay_plan(plans: list[dict]) -> dict:
+    for plan in plans or []:
+        if bool(plan.get("enabled", False)):
+            return dict(plan)
+    if plans:
+        return dict(plans[0])
+    return {"enabled": False, "reason": "missing_lod_host_or_geometry"}
+
+
 def _build_lod_shadow_replay_plan(
     capture_manifest: dict,
     geometry_records: list[dict],
     lod_replay_links: list[dict],
     lod_capture_records: list[dict],
 ) -> dict:
+    return _primary_lod_shadow_replay_plan(
+        _build_lod_shadow_replay_plans(capture_manifest, geometry_records, lod_replay_links, lod_capture_records)
+    )
+
+
+def _build_lod_shadow_replay_plans(
+    capture_manifest: dict,
+    geometry_records: list[dict],
+    lod_replay_links: list[dict],
+    lod_capture_records: list[dict],
+) -> list[dict]:
     lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
     stage = _normalize_shadow_stage(lod_snapshot)
-    host_key, host_draw_index, host_source = _select_lod_shadow_host(stage, lod_capture_records)
-    if not _is_valid_override_key(host_key) or not geometry_records or not lod_replay_links:
+    raw_lod_records = _raw_lod_shadow_records(capture_manifest, lod_capture_records)
+    chains = _lod_shadow_capture_chains(raw_lod_records, stage)
+    if not geometry_records or not lod_replay_links or not chains:
+        return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
+
+    plans: list[dict] = []
+    for chain in chains:
+        plan = _build_lod_shadow_replay_plan_for_chain(
+            capture_manifest,
+            geometry_records,
+            lod_replay_links,
+            lod_capture_records,
+            chain,
+        )
+        if bool(plan.get("enabled", False)) or plan.get("reason") in {"lod_shadow_coverage_incomplete", "no_lod_exported_shadow_parts"}:
+            plans.append(plan)
+    enabled_plans = [plan for plan in plans if bool(plan.get("enabled", False))]
+    if enabled_plans:
+        return _merge_lod_shadow_plans_by_host(enabled_plans)
+    if plans:
+        return plans
+    else:
+        return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
+
+
+def _build_lod_shadow_replay_plan_for_chain(
+    capture_manifest: dict,
+    geometry_records: list[dict],
+    lod_replay_links: list[dict],
+    lod_capture_records: list[dict],
+    chain: dict,
+) -> dict:
+    host_key = _key_from_payload(dict(chain.get("host_key", {}) or {}))
+    host_draw_index = int(chain.get("host_draw_index", -1) or -1)
+    if not _is_valid_override_key(host_key):
         return {"enabled": False, "reason": "missing_lod_host_or_geometry"}
-    available_globals, coverage_records = _lod_shadow_available_globals_before_host(
+
+    chain_keys = {
+        _key_from_payload(dict(payload or {}))
+        for payload in chain.get("keys", []) or []
+        if _is_valid_override_key(_key_from_payload(dict(payload or {})))
+    }
+    available_globals, coverage_records = _lod_shadow_available_globals_for_chain(
         lod_capture_records,
-        host_draw_index=int(host_draw_index),
-        stage=stage,
+        chain_keys=chain_keys,
+        host_draw_index=host_draw_index,
+        chain_draw_start=int(chain.get("draw_start", -1) or -1),
+        chain_draw_end=int(chain.get("draw_end", -1) or -1),
     )
 
     roles_by_main_key = _shadow_roles_by_key(capture_manifest)
@@ -647,6 +735,8 @@ def _build_lod_shadow_replay_plan(
     for link in lod_replay_links:
         lod_key = _key_from_payload(dict(link.get("lod_key", {}) or {}))
         if not _is_valid_override_key(lod_key):
+            continue
+        if chain_keys and lod_key not in chain_keys:
             continue
         link_transparent_parts: list[str] = []
         link_normal_parts: list[str] = []
@@ -695,7 +785,10 @@ def _build_lod_shadow_replay_plan(
             "reason": reason,
             "host_key": _key_payload(host_key),
             "host_draw_index": int(host_draw_index),
-            "host_source": host_source,
+            "host_source": "lod_shadow_chain_host",
+            "chain_index": int(chain.get("chain_index", -1) or -1),
+            "chain_draw_start": int(chain.get("draw_start", -1) or -1),
+            "chain_draw_end": int(chain.get("draw_end", -1) or -1),
             "available_global_count": len(available_globals),
             "coverage_record_count": len(coverage_records),
             "missing_links": missing_links,
@@ -705,7 +798,10 @@ def _build_lod_shadow_replay_plan(
         "enabled": True,
         "host_key": _key_payload(host_key),
         "host_draw_index": int(host_draw_index),
-        "host_source": host_source,
+        "host_source": "lod_shadow_chain_host",
+        "chain_index": int(chain.get("chain_index", -1) or -1),
+        "chain_draw_start": int(chain.get("draw_start", -1) or -1),
+        "chain_draw_end": int(chain.get("draw_end", -1) or -1),
         "preserve_host_draw": host_key not in skipped_keys,
         "white_shadow_resource": "ResourceBMCWhiteShadow",
         "transparent_parts": transparent_parts,
@@ -717,37 +813,146 @@ def _build_lod_shadow_replay_plan(
     }
 
 
-def _select_lod_shadow_host(stage: dict, _lod_capture_records: list[dict]) -> tuple[tuple[str, int, int], int, str]:
-    host_key = (
-        str(stage.get("host_ib_hash", "") or "").lower(),
-        int(stage.get("host_match_first_index", 0) or 0),
-        int(stage.get("host_match_index_count", 0) or 0),
+def _raw_lod_shadow_records(capture_manifest: dict, lod_capture_records: list[dict]) -> list[dict]:
+    source_records = list(capture_manifest.get("lod_capture_records", []) or [])
+    if not source_records:
+        source_records = list(lod_capture_records or [])
+
+    records: list[dict] = []
+    for record in source_records:
+        raw = dict(record or {})
+        key = _lod_capture_record_key(raw)
+        if not _is_valid_override_key(key):
+            continue
+        draw_indices = _int_list(raw.get("lod_capture_draw_indices", raw.get("capture_draw_indices", [])))
+        if not draw_indices:
+            continue
+        records.append(
+            {
+                "key": _key_payload(key),
+                "draw_indices": sorted({int(value) for value in draw_indices if int(value) >= 0}),
+            }
+        )
+    return records
+
+
+def _lod_capture_record_key(record: dict) -> tuple[str, int, int]:
+    return (
+        str(record.get("ib_hash", record.get("lod_ib_hash", "")) or "").lower(),
+        int(record.get("match_first_index", record.get("lod_match_first_index", 0)) or 0),
+        int(record.get("match_index_count", record.get("lod_match_index_count", 0)) or 0),
     )
-    host_draw = int(stage.get("host_draw_index", -1) or -1)
-    return host_key, host_draw, "lod_shadow_stage_host"
 
 
-def _lod_shadow_available_globals_before_host(
+def _lod_shadow_capture_chains(raw_records: list[dict], stage: dict) -> list[dict]:
+    stage_start = int(stage.get("stage_draw_start", -1) or -1)
+    stage_end = int(stage.get("stage_draw_end", -1) or -1)
+    entries: list[tuple[int, tuple[str, int, int]]] = []
+    for record in raw_records or []:
+        key = _key_from_payload(dict(record.get("key", {}) or {}))
+        if not _is_valid_override_key(key):
+            continue
+        for draw_index in record.get("draw_indices", []) or []:
+            draw = int(draw_index)
+            if draw < 0 or not _draw_index_in_optional_stage_window(draw, stage_start, stage_end):
+                continue
+            entries.append((draw, key))
+    if not entries:
+        return []
+
+    entries.sort(key=lambda item: (int(item[0]), item[1][0], int(item[1][1]), int(item[1][2])))
+    segments: list[list[tuple[int, tuple[str, int, int]]]] = []
+    current: list[tuple[int, tuple[str, int, int]]] = []
+    previous_draw: int | None = None
+    for entry in entries:
+        draw = int(entry[0])
+        if current and previous_draw is not None and draw - previous_draw > _LOD_SHADOW_CHAIN_GAP:
+            segments.append(current)
+            current = []
+        current.append(entry)
+        previous_draw = draw
+    if current:
+        segments.append(current)
+
+    chains: list[dict] = []
+    for chain_index, segment in enumerate(segments):
+        key_values = {key for _draw, key in segment}
+        host_draw, host_key = max(segment, key=lambda item: (int(item[0]), item[1][0], int(item[1][1]), int(item[1][2])))
+        chains.append(
+            {
+                "chain_index": int(chain_index),
+                "draw_start": int(min(draw for draw, _key in segment)),
+                "draw_end": int(max(draw for draw, _key in segment)),
+                "host_draw_index": int(host_draw),
+                "host_key": _key_payload(host_key),
+                "keys": [_key_payload(key) for key in sorted(key_values)],
+            }
+        )
+    return chains
+
+
+def _merge_lod_shadow_plans_by_host(plans: list[dict]) -> list[dict]:
+    merged_by_host: dict[tuple[str, int, int], dict] = {}
+    order: list[tuple[str, int, int]] = []
+    for plan in plans or []:
+        host_key = _key_from_payload(dict(plan.get("host_key", {}) or {}))
+        if not _is_valid_override_key(host_key):
+            continue
+        if host_key not in merged_by_host:
+            merged_by_host[host_key] = dict(plan)
+            merged_by_host[host_key]["transparent_parts"] = list(plan.get("transparent_parts", []) or [])
+            merged_by_host[host_key]["normal_parts"] = list(plan.get("normal_parts", []) or [])
+            merged_by_host[host_key]["skip_keys"] = list(plan.get("skip_keys", []) or [])
+            merged_by_host[host_key]["chain_indices"] = [int(plan.get("chain_index", -1) or -1)]
+            order.append(host_key)
+            continue
+        bucket = merged_by_host[host_key]
+        for field in ("transparent_parts", "normal_parts"):
+            for suffix in plan.get(field, []) or []:
+                if suffix not in bucket[field]:
+                    bucket[field].append(suffix)
+        existing_skip = {
+            _key_from_payload(dict(payload or {}))
+            for payload in bucket.get("skip_keys", []) or []
+            if _is_valid_override_key(_key_from_payload(dict(payload or {})))
+        }
+        for payload in plan.get("skip_keys", []) or []:
+            key = _key_from_payload(dict(payload or {}))
+            if _is_valid_override_key(key) and key not in existing_skip:
+                bucket.setdefault("skip_keys", []).append(dict(payload))
+                existing_skip.add(key)
+        chain_index = int(plan.get("chain_index", -1) or -1)
+        if chain_index not in bucket.setdefault("chain_indices", []):
+            bucket["chain_indices"].append(chain_index)
+        bucket["available_global_count"] = max(int(bucket.get("available_global_count", 0) or 0), int(plan.get("available_global_count", 0) or 0))
+        bucket["coverage_record_count"] = max(int(bucket.get("coverage_record_count", 0) or 0), int(plan.get("coverage_record_count", 0) or 0))
+    return [merged_by_host[key] for key in order]
+
+
+def _lod_shadow_available_globals_for_chain(
     lod_capture_records: list[dict],
     *,
+    chain_keys: set[tuple[str, int, int]],
     host_draw_index: int,
-    stage: dict,
+    chain_draw_start: int,
+    chain_draw_end: int,
 ) -> tuple[set[int], list[dict]]:
     if int(host_draw_index) < 0:
         return set(), []
 
-    stage_start = int(stage.get("stage_draw_start", -1) or -1)
-    stage_end = int(stage.get("stage_draw_end", -1) or -1)
     available_globals: set[int] = set()
     coverage_records: list[dict] = []
 
     for record in lod_capture_records or []:
+        key = _override_key(record)
+        if chain_keys and key not in chain_keys:
+            continue
         draw_indices = [
             int(value)
             for value in record.get("capture_draw_indices", []) or []
             if int(value) >= 0
             and int(value) <= int(host_draw_index)
-            and _draw_index_in_optional_stage_window(int(value), stage_start, stage_end)
+            and _draw_index_in_optional_stage_window(int(value), int(chain_draw_start), int(chain_draw_end))
         ]
         if not draw_indices:
             continue
@@ -765,7 +970,7 @@ def _lod_shadow_available_globals_before_host(
             {
                 "record_index": int(record.get("record_index", -1) or -1),
                 "draw_index": max(draw_indices),
-                "key": _key_payload(_override_key(record)),
+                "key": _key_payload(key),
                 "global_count": len(globals_for_record),
             }
         )
@@ -939,6 +1144,23 @@ def _geometry_required_global_bones(geometry_record: dict) -> set[int]:
     }
 
 
+def _runtime_required_global_bones(geometry_records: list[dict], palette_records: list[dict]) -> set[int] | None:
+    if not geometry_records and not palette_records:
+        return None
+    required: set[int] = set()
+    for geometry_record in geometry_records or []:
+        required.update(_geometry_required_global_bones(geometry_record))
+    if required:
+        return required
+    for palette_record in palette_records or []:
+        required.update(
+            int(value)
+            for value in palette_record.get("palette_values", []) or []
+            if int(value) >= 0
+        )
+    return required
+
+
 def _validate_palette_globals(capture_manifest: dict, palette_records: list[dict]) -> None:
     unavailable = _capture_unavailable_global_bones(capture_manifest)
     if not unavailable:
@@ -1031,7 +1253,7 @@ def _resource_sections(runtime_plan: dict) -> list[str]:
     global_pool_rows = _GLOBAL_BONE_POOL_ROWS_PER_SLOT * _MAX_INSTANCE_SLOTS
     local_pool_rows = _LOCAL_BONE_POOL_ROWS_PER_SLOT * _MAX_INSTANCE_SLOTS
     shadow_plan = dict(runtime_plan.get("shadow_replay_plan", {}) or {})
-    lod_shadow_plan = dict(runtime_plan.get("lod_shadow_replay_plan", {}) or {})
+    lod_shadow_plans = _lod_shadow_plans(runtime_plan)
     lines = [
         "; -------------------------------------------------",
         "; Static capture tables",
@@ -1098,7 +1320,7 @@ def _resource_sections(runtime_plan: dict) -> list[str]:
             f"array = {_RUNTIME_STATE_ROWS}",
         ]
     )
-    if _shadow_plan_needs_white_texture(shadow_plan) or _shadow_plan_needs_white_texture(lod_shadow_plan):
+    if _shadow_plan_needs_white_texture(shadow_plan) or any(_shadow_plan_needs_white_texture(plan) for plan in lod_shadow_plans):
         lines.extend(
             [
                 "",
@@ -1107,6 +1329,14 @@ def _resource_sections(runtime_plan: dict) -> list[str]:
             ]
         )
     return lines
+
+
+def _lod_shadow_plans(runtime_plan: dict) -> list[dict]:
+    plans = [dict(plan or {}) for plan in runtime_plan.get("lod_shadow_replay_plans", []) or []]
+    if plans:
+        return plans
+    single = dict(runtime_plan.get("lod_shadow_replay_plan", {}) or {})
+    return [single] if single else []
 
 
 def _custom_shader_sections(runtime_plan: dict) -> list[str]:
@@ -1301,8 +1531,8 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
     lod_geometry_by_key = _lod_geometry_records_by_key(runtime_plan, geometry_by_suffix)
 
     shadow_plan = dict(runtime_plan.get("shadow_replay_plan", {}) or {})
-    lod_shadow_plan = dict(runtime_plan.get("lod_shadow_replay_plan", {}) or {})
-    shadow_plans = [plan for plan in (shadow_plan, lod_shadow_plan) if bool(plan.get("enabled", False))]
+    lod_shadow_plans = _lod_shadow_plans(runtime_plan)
+    shadow_plans = [plan for plan in [shadow_plan, *lod_shadow_plans] if bool(plan.get("enabled", False))]
     shadow_host_keys = [_shadow_plan_host_key(plan) for plan in shadow_plans]
     shadow_skip_keys: set[tuple[str, int, int]] = set()
     for plan in shadow_plans:
@@ -1311,7 +1541,7 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
     for host_key, plan in zip(shadow_host_keys, shadow_plans):
         if host_key is not None:
             shadow_hosts_by_key.setdefault(host_key, []).append(plan)
-    lod_role_keys = _lod_texture_override_keys(capture_by_key, lod_geometry_by_key, lod_shadow_plan)
+    lod_role_keys = _lod_texture_override_keys(capture_by_key, lod_geometry_by_key, lod_shadow_plans)
     main_role_keys = _main_texture_override_keys(capture_by_key, geometry_by_key, shadow_plan)
     lod_annotations_by_key = _lod_annotations_by_key(runtime_plan)
 
@@ -1379,7 +1609,7 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
 def _lod_texture_override_keys(
     capture_by_key: dict[tuple[str, int, int], dict[str, list[int]]],
     lod_geometry_by_key: dict[tuple[str, int, int], list[dict]],
-    lod_shadow_plan: dict,
+    lod_shadow_plans: list[dict],
 ) -> set[tuple[str, int, int]]:
     keys = {
         key
@@ -1387,10 +1617,11 @@ def _lod_texture_override_keys(
         if grouped_records.get("lod")
     }
     keys.update(lod_geometry_by_key)
-    host_key = _shadow_plan_host_key(lod_shadow_plan)
-    if host_key is not None:
-        keys.add(host_key)
-    keys.update(_shadow_plan_skip_keys(lod_shadow_plan))
+    for lod_shadow_plan in lod_shadow_plans or []:
+        host_key = _shadow_plan_host_key(lod_shadow_plan)
+        if host_key is not None:
+            keys.add(host_key)
+        keys.update(_shadow_plan_skip_keys(lod_shadow_plan))
     return keys
 
 

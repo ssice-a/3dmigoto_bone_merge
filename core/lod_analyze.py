@@ -512,44 +512,84 @@ def _score_bone_clouds(
     lod_clouds: dict[tuple[str, int], list[LodBoneSample]],
     tolerance: float,
 ) -> dict[tuple[str, int, int], dict]:
+    np = require_numpy()
     lod_samples = [sample for samples in lod_clouds.values() for sample in samples]
-    lod_hash = _generic_build_spatial_hash(lod_samples, lambda sample: sample.position, tolerance)
-    tolerance_squared = tolerance * tolerance
-    inverse_tolerance = 1.0 / max(float(tolerance), 1.0e-6)
-    lod_hash_get = lod_hash.get
+    if not lod_samples:
+        return {}
+
+    lod_bone_keys: list[tuple[str, int]] = []
+    lod_bone_to_id: dict[tuple[str, int], int] = {}
+    lod_bone_ids = np.empty((len(lod_samples),), dtype=np.int64)
+    lod_positions = np.empty((len(lod_samples), 3), dtype=np.float64)
+    lod_weights = np.empty((len(lod_samples),), dtype=np.float64)
+    for sample_index, sample in enumerate(lod_samples):
+        bone_key = (str(sample.lod_record_key), int(sample.lod_local_bone))
+        bone_id = lod_bone_to_id.get(bone_key)
+        if bone_id is None:
+            bone_id = len(lod_bone_keys)
+            lod_bone_to_id[bone_key] = bone_id
+            lod_bone_keys.append(bone_key)
+        lod_bone_ids[sample_index] = int(bone_id)
+        lod_positions[sample_index] = sample.position
+        lod_weights[sample_index] = float(sample.weight)
+
+    cell_size = max(float(tolerance), 1.0e-6)
+    lod_cell_keys = np.floor(lod_positions / cell_size).astype(np.int64)
+    lod_hash: dict[tuple[int, int, int], list[int]] = {}
+    for sample_index, cell in enumerate(lod_cell_keys):
+        lod_hash.setdefault((int(cell[0]), int(cell[1]), int(cell[2])), []).append(int(sample_index))
+    lod_hash_arrays = {
+        key: np.asarray(indices, dtype=np.intp)
+        for key, indices in lod_hash.items()
+    }
+
+    tolerance_squared = float(tolerance) * float(tolerance)
+    inverse_tolerance = 1.0 / cell_size
     min_pair_score = _MIN_PAIR_SCORE
     stats: dict[tuple[str, int, int], dict] = {}
 
     for canonical_global, canonical_samples in canonical_clouds.items():
         for canonical_sample in canonical_samples:
-            best_by_lod_bone: dict[tuple[str, int], tuple[float, float, float]] = {}
-            base_key = _cell_key(canonical_sample.position, tolerance)
-            canonical_x, canonical_y, canonical_z = canonical_sample.position
-            canonical_weight = float(canonical_sample.weight)
-            for cell_key in _neighbor_keys(base_key):
-                for lod_sample in lod_hash_get(cell_key, ()):
-                    lod_x, lod_y, lod_z = lod_sample.position
-                    dx = canonical_x - lod_x
-                    dy = canonical_y - lod_y
-                    dz = canonical_z - lod_z
-                    distance_squared = dx * dx + dy * dy + dz * dz
-                    if distance_squared > tolerance_squared:
-                        continue
-                    distance = math.sqrt(distance_squared)
-                    distance_score = 1.0 / (1.0 + distance * inverse_tolerance)
-                    score = canonical_weight * float(lod_sample.weight) * distance_score
-                    if score <= min_pair_score:
-                        continue
-                    lod_key = (lod_sample.lod_record_key, lod_sample.lod_local_bone)
-                    current = best_by_lod_bone.get(lod_key)
-                    if current is None or score > current[0]:
-                        best_by_lod_bone[lod_key] = (score, distance, float(lod_sample.weight))
-            for (lod_record_key, lod_local_bone), (score, distance, _lod_weight) in best_by_lod_bone.items():
+            neighbor_indices = [
+                lod_hash_arrays[cell_key]
+                for cell_key in _neighbor_keys(_cell_key(canonical_sample.position, tolerance))
+                if cell_key in lod_hash_arrays
+            ]
+            if not neighbor_indices:
+                continue
+            candidate_indices = np.concatenate(neighbor_indices) if len(neighbor_indices) > 1 else neighbor_indices[0]
+            if candidate_indices.size == 0:
+                continue
+            canonical_position = np.asarray(canonical_sample.position, dtype=np.float64)
+            deltas = lod_positions[candidate_indices] - canonical_position
+            distance_squared = np.einsum("ij,ij->i", deltas, deltas)
+            valid = distance_squared <= tolerance_squared
+            if not np.any(valid):
+                continue
+            candidate_indices = candidate_indices[valid]
+            distances = np.sqrt(distance_squared[valid])
+            distance_scores = 1.0 / (1.0 + distances * inverse_tolerance)
+            scores = float(canonical_sample.weight) * lod_weights[candidate_indices] * distance_scores
+            accepted = scores > min_pair_score
+            if not np.any(accepted):
+                continue
+            candidate_indices = candidate_indices[accepted]
+            distances = distances[accepted]
+            scores = scores[accepted]
+            candidate_bone_ids = lod_bone_ids[candidate_indices]
+            order = np.lexsort((-scores, candidate_bone_ids))
+            sorted_bone_ids = candidate_bone_ids[order]
+            best_starts = np.flatnonzero(
+                np.concatenate((np.array([True]), sorted_bone_ids[1:] != sorted_bone_ids[:-1]))
+            )
+            for sorted_position in best_starts:
+                source_index = int(order[int(sorted_position)])
+                lod_record_key, lod_local_bone = lod_bone_keys[int(candidate_bone_ids[source_index])]
                 key = (str(lod_record_key), int(lod_local_bone), int(canonical_global))
                 record = stats.setdefault(key, {"score": 0.0, "votes": 0, "distance_sum": 0.0})
-                record["score"] += float(score)
+                record["score"] += float(scores[source_index])
                 record["votes"] += 1
-                record["distance_sum"] += float(distance)
+                record["distance_sum"] += float(distances[source_index])
     return stats
 
 

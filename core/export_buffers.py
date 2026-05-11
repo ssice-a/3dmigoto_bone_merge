@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 
 from .draw_arrays import require_numpy
-from .texcoord_attrs import texcoord_color_attr_names
+from .texcoord_attrs import texcoord_color_attr_names, texcoord_component_attr_names
 from .export_package import ExportPartPlan, write_r32_index_buffer
 from .numpy_buffers import assign_bytes, foreach_get_array, object_attribute_array
 from .uv_transform import DEFAULT_UV_FLIP_V
@@ -611,7 +611,8 @@ def _write_texcoord_slot(
 ) -> bool:
     uv_plans = [plan for plan in field_plans if plan[0] == "uv"]
     texcoord_snorm4_plans = [plan for plan in field_plans if plan[0] == "texcoord_snorm4"]
-    if len(uv_plans) + len(texcoord_snorm4_plans) != len(field_plans):
+    texcoord_float_plans = [plan for plan in field_plans if plan[0] == "texcoord_float"]
+    if len(uv_plans) + len(texcoord_snorm4_plans) + len(texcoord_float_plans) != len(field_plans):
         return False
     if _write_numpy_texcoord_slot(slot, field_plans, loop_vertices, export_cache):
         return True
@@ -629,7 +630,8 @@ def _write_numpy_texcoord_slot(
         return False
     uv_plans = [plan for plan in field_plans if plan[0] == "uv"]
     texcoord_snorm4_plans = [plan for plan in field_plans if plan[0] == "texcoord_snorm4"]
-    if len(uv_plans) + len(texcoord_snorm4_plans) != len(field_plans):
+    texcoord_float_plans = [plan for plan in field_plans if plan[0] == "texcoord_float"]
+    if len(uv_plans) + len(texcoord_snorm4_plans) + len(texcoord_float_plans) != len(field_plans):
         return False
     stride = int(slot.stride)
     records = np.zeros((len(loop_vertices), stride), dtype=np.uint8)
@@ -653,6 +655,13 @@ def _write_numpy_texcoord_slot(
             if snorm_values is None:
                 return False
             _numpy_assign_bytes(records[start:end], int(field_offset), snorm_values)
+        for _kind, field_offset, semantic_index, component_count in texcoord_float_plans:
+            values = _texcoord_float_values(first.mesh, slot.slot_name, int(semantic_index), int(component_count), mesh_cache)
+            if values is None:
+                continue
+            if vertex_indices.size and int(vertex_indices.max()) >= len(values):
+                return False
+            _numpy_assign_bytes(records[start:end], int(field_offset), values[vertex_indices])
     slot.output[:] = records.tobytes()
     return True
 
@@ -827,6 +836,8 @@ def _fast_field_plans(slot: _PreparedVertexSlot) -> list[tuple] | None:
             plans.append(("uv", offset, f"UV{semantic_index}"))
         elif semantic_name == "TEXCOORD" and fmt == "R8G8B8A8_SNORM":
             plans.append(("texcoord_snorm4", offset, semantic_index))
+        elif semantic_name == "TEXCOORD" and fmt in {"R32_FLOAT", "R32G32_FLOAT", "R32G32B32_FLOAT", "R32G32B32A32_FLOAT"}:
+            plans.append(("texcoord_float", offset, semantic_index, _float_format_component_count(fmt)))
         elif semantic_name == "BLENDWEIGHTS" and semantic_index == 0 and fmt in {"R16G16B16A16_UNORM", "R32G32B32A32_FLOAT"}:
             plans.append(("blend_weights", offset, fmt))
         elif semantic_name == "BLENDINDICES" and semantic_index == 0 and fmt in {"R8G8B8A8_UINT", "R32G32B32A32_UINT"}:
@@ -834,6 +845,15 @@ def _fast_field_plans(slot: _PreparedVertexSlot) -> list[tuple] | None:
         else:
             return None
     return plans
+
+
+def _float_format_component_count(fmt: str) -> int:
+    return {
+        "R32_FLOAT": 1,
+        "R32G32_FLOAT": 2,
+        "R32G32B32_FLOAT": 3,
+        "R32G32B32A32_FLOAT": 4,
+    }.get(_normalize_format(fmt), 0)
 
 
 def _unorm16(value: float) -> int:
@@ -861,6 +881,45 @@ def _texcoord_snorm4_source(mesh, slot_name: str, semantic_index: int, mesh_cach
 
     mesh_cache.texcoord_snorm4_sources[key] = source
     return source
+
+
+def _texcoord_float_values(mesh, slot_name: str, semantic_index: int, component_count: int, mesh_cache: _MeshExportCache):
+    np = require_numpy()
+    vertex_count = len(getattr(mesh, "vertices", []) or [])
+    component_values = []
+    for component_index in range(int(component_count)):
+        value = _point_attribute_array(
+            mesh,
+            texcoord_component_attr_names(slot_name, semantic_index, component_index),
+            vertex_count,
+            mesh_cache,
+        )
+        if value is None:
+            return None
+        component_values.append(value)
+    if not component_values:
+        return None
+    return np.stack(component_values, axis=1).astype(np.float32, copy=False)
+
+
+def _point_attribute_array(mesh, names: tuple[str, ...], count: int, mesh_cache: _MeshExportCache):
+    np = require_numpy()
+    for name in names:
+        attribute = _attribute(mesh, name, mesh_cache)
+        if attribute is None:
+            continue
+        data = getattr(attribute, "data", []) or []
+        if len(data) < int(count):
+            continue
+        try:
+            return foreach_get_array(data, "value", dtype="float32")[: int(count)]
+        except ValueError:
+            return np.fromiter(
+                (float(getattr(data[index], "value", 0.0)) for index in range(int(count))),
+                dtype=np.float32,
+                count=int(count),
+            )
+    return None
 
 
 def _color_attribute_numpy_array(attribute) -> object | None:
@@ -1440,17 +1499,47 @@ def _local_top4_packed(loop_vertex: _LoopVertex, export_cache: _ExportPartCache)
 
 def _local_top4_vertex_arrays(mesh, mesh_cache: _MeshExportCache, export_cache: _ExportPartCache):
     np = require_numpy()
-    vertex_count = len(getattr(mesh, "vertices", []) or [])
+    vertices = getattr(mesh, "vertices", []) or []
+    vertex_count = len(vertices)
     cached_weights = mesh_cache.blend_weights_by_vertex
     cached_indices = mesh_cache.blend_indices_by_vertex
     if cached_weights is not None and cached_indices is not None:
         return cached_weights, cached_indices
     weights_array = np.zeros((vertex_count, 4), dtype=np.float32)
     indices_array = np.zeros((vertex_count, 4), dtype=np.uint32)
-    for vertex_index in range(vertex_count):
-        weights, indices = _local_top4_weights_for_vertex(mesh, vertex_index, mesh_cache, export_cache)
-        weights_array[vertex_index] = weights
-        indices_array[vertex_index] = indices
+    group_index_to_local = {
+        int(group_index): int(local_index)
+        for group_index, global_group in mesh_cache.group_index_to_global.items()
+        if (local_index := export_cache.palette_to_local.get(int(global_group))) is not None
+    }
+    if not group_index_to_local:
+        mesh_cache.blend_weights_by_vertex = weights_array
+        mesh_cache.blend_indices_by_vertex = indices_array
+        return weights_array, indices_array
+
+    for sequence_index, vertex in enumerate(vertices):
+        vertex_index = int(getattr(vertex, "index", sequence_index))
+        if vertex_index < 0 or vertex_index >= vertex_count:
+            vertex_index = int(sequence_index)
+        weighted: list[tuple[int, float]] = []
+        for group_element in getattr(vertex, "groups", []) or []:
+            local_index = group_index_to_local.get(int(getattr(group_element, "group", -1)))
+            if local_index is None:
+                continue
+            weight = float(getattr(group_element, "weight", 0.0))
+            if weight <= 0.0:
+                continue
+            weighted.append((int(local_index), weight))
+        if not weighted:
+            continue
+        weighted.sort(key=lambda item: (-item[1], item[0]))
+        top = weighted[:4]
+        total = sum(weight for _index, weight in top)
+        if total <= 1e-12:
+            continue
+        for column, (local_index, weight) in enumerate(top):
+            weights_array[vertex_index, column] = float(weight) / float(total)
+            indices_array[vertex_index, column] = int(local_index)
     mesh_cache.blend_weights_by_vertex = weights_array
     mesh_cache.blend_indices_by_vertex = indices_array
     return weights_array, indices_array

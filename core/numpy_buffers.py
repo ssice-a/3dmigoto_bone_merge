@@ -223,6 +223,50 @@ def object_attribute_array(items, attribute_name: str, *, dtype="int64", start: 
     )
 
 
+def grouped_positive_blend_assignments(blend_indices, blend_weights, *, epsilon: float = 0.0):
+    """Return sorted (palette, weight, vertex_ids) runs for Blender group.add()."""
+
+    indices = np.asarray(blend_indices)
+    weights = np.asarray(blend_weights, dtype=np.float64)
+    if indices.size == 0 or weights.size == 0:
+        return []
+    if indices.ndim == 1:
+        indices = indices.reshape((-1, 1))
+    if weights.ndim == 1:
+        weights = weights.reshape((-1, 1))
+    row_count = min(int(indices.shape[0]), int(weights.shape[0]))
+    column_count = min(int(indices.shape[1]), int(weights.shape[1]))
+    if row_count <= 0 or column_count <= 0:
+        return []
+    indices = indices[:row_count, :column_count].astype(np.int64, copy=False)
+    weights = weights[:row_count, :column_count]
+    positive = weights > float(epsilon)
+    if not np.any(positive):
+        return []
+
+    vertex_grid = np.broadcast_to(np.arange(row_count, dtype=np.int64)[:, None], (row_count, column_count))
+    flat_vertices = vertex_grid[positive]
+    flat_palettes = indices[positive]
+    flat_weights = weights[positive]
+    order = np.lexsort((flat_vertices, flat_weights, flat_palettes))
+    flat_vertices = flat_vertices[order]
+    flat_palettes = flat_palettes[order]
+    flat_weights = flat_weights[order]
+    run_starts = np.flatnonzero(
+        np.concatenate(
+            (
+                np.array([True]),
+                (flat_palettes[1:] != flat_palettes[:-1]) | (flat_weights[1:] != flat_weights[:-1]),
+            )
+        )
+    )
+    run_ends = np.concatenate((run_starts[1:], np.array([len(flat_palettes)])))
+    return [
+        (int(flat_palettes[start]), float(flat_weights[start]), flat_vertices[start:end])
+        for start, end in zip(run_starts, run_ends)
+    ]
+
+
 def normalize_rows(values, *, columns: int = 3, dtype="float32"):
     vectors = np.asarray(values, dtype=np.dtype(dtype))
     if vectors.size == 0:

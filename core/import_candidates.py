@@ -12,7 +12,7 @@ from typing import Iterable
 
 from .draw_arrays import build_topology_arrays, read_index_array, require_numpy, row_tuple_list
 from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
-from .numpy_buffers import read_interleaved_field, read_interleaved_fields
+from .numpy_buffers import grouped_positive_blend_assignments, read_interleaved_field, read_interleaved_fields
 from .texcoord_attrs import texcoord_color_attr_names
 from .uv_transform import DEFAULT_UV_FLIP_V, game_uv_to_blender
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
@@ -1480,14 +1480,10 @@ def _assign_vertex_groups(
     blend_indices: list[tuple[int, int, int, int]],
     blend_weights: list[tuple[float, float, float, float]],
 ) -> None:
-    assignments: dict[int, dict[float, list[int]]] = {}
-    for vertex_index, (index_record, weight_record) in enumerate(zip(blend_indices, blend_weights)):
-        for palette_index, weight in zip(index_record, weight_record):
-            if weight <= 0.0:
-                continue
-            assignments.setdefault(int(palette_index), {}).setdefault(float(weight), []).append(vertex_index)
-
-    for palette_index, weights_to_vertices in sorted(assignments.items()):
-        group = imported_object.vertex_groups.new(name=str(int(palette_index)))
-        for weight, vertex_indices in weights_to_vertices.items():
-            group.add(vertex_indices, float(weight), "ADD")
+    current_group = None
+    current_palette_index = None
+    for palette_index, weight, vertex_indices in grouped_positive_blend_assignments(blend_indices, blend_weights):
+        if current_group is None or current_palette_index != int(palette_index):
+            current_palette_index = int(palette_index)
+            current_group = imported_object.vertex_groups.new(name=str(current_palette_index))
+        current_group.add(vertex_indices.astype("int64", copy=False).tolist(), float(weight), "ADD")

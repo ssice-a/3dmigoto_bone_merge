@@ -1707,9 +1707,7 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
             ]
         )
         has_capture_records = bool(grouped_records.get("main") or grouped_records.get("lod"))
-        if has_capture_records:
-            lines.extend(_capture_record_lines(grouped_records, indent=""))
-
+        capture_lines = _capture_record_lines(grouped_records, indent="  ") if has_capture_records else []
         shadow_lines = _profiled_shadow_lines(
             key,
             main_shadow_skip_keys=main_shadow_skip_keys,
@@ -1718,13 +1716,14 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
             lod_shadow_hosts_by_key=lod_shadow_hosts_by_key,
             parts_by_suffix=geometry_by_suffix,
         )
-        if shadow_lines:
+        if capture_lines or shadow_lines:
             lines.append("if vs == 200")
+            lines.extend(capture_lines)
             lines.extend(shadow_lines)
             lines.append("endif")
 
         if geometry_records:
-            if has_capture_records or shadow_lines:
+            if capture_lines or shadow_lines:
                 lines.append("")
             lines.extend(_visible_replay_lines(geometry_records, runtime_plan))
         lines.append("")

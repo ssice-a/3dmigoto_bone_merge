@@ -271,6 +271,7 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
         "producer_dispatches": [],
         "bone_pool_order": bone_pool_order,
         "lod_frameanalysis": [],
+        "lod_chains": [],
         "lod_links": [],
         "lod_capture_records": [],
         "validation": warnings,

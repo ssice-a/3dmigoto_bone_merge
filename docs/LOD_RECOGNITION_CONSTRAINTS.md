@@ -94,7 +94,7 @@ and LOD replay consume the same canonical global bone pool.
 
 ## Profile Discrimination
 
-Profile discrimination belongs to the record stage.
+Profile discrimination primarily belongs to the record stage.
 
 If an override key can only appear in one capture profile, it can use a direct
 record block:
@@ -143,11 +143,16 @@ if vs == 200
 endif
 ```
 
-The flag chooses how to write bones into `GlobalBonePool`. It must not be used
-as the authority for which exported parts to replay.
+The flag chooses how to write bones into `GlobalBonePool`. If one generated
+`TextureOverride` section is shared by main and LOD shadow contexts, the same
+flag may also guard which already-planned shadow skip/replay block runs in that
+section. It must not dynamically choose replay parts; replay ownership still
+comes from the offline main/LOD matching and shadow-chain plan.
 
-Emit this flag only when an override key can be reached by both main and LOD
-record profiles. Keys that exist in only one profile keep direct capture blocks.
+Emit this flag when an override key can be reached by both main and LOD record
+profiles, or when a single override section would otherwise contain both main
+and LOD shadow actions. Keys that exist in only one profile keep direct capture
+and shadow blocks.
 
 ## Terms
 
@@ -192,6 +197,13 @@ lod_record_keys
 Runtime generation uses this data for profile markers and delayed shadow host
 selection.
 
+Profile markers and delayed shadow host selection must be built from the raw
+recognized LOD chain data, not only from the filtered `LodCaptureBoneMap`
+records. A host draw can be valid even when that host does not write any
+currently required canonical global bone. Filtering it out of the capture map
+must not remove the `$bmc_profile_lod = 0` reset point or the delayed replay
+host.
+
 ## Chain Detection
 
 LOD chain detection must be based on draw order and pass state. A chain should
@@ -217,6 +229,16 @@ LOD-to-main matching answers one question only:
 > Which exported main part should be replayed when this LOD key is encountered?
 
 The matcher should be chain-scoped:
+
+```text
+main exported part -> LOD source within one recognized LOD chain
+```
+
+Do not collapse replay links only by LOD key. If the same LOD key appears in
+two chains, each chain keeps its own `lod_chain_index` and geometry list. The
+coverage proof for chain A must not include geometry that belongs only to chain
+B, or it can incorrectly fail as "missing bones" and suppress a valid shadow
+replay.
 
 - A main key may only match LOD keys present in the same recognized LOD chain.
 - Matching all main records against all LOD records globally is too broad.
@@ -272,8 +294,8 @@ For each capture profile, gather the union of all globals needed by the replay
 parts that can be drawn in that profile:
 
 ```text
-MainNeededGlobals = union(main replay part required globals)
-LodNeededGlobals  = union(LOD replay part required globals)
+MainNeededGlobals = union(all exported main replay part required globals)
+LodNeededGlobals  = union(geometry suffixes referenced by LOD replay links)
 ```
 
 Then find provider draws independently for each profile:
@@ -297,6 +319,10 @@ set may need four provider IBs, while the corresponding LOD replay set may need
 three or five. The counts must not be inherited between profiles; both profiles
 share the canonical global bone pool, but their source-local bone layouts and
 provider draws are selected separately.
+
+If exported main geometry has no LOD replay link, that geometry must not broaden
+`LodNeededGlobals`. If there is no exported geometry at all, capture maps may
+remain unfiltered for diagnostic/import-only workflows.
 
 When multiple export collections contain objects, compute each part palette
 first, then union those palettes only for provider selection. Replay still uses

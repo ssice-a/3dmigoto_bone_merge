@@ -523,6 +523,24 @@ record block branches between `ResourceLodCaptureBoneMap` and
 the flag to `0`. This flag only selects the capture map; replay still uses the
 part's `PartLocalToGlobalBoneMap`.
 
+When a single override section is shared by main and LOD shadow contexts, the
+same flag must also guard shadow skip/replay blocks so a LOD shadow plan cannot
+skip or replay during the main/control profile, and vice versa:
+
+```ini
+if vs == 200
+  if $bmc_profile_lod == 1
+    ; LOD shadow skip/replay planned for this section
+  else
+    ; main shadow skip/replay planned for this section
+  endif
+endif
+```
+
+The guarded shadow blocks are still generated from static offline plans. The
+runtime flag does not pick geometry by itself; it only prevents a shared
+`TextureOverride` section from executing the wrong precomputed profile branch.
+
 `x102` is reserved for future capture sequence flags. It must not be emitted or
 read while the generator cannot prove the multi-instance capture sequence:
 

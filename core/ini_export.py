@@ -51,26 +51,35 @@ def materialize_bonestore_runtime(
     palette_records = _normalize_palette_records(normalized_output_dir, local_palette_records)
     geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
     _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
-    required_globals = _runtime_required_global_bones(geometry_payloads, palette_records)
+    lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
+    main_required_globals = _runtime_required_global_bones(geometry_payloads, palette_records)
+    lod_required_globals = _lod_runtime_required_global_bones(geometry_payloads, palette_records, lod_replay_links)
     capture_records, main_capture_bone_map = _build_main_capture_bone_map(
         capture_manifest,
-        required_globals=required_globals,
+        required_globals=main_required_globals,
     )
     lod_records, lod_capture_bone_map = _build_lod_capture_bone_map(
         capture_manifest,
-        required_globals=required_globals,
+        required_globals=lod_required_globals,
     )
     texture_records, texture_warnings = _materialize_texture_records(normalized_output_dir, texture_mark_payload or {})
     shader_filter_overrides = _runtime_shader_filter_overrides(
         capture_manifest,
         filter_residual=filter_residual,
     )
-    lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
     lod_key_annotations = _build_lod_key_annotations(capture_manifest, geometry_payloads)
     shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
-    lod_profile_chains = _build_lod_profile_chains(lod_records)
+    lod_profile_chains = _build_lod_profile_chains(capture_manifest, lod_records)
     lod_shadow_replay_plans = _build_lod_shadow_replay_plans(capture_manifest, geometry_payloads, lod_replay_links, lod_records)
     lod_shadow_replay_plan = _primary_lod_shadow_replay_plan(lod_shadow_replay_plans)
+    uses_lod_profile_flag = _uses_lod_profile_flag(
+        capture_records,
+        lod_records,
+        geometry_payloads,
+        lod_replay_links,
+        shadow_replay_plan,
+        lod_shadow_replay_plans,
+    )
     if _shadow_plan_needs_white_texture(shadow_replay_plan) or any(
         _shadow_plan_needs_white_texture(plan) for plan in lod_shadow_replay_plans
     ):
@@ -115,7 +124,9 @@ def materialize_bonestore_runtime(
         "lod_replay_links": lod_replay_links,
         "lod_key_annotations": lod_key_annotations,
         "lod_profile_chains": lod_profile_chains,
-        "uses_lod_profile_flag": _uses_lod_profile_flag(capture_records, lod_records),
+        "uses_lod_profile_flag": uses_lod_profile_flag,
+        "main_required_global_bones": sorted(main_required_globals) if main_required_globals is not None else [],
+        "lod_required_global_bones": sorted(lod_required_globals) if lod_required_globals is not None else [],
         "palettes": palette_records,
         "geometry": geometry_payloads,
         "textures": texture_records,
@@ -570,7 +581,7 @@ def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]
     if not geometry_by_key:
         return []
 
-    links_by_lod_key: dict[tuple[str, int, int], dict] = {}
+    links_by_lod_chain: dict[tuple[tuple[str, int, int], int], dict] = {}
     for link in capture_manifest.get("lod_links", []) or []:
         main_key = _main_key_from_lod_link(dict(link or {}))
         main_geometry = geometry_by_key.get(main_key, [])
@@ -579,9 +590,10 @@ def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]
         lod_key = _lod_replay_host_key_from_link(dict(link or {}))
         if not _is_valid_override_key(lod_key):
             continue
+        chain_index = _lod_replay_chain_index_from_link(dict(link or {}))
 
-        bucket = links_by_lod_key.setdefault(
-            lod_key,
+        bucket = links_by_lod_chain.setdefault(
+            (lod_key, chain_index),
             {
                 "lod_key": _key_payload(lod_key),
                 "main_keys": [],
@@ -589,6 +601,9 @@ def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]
                 "geometry_suffixes": [],
             },
         )
+        if chain_index >= 0:
+            bucket["lod_chain_index"] = int(chain_index)
+        _copy_lod_replay_chain_fields(bucket, dict(link or {}))
         main_payload = _key_payload(main_key)
         _append_unique_payload(bucket["main_keys"], main_payload)
         for geometry_record in sorted(main_geometry, key=lambda item: int(item.get("part_index", 0) or 0)):
@@ -606,9 +621,9 @@ def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]
             )
 
     return [
-        links_by_lod_key[key]
-        for key in sorted(links_by_lod_key)
-        if links_by_lod_key[key].get("geometry_suffixes")
+        links_by_lod_chain[key]
+        for key in sorted(links_by_lod_chain, key=lambda item: (item[0][0], int(item[0][1]), int(item[0][2]), int(item[1])))
+        if links_by_lod_chain[key].get("geometry_suffixes")
     ]
 
 
@@ -703,8 +718,8 @@ def _build_lod_shadow_replay_plans(
         return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
 
 
-def _build_lod_profile_chains(lod_capture_records: list[dict]) -> list[dict]:
-    raw_lod_records = _raw_lod_shadow_records({}, lod_capture_records)
+def _build_lod_profile_chains(capture_manifest: dict, lod_capture_records: list[dict]) -> list[dict]:
+    raw_lod_records = _raw_lod_shadow_records(capture_manifest, lod_capture_records)
     return _lod_shadow_capture_chains(raw_lod_records, {})
 
 
@@ -744,6 +759,8 @@ def _build_lod_shadow_replay_plan_for_chain(
     missing_links: list[dict] = []
 
     for link in lod_replay_links:
+        if not _lod_replay_link_matches_chain(link, chain):
+            continue
         lod_key = _key_from_payload(dict(link.get("lod_key", {}) or {}))
         if not _is_valid_override_key(lod_key):
             continue
@@ -822,6 +839,14 @@ def _build_lod_shadow_replay_plan_for_chain(
         "coverage_record_count": len(coverage_records),
         "missing_links": missing_links,
     }
+
+
+def _lod_replay_link_matches_chain(link: dict, chain: dict) -> bool:
+    link_chain_index = _int_default(link.get("lod_chain_index"), -1)
+    chain_index = _int_default(chain.get("chain_index"), -1)
+    if link_chain_index < 0 or chain_index < 0:
+        return True
+    return link_chain_index == chain_index
 
 
 def _raw_lod_shadow_records(capture_manifest: dict, lod_capture_records: list[dict]) -> list[dict]:
@@ -1091,6 +1116,42 @@ def _lod_replay_host_key_from_link(link: dict) -> tuple[str, int, int]:
     return _lod_key_from_source(link)
 
 
+def _lod_replay_chain_index_from_link(link: dict) -> int:
+    chain_index = _int_default(link.get("lod_chain_index"), -1)
+    if chain_index >= 0:
+        return chain_index
+    sources = [
+        dict(source or {})
+        for source in link.get("lod_sources", []) or []
+        if _is_valid_override_key(_lod_key_from_source(dict(source or {})))
+    ]
+    if not sources:
+        return -1
+    sources.sort(
+        key=lambda source: (
+            -int(source.get("mapped_global_count", 0) or 0),
+            -float(source.get("score", 0.0) or 0.0),
+            -int(source.get("votes", 0) or 0),
+            str(source.get("lod_record_key", "") or ""),
+        )
+    )
+    return _int_default(sources[0].get("lod_chain_index"), -1)
+
+
+def _copy_lod_replay_chain_fields(bucket: dict, link: dict) -> None:
+    for field in (
+        "lod_chain_draw_start",
+        "lod_chain_draw_end",
+        "lod_chain_host_draw_index",
+    ):
+        value = _int_default(link.get(field), -1)
+        if value >= 0:
+            bucket[field] = value
+    host_key = dict(link.get("lod_chain_host_key", {}) or {})
+    if host_key:
+        bucket["lod_chain_host_key"] = host_key
+
+
 def _lod_key_from_source(source: dict) -> tuple[str, int, int]:
     return (
         str(source.get("lod_ib_hash", "") or "").lower(),
@@ -1175,6 +1236,42 @@ def _runtime_required_global_bones(geometry_records: list[dict], palette_records
     return required
 
 
+def _lod_runtime_required_global_bones(
+    geometry_records: list[dict],
+    palette_records: list[dict],
+    lod_replay_links: list[dict],
+) -> set[int] | None:
+    if not geometry_records and not palette_records:
+        return None
+    if not lod_replay_links:
+        return set()
+    geometry_by_suffix = {
+        str(record.get("resource_suffix", "") or ""): record
+        for record in geometry_records or []
+        if str(record.get("resource_suffix", "") or "")
+    }
+    required: set[int] = set()
+    for suffix in _lod_replay_geometry_suffixes(lod_replay_links):
+        geometry_record = geometry_by_suffix.get(suffix)
+        if geometry_record is not None:
+            required.update(_geometry_required_global_bones(geometry_record))
+    return required
+
+
+def _lod_replay_geometry_suffixes(lod_replay_links: list[dict]) -> set[str]:
+    suffixes: set[str] = set()
+    for link in lod_replay_links or []:
+        for suffix in link.get("geometry_suffixes", []) or []:
+            value = str(suffix or "")
+            if value:
+                suffixes.add(value)
+        for item in link.get("geometry", []) or []:
+            value = str(dict(item or {}).get("resource_suffix", "") or "")
+            if value:
+                suffixes.add(value)
+    return suffixes
+
+
 def _validate_palette_globals(capture_manifest: dict, palette_records: list[dict]) -> None:
     unavailable = _capture_unavailable_global_bones(capture_manifest)
     if not unavailable:
@@ -1208,10 +1305,36 @@ def _capture_unavailable_global_bones(capture_manifest: dict) -> set[int]:
     return unavailable
 
 
-def _uses_lod_profile_flag(capture_records: list[dict], lod_records: list[dict]) -> bool:
+def _uses_lod_profile_flag(
+    capture_records: list[dict],
+    lod_records: list[dict],
+    geometry_records: list[dict] | None = None,
+    lod_replay_links: list[dict] | None = None,
+    shadow_plan: dict | None = None,
+    lod_shadow_plans: list[dict] | None = None,
+) -> bool:
     main_keys = {_override_key(record) for record in capture_records or []}
     lod_keys = {_override_key(record) for record in lod_records or []}
-    return any(_is_valid_override_key(key) and key in lod_keys for key in main_keys)
+    if any(_is_valid_override_key(key) and key in lod_keys for key in main_keys):
+        return True
+
+    if not lod_records:
+        return False
+    geometry_payloads = list(geometry_records or [])
+    geometry_by_key = _geometry_records_by_key(geometry_payloads)
+    geometry_by_suffix = _geometry_records_by_suffix(geometry_payloads)
+    lod_geometry_by_key = _lod_geometry_records_by_key(
+        {"lod_replay_links": list(lod_replay_links or [])},
+        geometry_by_suffix,
+    )
+    capture_by_key: dict[tuple[str, int, int], dict[str, list[int]]] = {}
+    for record in capture_records or []:
+        capture_by_key.setdefault(_override_key(record), {"main": [], "lod": []})["main"].append(int(record.get("record_index", 0) or 0))
+    for record in lod_records or []:
+        capture_by_key.setdefault(_override_key(record), {"main": [], "lod": []})["lod"].append(int(record.get("record_index", 0) or 0))
+    main_role_keys = _main_texture_override_keys(capture_by_key, geometry_by_key, dict(shadow_plan or {}))
+    lod_role_keys = _lod_texture_override_keys(capture_by_key, lod_geometry_by_key, list(lod_shadow_plans or []))
+    return bool(main_role_keys.intersection(lod_role_keys))
 
 
 def _constants_sections(runtime_plan: dict) -> list[str]:
@@ -1560,16 +1683,13 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
     lod_geometry_by_key = _lod_geometry_records_by_key(runtime_plan, geometry_by_suffix)
 
     shadow_plan = dict(runtime_plan.get("shadow_replay_plan", {}) or {})
+    main_shadow_plans = [shadow_plan] if bool(shadow_plan.get("enabled", False)) else []
     lod_shadow_plans = _lod_shadow_plans(runtime_plan)
-    shadow_plans = [plan for plan in [shadow_plan, *lod_shadow_plans] if bool(plan.get("enabled", False))]
-    shadow_host_keys = [_shadow_plan_host_key(plan) for plan in shadow_plans]
-    shadow_skip_keys: set[tuple[str, int, int]] = set()
-    for plan in shadow_plans:
-        shadow_skip_keys.update(_shadow_plan_skip_keys(plan))
-    shadow_hosts_by_key: dict[tuple[str, int, int], list[dict]] = {}
-    for host_key, plan in zip(shadow_host_keys, shadow_plans):
-        if host_key is not None:
-            shadow_hosts_by_key.setdefault(host_key, []).append(plan)
+    enabled_lod_shadow_plans = [plan for plan in lod_shadow_plans if bool(plan.get("enabled", False))]
+    main_shadow_skip_keys = _shadow_skip_keys_for_plans(main_shadow_plans)
+    lod_shadow_skip_keys = _shadow_skip_keys_for_plans(enabled_lod_shadow_plans)
+    main_shadow_hosts_by_key = _shadow_hosts_by_key(main_shadow_plans)
+    lod_shadow_hosts_by_key = _shadow_hosts_by_key(enabled_lod_shadow_plans)
     lod_role_keys = _lod_texture_override_keys(capture_by_key, lod_geometry_by_key, lod_shadow_plans)
     main_role_keys = _main_texture_override_keys(capture_by_key, geometry_by_key, shadow_plan)
     lod_annotations_by_key = _lod_annotations_by_key(runtime_plan)
@@ -1577,7 +1697,8 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
     lod_profile_start_keys, lod_profile_end_keys = _lod_profile_marker_keys(runtime_plan) if use_lod_profile_flag else (set(), set())
 
     all_keys_set = set(capture_by_key).union(geometry_by_key).union(lod_geometry_by_key)
-    all_keys_set.update(shadow_hosts_by_key)
+    all_keys_set.update(main_shadow_hosts_by_key)
+    all_keys_set.update(lod_shadow_hosts_by_key)
     all_keys = sorted(all_keys_set)
     if not all_keys:
         return []
@@ -1625,11 +1746,15 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
         if has_capture_records:
             lines.extend(_capture_record_lines(grouped_records, indent="", use_lod_profile_flag=use_lod_profile_flag))
 
-        shadow_lines: list[str] = []
-        if key in shadow_skip_keys:
-            shadow_lines.append("  handling = skip")
-        for plan in shadow_hosts_by_key.get(key, []):
-            shadow_lines.extend(_shadow_host_replay_lines(plan, geometry_by_suffix, indent="  "))
+        shadow_lines = _profiled_shadow_lines(
+            key,
+            main_shadow_skip_keys=main_shadow_skip_keys,
+            lod_shadow_skip_keys=lod_shadow_skip_keys,
+            main_shadow_hosts_by_key=main_shadow_hosts_by_key,
+            lod_shadow_hosts_by_key=lod_shadow_hosts_by_key,
+            parts_by_suffix=geometry_by_suffix,
+            profile_guard=use_lod_profile_flag and key in main_role_keys and key in lod_role_keys,
+        )
         if use_lod_profile_flag and key in lod_profile_end_keys:
             shadow_lines.append("  $bmc_profile_lod = 0")
         if shadow_lines:
@@ -1682,6 +1807,103 @@ def _main_texture_override_keys(
         keys.add(host_key)
     keys.update(_shadow_plan_skip_keys(shadow_plan))
     return keys
+
+
+def _shadow_skip_keys_for_plans(shadow_plans: list[dict]) -> set[tuple[str, int, int]]:
+    keys: set[tuple[str, int, int]] = set()
+    for plan in shadow_plans or []:
+        keys.update(_shadow_plan_skip_keys(plan))
+    return keys
+
+
+def _shadow_hosts_by_key(shadow_plans: list[dict]) -> dict[tuple[str, int, int], list[dict]]:
+    hosts_by_key: dict[tuple[str, int, int], list[dict]] = {}
+    for plan in shadow_plans or []:
+        host_key = _shadow_plan_host_key(plan)
+        if host_key is not None:
+            hosts_by_key.setdefault(host_key, []).append(plan)
+    return hosts_by_key
+
+
+def _profiled_shadow_lines(
+    key: tuple[str, int, int],
+    *,
+    main_shadow_skip_keys: set[tuple[str, int, int]],
+    lod_shadow_skip_keys: set[tuple[str, int, int]],
+    main_shadow_hosts_by_key: dict[tuple[str, int, int], list[dict]],
+    lod_shadow_hosts_by_key: dict[tuple[str, int, int], list[dict]],
+    parts_by_suffix: dict[str, dict],
+    profile_guard: bool,
+) -> list[str]:
+    if not profile_guard:
+        return [
+            *_shadow_lines_for_profile(
+                key,
+                skip_keys=main_shadow_skip_keys,
+                hosts_by_key=main_shadow_hosts_by_key,
+                parts_by_suffix=parts_by_suffix,
+                indent="  ",
+            ),
+            *_shadow_lines_for_profile(
+                key,
+                skip_keys=lod_shadow_skip_keys,
+                hosts_by_key=lod_shadow_hosts_by_key,
+                parts_by_suffix=parts_by_suffix,
+                indent="  ",
+            ),
+        ]
+
+    main_lines = _shadow_lines_for_profile(
+        key,
+        skip_keys=main_shadow_skip_keys,
+        hosts_by_key=main_shadow_hosts_by_key,
+        parts_by_suffix=parts_by_suffix,
+        indent="    ",
+    )
+    lod_lines = _shadow_lines_for_profile(
+        key,
+        skip_keys=lod_shadow_skip_keys,
+        hosts_by_key=lod_shadow_hosts_by_key,
+        parts_by_suffix=parts_by_suffix,
+        indent="    ",
+    )
+    if main_lines and lod_lines:
+        return [
+            "  if $bmc_profile_lod == 1",
+            *lod_lines,
+            "  else",
+            *main_lines,
+            "  endif",
+        ]
+    if lod_lines:
+        return [
+            "  if $bmc_profile_lod == 1",
+            *lod_lines,
+            "  endif",
+        ]
+    if main_lines:
+        return [
+            "  if $bmc_profile_lod != 1",
+            *main_lines,
+            "  endif",
+        ]
+    return []
+
+
+def _shadow_lines_for_profile(
+    key: tuple[str, int, int],
+    *,
+    skip_keys: set[tuple[str, int, int]],
+    hosts_by_key: dict[tuple[str, int, int], list[dict]],
+    parts_by_suffix: dict[str, dict],
+    indent: str,
+) -> list[str]:
+    lines: list[str] = []
+    if key in skip_keys:
+        lines.append(f"{indent}handling = skip")
+    for plan in hosts_by_key.get(key, []) or []:
+        lines.extend(_shadow_host_replay_lines(plan, parts_by_suffix, indent=indent))
+    return lines
 
 
 def _texture_override_section_name(suffix: str, *, has_lod: bool, has_main: bool) -> str:

@@ -281,6 +281,8 @@ def regenerate_bonestore_runtime_files(
             "lod_key_annotations": list(runtime_plan.get("lod_key_annotations", []) or []),
             "lod_profile_chains": list(runtime_plan.get("lod_profile_chains", []) or []),
             "uses_lod_profile_flag": bool(runtime_plan.get("uses_lod_profile_flag", False)),
+            "main_required_global_bones": list(runtime_plan.get("main_required_global_bones", []) or []),
+            "lod_required_global_bones": list(runtime_plan.get("lod_required_global_bones", []) or []),
             "geometry": list(runtime_plan.get("geometry", []) or []),
             "textures": list(runtime_plan.get("textures", []) or []),
             "shader_filter_overrides": list(runtime_plan.get("shader_filter_overrides", []) or []),

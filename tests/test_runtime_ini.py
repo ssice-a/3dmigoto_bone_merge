@@ -137,6 +137,22 @@ class RuntimeIniTests(unittest.TestCase):
                     "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
                 }
             ],
+            "lod_links": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-same-key",
+                            "lod_ib_hash": "aaaaaaaa",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 10,
+                            "mapped_global_count": 1,
+                        }
+                    ],
+                }
+            ],
         }
         palette = LocalPaletteRecord(
             object_name="main",
@@ -170,6 +186,304 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("if vs == 200\n  $bmc_profile_lod = 0\nendif", ini_text)
         self.assertIn("[CommandList_BMC_FrameEndReset]\nrun = CustomShader_ResetRuntimeState\n$bmc_profile_lod = 0", ini_text)
         self.assertNotIn("x102", ini_text)
+
+    def test_same_override_key_branches_shadow_replay_by_lod_profile(self):
+        manifest = {
+            "shadow_stage": {
+                "shadow_vs_hashes": ["1111111111111111"],
+                "host_ib_hash": "bbbbbbbb",
+                "host_match_first_index": 0,
+                "host_match_index_count": 20,
+                "host_draw_index": 40,
+            },
+            "lod_manifest_snapshot": {"shadow_stage": {"shadow_vs_hashes": ["2222222222222222"]}},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 10,
+                    "ib_hash": "aaaaaaaa",
+                    "first_index": 0,
+                    "index_count": 10,
+                    "pass_role": "normal_shadow",
+                },
+                {
+                    "draw_index": 40,
+                    "ib_hash": "bbbbbbbb",
+                    "first_index": 0,
+                    "index_count": 20,
+                    "pass_role": "normal_shadow",
+                },
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-same-key",
+                    "lod_ib_hash": "aaaaaaaa",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 10,
+                    "lod_capture_draw_indices": [50],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                }
+            ],
+            "lod_links": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-same-key",
+                            "lod_ib_hash": "aaaaaaaa",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 10,
+                            "mapped_global_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="main",
+            ib_hash="aaaaaaaa",
+            match_index_count=10,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="aaaaaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_10_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("aaaaaaaa", 10, 0, 6, object_names=["same_key_mesh"])],
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertTrue(runtime["uses_lod_profile_flag"])
+        section = ini_text[
+            ini_text.index("[TextureOverride_BMC_aaaaaaaa_10_0_MAIN_LOD]") :
+            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_0]")
+        ]
+        self.assertIn("if vs == 200\n  if $bmc_profile_lod == 1\n    handling = skip", section)
+        self.assertIn("    ps-t0 = ResourceBMCWhiteShadow", section)
+        self.assertIn("    ; delayed normal shadow replay", section)
+        self.assertIn("  else\n    handling = skip\n  endif", section)
+
+    def test_lod_profile_reset_uses_raw_chain_host_even_when_host_record_is_filtered(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 10,
+                    "ib_hash": "aaaaaaaa",
+                    "first_index": 0,
+                    "index_count": 10,
+                    "pass_role": "normal_shadow",
+                }
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-source",
+                    "lod_ib_hash": "aaaaaaaa",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 10,
+                    "lod_capture_draw_indices": [50],
+                    "lod_local_bone_count": 2,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                },
+                {
+                    "lod_record_key": "lod-host",
+                    "lod_ib_hash": "bbbbbbbb",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 20,
+                    "lod_capture_draw_indices": [60],
+                    "lod_local_bone_count": 2,
+                    "scatter_pairs": [{"lod_local_bone": 1, "canonical_global_bone": 1}],
+                },
+            ],
+            "lod_links": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-source",
+                            "lod_ib_hash": "aaaaaaaa",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 10,
+                            "mapped_global_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="main",
+            ib_hash="aaaaaaaa",
+            match_index_count=10,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="aaaaaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_10_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("aaaaaaaa", 10, 0, 6, object_names=["main_mesh"])],
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertTrue(runtime["uses_lod_profile_flag"])
+        self.assertEqual(
+            {"ib_hash": "bbbbbbbb", "match_first_index": 0, "match_index_count": 20},
+            runtime["lod_profile_chains"][0]["host_key"],
+        )
+        self.assertEqual(["aaaaaaaa"], [record["ib_hash"] for record in runtime["lod_capture_records"]])
+        host_section = ini_text[
+            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_0_LOD]") :
+            ini_text.index("[Present]")
+        ]
+        self.assertIn("  draw = from_caller", host_section)
+        self.assertIn("  $bmc_profile_lod = 0", host_section)
+
+    def test_lod_capture_records_only_exported_lod_replay_globals(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
+            "lod_manifest_snapshot": {"shadow_stage": {"shadow_vs_hashes": ["2222222222222222"]}},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "main_a",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                },
+                {
+                    "ib_hash": "main_b",
+                    "match_first_index": 0,
+                    "match_index_count": 20,
+                    "global_bone_base": 1,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                },
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-a",
+                    "lod_ib_hash": "lod_a",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 30,
+                    "lod_capture_draw_indices": [10],
+                    "lod_local_bone_count": 2,
+                    "scatter_pairs": [
+                        {"lod_local_bone": 0, "canonical_global_bone": 0},
+                        {"lod_local_bone": 1, "canonical_global_bone": 1},
+                    ],
+                }
+            ],
+            "lod_links": [
+                {
+                    "ib_hash": "main_a",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-a",
+                            "lod_ib_hash": "lod_a",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 30,
+                            "mapped_global_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+        palettes = [
+            LocalPaletteRecord(
+                object_name="a",
+                ib_hash="main_a",
+                match_index_count=10,
+                chunk_index=0,
+                local_bone_count=1,
+                palette_values=(0,),
+                file_name="main_a-10-0_part00-PartLocalToGlobalBoneMap.buf",
+                file_path="",
+                resource_suffix="main_a_10_0_part00",
+                match_first_index=0,
+            ),
+            LocalPaletteRecord(
+                object_name="b",
+                ib_hash="main_b",
+                match_index_count=20,
+                chunk_index=0,
+                local_bone_count=1,
+                palette_values=(1,),
+                file_name="main_b-20-0_part00-PartLocalToGlobalBoneMap.buf",
+                file_path="",
+                resource_suffix="main_b_20_0_part00",
+                match_first_index=0,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                palettes,
+                [
+                    _geometry_record("main_a", 10, 0, 3, object_names=["a"]),
+                    _geometry_record("main_b", 20, 0, 3, object_names=["b"]),
+                ],
+            )
+            lod_capture_bone_map = _read_uints(runtime["buffers"]["lod_capture_bone_map"]["file_path"])
+
+        self.assertEqual([0, 1], runtime["main_required_global_bones"])
+        self.assertEqual([0], runtime["lod_required_global_bones"])
+        self.assertEqual(
+            [[0], [1]],
+            [record["canonical_global_bones"] for record in runtime["capture_records"]],
+        )
+        self.assertEqual([[0]], [record["canonical_global_bones"] for record in runtime["lod_capture_records"]])
+        self.assertEqual(
+            (1, 8, 1, 1, 0, 1, 2, 1, 0, 0),
+            lod_capture_bone_map,
+        )
 
     def test_lod_replay_uses_lod_hash_but_main_export_geometry(self):
         manifest = {
@@ -598,6 +912,169 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("; replay aaaaaaaa_10_0_part00", host_section)
         self.assertIn("  handling = skip", exported_lod_section)
         self.assertNotIn("; delayed normal shadow replay", exported_lod_section)
+
+    def test_lod_shadow_replay_links_remain_chain_scoped_for_repeated_lod_key(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "mainaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                },
+                {
+                    "ib_hash": "mainbbbb",
+                    "match_first_index": 0,
+                    "match_index_count": 20,
+                    "global_bone_base": 1,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                },
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 1,
+                    "ib_hash": "mainaaaa",
+                    "first_index": 0,
+                    "index_count": 10,
+                    "pass_role": "normal_shadow",
+                },
+                {
+                    "draw_index": 2,
+                    "ib_hash": "mainbbbb",
+                    "first_index": 0,
+                    "index_count": 20,
+                    "pass_role": "normal_shadow",
+                },
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-a",
+                    "lod_ib_hash": "lodsame1",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 30,
+                    "lod_capture_draw_indices": [10],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                },
+                {
+                    "lod_record_key": "lod-host-a",
+                    "lod_ib_hash": "hostaaaa",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 40,
+                    "lod_capture_draw_indices": [11],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                },
+                {
+                    "lod_record_key": "lod-b",
+                    "lod_ib_hash": "lodsame1",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 30,
+                    "lod_capture_draw_indices": [40],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 1}],
+                },
+                {
+                    "lod_record_key": "lod-host-b",
+                    "lod_ib_hash": "hostbbbb",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 50,
+                    "lod_capture_draw_indices": [41],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 1}],
+                },
+            ],
+            "lod_links": [
+                {
+                    "source_key": "main-a",
+                    "ib_hash": "mainaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "lod_chain_index": 0,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-a",
+                            "lod_ib_hash": "lodsame1",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 30,
+                            "mapped_global_count": 1,
+                            "lod_chain_index": 0,
+                        }
+                    ],
+                },
+                {
+                    "source_key": "main-b",
+                    "ib_hash": "mainbbbb",
+                    "match_first_index": 0,
+                    "match_index_count": 20,
+                    "lod_chain_index": 1,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-b",
+                            "lod_ib_hash": "lodsame1",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 30,
+                            "mapped_global_count": 1,
+                            "lod_chain_index": 1,
+                        }
+                    ],
+                },
+            ],
+        }
+        palettes = [
+            LocalPaletteRecord(
+                object_name="a",
+                ib_hash="mainaaaa",
+                match_index_count=10,
+                chunk_index=0,
+                local_bone_count=1,
+                palette_values=(0,),
+                file_name="mainaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+                file_path="",
+                resource_suffix="mainaaaa_10_0_part00",
+                match_first_index=0,
+            ),
+            LocalPaletteRecord(
+                object_name="b",
+                ib_hash="mainbbbb",
+                match_index_count=20,
+                chunk_index=0,
+                local_bone_count=1,
+                palette_values=(1,),
+                file_name="mainbbbb-20-0_part00-PartLocalToGlobalBoneMap.buf",
+                file_path="",
+                resource_suffix="mainbbbb_20_0_part00",
+                match_first_index=0,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                palettes,
+                [
+                    _geometry_record("mainaaaa", 10, 0, 3, object_names=["a"]),
+                    _geometry_record("mainbbbb", 20, 0, 3, object_names=["b"]),
+                ],
+            )
+
+        enabled_plans = [plan for plan in runtime["lod_shadow_replay_plans"] if plan.get("enabled")]
+        self.assertEqual(2, len(enabled_plans))
+        self.assertEqual(
+            ["hostaaaa", "hostbbbb"],
+            [plan["host_key"]["ib_hash"] for plan in enabled_plans],
+        )
+        self.assertEqual(
+            [["mainaaaa_10_0_part00"], ["mainbbbb_20_0_part00"]],
+            [plan["normal_parts"] for plan in enabled_plans],
+        )
 
     def test_generated_ini_uses_single_lifecycle_commandlist_only(self):
         manifest = {

@@ -114,7 +114,12 @@ def analyze_lod_for_manifest(
     global_candidates = _mapping_global_candidates(mapping)
     lod_chains = _build_lod_record_chains(lod_records)
     links = _build_lod_links(main_records, lod_records, global_candidates, lod_chains=lod_chains)
-    capture_records = _build_lod_capture_records(lod_records, mapping["global_to_lod"])
+    capture_records = _build_lod_capture_records(
+        lod_records,
+        mapping["global_to_lod"],
+        lod_links=links,
+        global_candidates=global_candidates,
+    )
     review = review_lod_global_pool_coverage(canonical_manifest, capture_records)
     variant_id = _build_lod_variant_id(normalized_lod_dir, capture_records)
     generated_at = datetime.now(timezone.utc).isoformat()
@@ -1243,28 +1248,104 @@ def _pair_rank(stats: dict) -> tuple[float, int, float]:
     return float(stats["score"]), int(stats["votes"]), -float(stats["distance_sum"]) / max(1, int(stats["votes"]))
 
 
-def _build_lod_capture_records(lod_records: dict[str, dict], global_to_lod: dict[int, dict]) -> list[dict]:
-    pairs_by_lod: dict[str, list[dict]] = {}
+def _build_lod_capture_records(
+    lod_records: dict[str, dict],
+    global_to_lod: dict[int, dict],
+    *,
+    lod_links: list[dict] | None = None,
+    global_candidates: dict[int, list[dict]] | None = None,
+) -> list[dict]:
+    pairs_by_lod: dict[str, dict[tuple[int, int], dict]] = {}
+
+    def add_pair(lod_key: str, lod_local_bone: int, canonical_global: int, mapping: dict | None = None) -> None:
+        lod_key = str(lod_key or "")
+        lod_local_bone = int(lod_local_bone)
+        canonical_global = int(canonical_global)
+        if not lod_key or lod_local_bone < 0 or canonical_global < 0:
+            return
+        pair = {
+            "lod_local_bone": lod_local_bone,
+            "canonical_global_bone": canonical_global,
+            "score": float(dict(mapping or {}).get("score", 0.0)),
+            "votes": int(dict(mapping or {}).get("votes", 0)),
+        }
+        bucket = pairs_by_lod.setdefault(lod_key, {})
+        pair_key = (lod_local_bone, canonical_global)
+        current = bucket.get(pair_key)
+        if current is None or _mapping_entry_rank(pair) > _mapping_entry_rank(current):
+            bucket[pair_key] = pair
+
     for canonical_global, mapping in sorted(global_to_lod.items()):
         lod_key = str(mapping.get("lod_record_key", "") or "")
         if not lod_key:
             continue
-        pairs_by_lod.setdefault(lod_key, []).append(
-            {
-                "lod_local_bone": int(mapping.get("lod_local_bone", -1)),
-                "canonical_global_bone": int(canonical_global),
-                "score": float(mapping.get("score", 0.0)),
-                "votes": int(mapping.get("votes", 0)),
-            }
-        )
+        add_pair(lod_key, int(mapping.get("lod_local_bone", -1)), int(canonical_global), mapping)
+
+    candidates = global_candidates or {}
+    for link in lod_links or []:
+        required_globals = _link_required_globals(link)
+        if not required_globals:
+            continue
+        for source in link.get("lod_sources", []) or []:
+            lod_key = str(dict(source or {}).get("lod_record_key", "") or "")
+            if not lod_key:
+                continue
+            for canonical_global in required_globals:
+                mapping = _best_candidate_by_lod(_iter_mapping_candidates(candidates.get(int(canonical_global)))).get(lod_key)
+                if mapping is not None:
+                    add_pair(lod_key, int(mapping.get("lod_local_bone", -1)), int(canonical_global), mapping)
+                    continue
+                local_bone = _same_identity_lod_local_bone(link, lod_records.get(lod_key), int(canonical_global))
+                if local_bone >= 0:
+                    add_pair(
+                        lod_key,
+                        local_bone,
+                        int(canonical_global),
+                        {"score": float(source.get("score", 0.0) or 0.0), "votes": int(source.get("votes", 0) or 0)},
+                    )
 
     records = []
-    for lod_key, pairs in sorted(pairs_by_lod.items(), key=lambda item: (-len(item[1]), item[0])):
+    for lod_key, pair_map in sorted(pairs_by_lod.items(), key=lambda item: (-len(item[1]), item[0])):
         lod_record = lod_records.get(lod_key)
         if not lod_record:
             continue
+        pairs = list(pair_map.values())
         records.append({**lod_record, "scatter_pairs": sorted(pairs, key=lambda item: (item["lod_local_bone"], item["canonical_global_bone"]))})
     return records
+
+
+def _link_required_globals(link: dict) -> list[int]:
+    base = int(link.get("global_bone_base", 0) or 0)
+    count = int(link.get("local_bone_count", 0) or 0)
+    if count <= 0:
+        return []
+    return list(range(base, base + count))
+
+
+def _same_identity_lod_local_bone(link: dict, lod_record: dict | None, canonical_global: int) -> int:
+    if not lod_record:
+        return -1
+    if str(link.get("ib_hash", "") or "").lower() != str(lod_record.get("lod_ib_hash", "") or "").lower():
+        return -1
+    if int(link.get("match_first_index", 0) or 0) != int(lod_record.get("lod_match_first_index", 0) or 0):
+        return -1
+    if int(link.get("match_index_count", 0) or 0) != int(lod_record.get("lod_match_index_count", 0) or 0):
+        return -1
+    base = int(link.get("global_bone_base", 0) or 0)
+    compact_index = int(canonical_global) - base
+    if compact_index < 0:
+        return -1
+    used_indices = [int(value) for value in link.get("used_local_bone_indices", []) or []]
+    if used_indices:
+        if compact_index >= len(used_indices):
+            return -1
+        local_bone = int(used_indices[compact_index])
+    else:
+        local_bone = compact_index
+    lod_local_count = int(lod_record.get("lod_source_local_bone_count", lod_record.get("lod_local_bone_count", 0)) or 0)
+    if lod_local_count > 0 and local_bone >= lod_local_count:
+        return -1
+    return local_bone
 
 
 def _mapping_global_candidates(mapping: dict) -> dict[int, list[dict]]:

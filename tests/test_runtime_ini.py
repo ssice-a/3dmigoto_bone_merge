@@ -111,7 +111,7 @@ class RuntimeIniTests(unittest.TestCase):
             self.assertIn("ResourceLodCaptureBoneMap", ini_text)
             self.assertIn("hash = bbbbbbbbbbbbbbbb", ini_text)
 
-    def test_same_override_key_branches_capture_map_by_lod_profile(self):
+    def test_same_override_key_records_all_capture_maps(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
             "lod_manifest_snapshot": {"shadow_stage": {"shadow_vs_hashes": ["2222222222222222"]}},
@@ -176,18 +176,13 @@ class RuntimeIniTests(unittest.TestCase):
             )
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
-        self.assertTrue(runtime["uses_lod_profile_flag"])
-        self.assertIn("[Constants]\nglobal $bmc_profile_lod = 0", ini_text)
-        self.assertIn("if vs == 200\n  $bmc_profile_lod = 1\nendif", ini_text)
-        self.assertIn("if $bmc_profile_lod == 1", ini_text)
-        self.assertIn("  cs-t2 = ResourceLodCaptureBoneMap", ini_text)
-        self.assertIn("else\n  run = CustomShader_ExtractCB1", ini_text)
-        self.assertIn("  cs-t2 = ResourceMainCaptureBoneMap", ini_text)
-        self.assertIn("if vs == 200\n  $bmc_profile_lod = 0\nendif", ini_text)
-        self.assertIn("[CommandList_BMC_FrameEndReset]\nrun = CustomShader_ResetRuntimeState\n$bmc_profile_lod = 0", ini_text)
+        self.assertFalse(runtime["uses_lod_profile_flag"])
+        self.assertNotIn("$bmc_profile_lod", ini_text)
+        self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", ini_text)
+        self.assertIn("cs-t2 = ResourceMainCaptureBoneMap", ini_text)
         self.assertNotIn("x102", ini_text)
 
-    def test_same_override_key_branches_shadow_replay_by_lod_profile(self):
+    def test_same_override_key_emits_all_shadow_replay_without_lod_profile(self):
         manifest = {
             "shadow_stage": {
                 "shadow_vs_hashes": ["1111111111111111"],
@@ -274,17 +269,17 @@ class RuntimeIniTests(unittest.TestCase):
             )
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
-        self.assertTrue(runtime["uses_lod_profile_flag"])
+        self.assertFalse(runtime["uses_lod_profile_flag"])
         section = ini_text[
             ini_text.index("[TextureOverride_BMC_aaaaaaaa_10_0_MAIN_LOD]") :
             ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_0]")
         ]
-        self.assertIn("if vs == 200\n  if $bmc_profile_lod == 1\n    handling = skip", section)
-        self.assertIn("    ps-t0 = ResourceBMCWhiteShadow", section)
-        self.assertIn("    ; delayed normal shadow replay", section)
-        self.assertIn("  else\n    handling = skip\n  endif", section)
+        self.assertNotIn("$bmc_profile_lod", section)
+        self.assertIn("if vs == 200\n  handling = skip", section)
+        self.assertIn("  ps-t0 = ResourceBMCWhiteShadow", section)
+        self.assertIn("  ; delayed normal shadow replay", section)
 
-    def test_lod_profile_reset_uses_raw_chain_host_even_when_host_record_is_filtered(self):
+    def test_lod_shadow_host_uses_raw_chain_host_even_when_host_record_is_filtered(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
             "bone_pool_order": [
@@ -366,7 +361,7 @@ class RuntimeIniTests(unittest.TestCase):
             )
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
-        self.assertTrue(runtime["uses_lod_profile_flag"])
+        self.assertFalse(runtime["uses_lod_profile_flag"])
         self.assertEqual(
             {"ib_hash": "bbbbbbbb", "match_first_index": 0, "match_index_count": 20},
             runtime["lod_profile_chains"][0]["host_key"],
@@ -377,7 +372,144 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text.index("[Present]")
         ]
         self.assertIn("  draw = from_caller", host_section)
-        self.assertIn("  $bmc_profile_lod = 0", host_section)
+        self.assertNotIn("$bmc_profile_lod", host_section)
+
+    def test_main_only_capture_in_raw_lod_chain_records_without_profile_guard(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
+            "lod_manifest_snapshot": {
+                "shadow_stage": {"shadow_vs_hashes": ["2222222222222222"]},
+                "candidate_ibs": [
+                    {
+                        "ib_hash": "cccccccc",
+                        "match_first_index": 0,
+                        "match_index_count": 30,
+                        "shadow_draw_indices": [50],
+                        "shadow_capture_ready": True,
+                    },
+                    {
+                        "ib_hash": "eeeeeeee",
+                        "match_first_index": 0,
+                        "match_index_count": 40,
+                        "shadow_draw_indices": [52],
+                        "shadow_capture_ready": True,
+                    },
+                    {
+                        "ib_hash": "bbbbbbbb",
+                        "match_first_index": 0,
+                        "match_index_count": 20,
+                        "shadow_draw_indices": [55],
+                        "shadow_capture_ready": True,
+                    },
+                    {
+                        "ib_hash": "dddddddd",
+                        "match_first_index": 0,
+                        "match_index_count": 99,
+                        "shadow_draw_indices": [60],
+                        "shadow_capture_ready": True,
+                    },
+                ],
+            },
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                },
+                {
+                    "ib_hash": "bbbbbbbb",
+                    "match_first_index": 0,
+                    "match_index_count": 20,
+                    "global_bone_base": 1,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                },
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 10,
+                    "ib_hash": "aaaaaaaa",
+                    "first_index": 0,
+                    "index_count": 10,
+                    "pass_role": "normal_shadow",
+                }
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-body-a",
+                    "lod_ib_hash": "cccccccc",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 30,
+                    "lod_capture_draw_indices": [50],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                },
+                {
+                    "lod_record_key": "lod-body-b",
+                    "lod_ib_hash": "eeeeeeee",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 40,
+                    "lod_capture_draw_indices": [52],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 1}],
+                },
+            ],
+            "lod_links": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-body-a",
+                            "lod_ib_hash": "cccccccc",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 30,
+                            "mapped_global_count": 1,
+                            "lod_chain_index": 0,
+                        }
+                    ],
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="main",
+            ib_hash="aaaaaaaa",
+            match_index_count=10,
+            chunk_index=0,
+            local_bone_count=2,
+            palette_values=(0, 1),
+            file_name="aaaaaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_10_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("aaaaaaaa", 10, 0, 6, object_names=["main_mesh"])],
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertFalse(runtime["uses_lod_profile_flag"])
+        self.assertEqual([], runtime["lod_profile_capture_guard_keys"])
+        main_only_section = ini_text[
+            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_0]") :
+            ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]")
+        ]
+        self.assertNotIn("$bmc_profile_lod", main_only_section)
+        self.assertIn("cs-t2 = ResourceMainCaptureBoneMap", main_only_section)
+        self.assertNotIn("ResourceLodCaptureBoneMap", main_only_section)
+        self.assertNotIn("$bmc_profile_lod", ini_text)
+        self.assertIn("if vs == 200\n  draw = from_caller", ini_text)
 
     def test_lod_capture_records_only_exported_lod_replay_globals(self):
         manifest = {

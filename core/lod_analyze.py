@@ -1310,19 +1310,21 @@ def _build_lod_capture_records(
             "votes": int(dict(mapping or {}).get("votes", 0)),
         }
         bucket = pairs_by_lod.setdefault(lod_key, {})
-        pair_key = (lod_local_bone, canonical_global)
+        pair_key = canonical_global
         current = bucket.get(pair_key)
         if current is None or _mapping_entry_rank(pair) > _mapping_entry_rank(current):
             bucket[pair_key] = pair
 
-    for canonical_global, mapping in sorted(global_to_lod.items()):
-        lod_key = str(mapping.get("lod_record_key", "") or "")
-        if not lod_key:
-            continue
-        add_pair(lod_key, int(mapping.get("lod_local_bone", -1)), int(canonical_global), mapping)
+    links = list(lod_links or [])
+    if not links:
+        for canonical_global, mapping in sorted(global_to_lod.items()):
+            lod_key = str(mapping.get("lod_record_key", "") or "")
+            if not lod_key:
+                continue
+            add_pair(lod_key, int(mapping.get("lod_local_bone", -1)), int(canonical_global), mapping)
 
     candidates = global_candidates or {}
-    for link in lod_links or []:
+    for link in links:
         required_globals = _link_required_globals(link)
         if not required_globals:
             continue
@@ -1331,11 +1333,7 @@ def _build_lod_capture_records(
             if not lod_key:
                 continue
             for canonical_global in required_globals:
-                mapping = _best_candidate_by_lod(_iter_mapping_candidates(candidates.get(int(canonical_global)))).get(lod_key)
-                if mapping is not None:
-                    add_pair(lod_key, int(mapping.get("lod_local_bone", -1)), int(canonical_global), mapping)
-                    continue
-                local_bone = _same_identity_lod_local_bone(link, lod_records.get(lod_key), int(canonical_global))
+                local_bone = _linked_lod_local_bone(link, lod_records.get(lod_key), dict(source or {}), int(canonical_global))
                 if local_bone >= 0:
                     add_pair(
                         lod_key,
@@ -1343,6 +1341,11 @@ def _build_lod_capture_records(
                         int(canonical_global),
                         {"score": float(source.get("score", 0.0) or 0.0), "votes": int(source.get("votes", 0) or 0)},
                     )
+                    continue
+                mapping = _best_candidate_by_lod(_iter_mapping_candidates(candidates.get(int(canonical_global)))).get(lod_key)
+                if mapping is not None:
+                    add_pair(lod_key, int(mapping.get("lod_local_bone", -1)), int(canonical_global), mapping)
+                    continue
 
     records = []
     for lod_key, pair_map in sorted(pairs_by_lod.items(), key=lambda item: (-len(item[1]), item[0])):
@@ -1360,6 +1363,48 @@ def _link_required_globals(link: dict) -> list[int]:
     if count <= 0:
         return []
     return list(range(base, base + count))
+
+
+def _linked_lod_local_bone(link: dict, lod_record: dict | None, source: dict, canonical_global: int) -> int:
+    if not lod_record:
+        return -1
+    if str(source.get("relation_method", "") or "") == "vb2_slot_signature":
+        local_bone = _slot_signature_lod_local_bone(link, lod_record, canonical_global)
+        if local_bone >= 0:
+            return local_bone
+    return _same_identity_lod_local_bone(link, lod_record, canonical_global)
+
+
+def _slot_signature_lod_local_bone(link: dict, lod_record: dict | None, canonical_global: int) -> int:
+    if not lod_record:
+        return -1
+    base = int(link.get("global_bone_base", 0) or 0)
+    compact_index = int(canonical_global) - base
+    if compact_index < 0:
+        return -1
+    main_count = int(link.get("local_bone_count", 0) or 0)
+    if main_count > 0 and compact_index >= main_count:
+        return -1
+    lod_slots = _ordered_lod_signature_slots(lod_record)
+    if compact_index < len(lod_slots):
+        return int(lod_slots[compact_index])
+    lod_local_count = int(lod_record.get("lod_source_local_bone_count", lod_record.get("lod_local_bone_count", 0)) or 0)
+    if 0 <= compact_index < lod_local_count:
+        return compact_index
+    return -1
+
+
+def _ordered_lod_signature_slots(lod_record: dict) -> list[int]:
+    for key in ("lod_used_local_bone_indices", "used_local_bone_indices"):
+        values = [int(value) for value in lod_record.get(key, []) or [] if int(value) >= 0]
+        if values:
+            return values
+    signature = dict(lod_record.get("vb2_signature", {}) or {})
+    values = [int(value) for value in signature.get("used_slots", []) or [] if int(value) >= 0]
+    if values:
+        return values
+    count = int(lod_record.get("lod_local_bone_count", lod_record.get("local_bone_count", 0)) or 0)
+    return list(range(max(0, count)))
 
 
 def _same_identity_lod_local_bone(link: dict, lod_record: dict | None, canonical_global: int) -> int:

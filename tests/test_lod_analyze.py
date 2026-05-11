@@ -102,6 +102,74 @@ class LodAnalyzeTests(unittest.TestCase):
             [(4, 10), (4, 11)],
         )
 
+    def test_lod_capture_records_use_vb2_slot_order_before_point_cloud_candidates(self):
+        lod_records = {
+            "lod_hair-3-0": {
+                "lod_record_key": "lod_hair-3-0",
+                "lod_ib_hash": "lod_hair",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 3,
+                "lod_local_bone_count": 3,
+                "lod_used_local_bone_indices": [0, 1, 2],
+                "vb2_signature": {"slot_count": 3, "used_slots": [0, 1, 2]},
+            },
+        }
+        noisy_candidates = {
+            234: [{"lod_record_key": "lod_hair-3-0", "lod_local_bone": 1, "score": 999.0, "votes": 99}],
+            235: [{"lod_record_key": "lod_hair-3-0", "lod_local_bone": 2, "score": 999.0, "votes": 99}],
+            236: [{"lod_record_key": "lod_hair-3-0", "lod_local_bone": 0, "score": 999.0, "votes": 99}],
+        }
+        lod_links = [
+            {
+                "source_key": "main_hair-3-0",
+                "ib_hash": "main_hair",
+                "match_first_index": 0,
+                "match_index_count": 3,
+                "global_bone_base": 234,
+                "local_bone_count": 3,
+                "used_local_bone_indices": [0, 1, 2],
+                "lod_sources": [
+                    {
+                        "lod_record_key": "lod_hair-3-0",
+                        "relation_method": "vb2_slot_signature",
+                        "score": 100.0,
+                        "votes": 3,
+                    }
+                ],
+            },
+            {
+                "source_key": "main_hair-3-0",
+                "ib_hash": "main_hair",
+                "match_first_index": 0,
+                "match_index_count": 3,
+                "global_bone_base": 234,
+                "local_bone_count": 3,
+                "used_local_bone_indices": [0, 1, 2],
+                "lod_sources": [
+                    {
+                        "lod_record_key": "lod_hair-3-0",
+                        "relation_method": "vb2_slot_signature",
+                        "score": 100.0,
+                        "votes": 3,
+                    }
+                ],
+            },
+        ]
+
+        records = lod_analyze._build_lod_capture_records(
+            lod_records,
+            {},
+            lod_links=lod_links,
+            global_candidates=noisy_candidates,
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["lod_record_key"], "lod_hair-3-0")
+        self.assertEqual(
+            [(pair["lod_local_bone"], pair["canonical_global_bone"]) for pair in records[0]["scatter_pairs"]],
+            [(0, 234), (1, 235), (2, 236)],
+        )
+
     def test_lod_links_drop_sparse_noise_sources(self):
         main_records = [
             {

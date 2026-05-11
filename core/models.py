@@ -18,6 +18,7 @@ class LocalPaletteRecord:
     resource_suffix: str
     variant_id: str = ""
     match_first_index: int = 0
+    object_usages: tuple[dict, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

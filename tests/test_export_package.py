@@ -101,6 +101,11 @@ class FakePolygon:
         self.normal = (0.0, 0.0, 1.0)
 
 
+class FakeLoopTriangle:
+    def __init__(self, loop_indices):
+        self.loops = tuple(loop_indices)
+
+
 class FakeMeshData:
     def __init__(self, positions, triangles, group_count: int):
         self.vertices = FakeDataList(
@@ -109,6 +114,7 @@ class FakeMeshData:
         )
         self.loops = FakeDataList()
         self.polygons = []
+        self.loop_triangles = FakeDataList()
         self.attributes = {}
         self.uv_layers = {}
         for triangle in triangles:
@@ -117,6 +123,7 @@ class FakeMeshData:
                 loop_indices.append(len(self.loops))
                 self.loops.append(FakeLoop(vertex_index))
             self.polygons.append(FakePolygon(loop_indices))
+            self.loop_triangles.append(FakeLoopTriangle(loop_indices))
 
 
 class FakeAttributeValue:

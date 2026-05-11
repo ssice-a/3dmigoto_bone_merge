@@ -320,6 +320,7 @@ def _normalize_palette_records(output_directory: str, local_palette_records: lis
                 "resource_suffix": suffix,
                 "variant_id": str(record.variant_id or ""),
                 "filename": _resource_filename(file_path, output_directory),
+                "object_usages": [dict(item) for item in getattr(record, "object_usages", ())],
             }
         )
     return normalized_records
@@ -1280,7 +1281,8 @@ def _lod_replay_geometry_suffixes(lod_replay_links: list[dict]) -> set[str]:
 
 
 def _validate_palette_globals(capture_manifest: dict, palette_records: list[dict]) -> None:
-    unavailable = _capture_unavailable_global_bones(capture_manifest)
+    unavailable_by_global = _capture_unavailable_global_bone_records(capture_manifest)
+    unavailable = set(unavailable_by_global)
     if not unavailable:
         return
 
@@ -1289,9 +1291,17 @@ def _validate_palette_globals(capture_manifest: dict, palette_records: list[dict
         used = sorted(unavailable.intersection(int(value) for value in palette_record.get("palette_values", []) or []))
         if not used:
             continue
+        object_details = _palette_unavailable_object_details(palette_record, used)
+        source_details = _capture_unavailable_source_details(unavailable_by_global, used)
+        detail = ""
+        if object_details:
+            detail += "; object usage: " + "; ".join(object_details[:4])
+        if source_details:
+            detail += "; unavailable source: " + "; ".join(source_details[:4])
         errors.append(
             f"{palette_record.get('resource_suffix')}: uses capture-unavailable global bone(s) "
             + ", ".join(str(value) for value in used[:12])
+            + detail
         )
     if errors:
         raise ValueError(
@@ -1310,6 +1320,52 @@ def _capture_unavailable_global_bones(capture_manifest: dict) -> set[int]:
         count = int(pool_record.get("local_bone_count", 0) or 0)
         unavailable.update(range(base, base + max(0, count)))
     return unavailable
+
+
+def _capture_unavailable_global_bone_records(capture_manifest: dict) -> dict[int, dict]:
+    records: dict[int, dict] = {}
+    for pool_record in capture_manifest.get("bone_pool_order", []) or []:
+        if bool(pool_record.get("bone_capture_available", pool_record.get("shadow_capture_ready", False))):
+            continue
+        base = int(pool_record.get("global_bone_base", 0) or 0)
+        count = int(pool_record.get("local_bone_count", 0) or 0)
+        for global_bone in range(base, base + max(0, count)):
+            records[int(global_bone)] = dict(pool_record)
+    return records
+
+
+def _palette_unavailable_object_details(palette_record: dict, used: list[int]) -> list[str]:
+    used_set = {int(value) for value in used}
+    details: list[str] = []
+    for usage in palette_record.get("object_usages", []) or []:
+        usage_record = dict(usage or {})
+        object_name = str(usage_record.get("object", usage_record.get("name", "")) or "")
+        groups = sorted(used_set.intersection(int(value) for value in usage_record.get("used_global_groups", []) or []))
+        if not groups:
+            continue
+        label = object_name or "<unknown object>"
+        details.append(f"{label} -> " + ",".join(str(value) for value in groups[:12]))
+    return details
+
+
+def _capture_unavailable_source_details(unavailable_by_global: dict[int, dict], used: list[int]) -> list[str]:
+    by_source: dict[tuple[str, int, int], list[int]] = {}
+    for global_bone in used:
+        record = unavailable_by_global.get(int(global_bone), {})
+        key = (
+            str(record.get("ib_hash", "") or "").lower(),
+            int(record.get("match_first_index", 0) or 0),
+            int(record.get("match_index_count", 0) or 0),
+        )
+        by_source.setdefault(key, []).append(int(global_bone))
+    details: list[str] = []
+    for (ib_hash, match_first_index, match_index_count), globals_ in sorted(by_source.items()):
+        if ib_hash:
+            source = f"{ib_hash}-{match_index_count}-{match_first_index}"
+        else:
+            source = "<unknown source>"
+        details.append(f"{source} -> " + ",".join(str(value) for value in sorted(globals_)[:12]))
+    return details
 
 
 def _constants_sections(runtime_plan: dict) -> list[str]:

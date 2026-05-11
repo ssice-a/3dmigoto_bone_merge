@@ -338,4 +338,5 @@ def _local_palette_record_from_export_record(record: dict) -> LocalPaletteRecord
         resource_suffix=str(record.get("resource_suffix", "")),
         variant_id=str(record.get("variant_id", "")),
         match_first_index=int(record.get("match_first_index", 0) or 0),
+        object_usages=tuple(dict(item or {}) for item in record.get("object_usages", []) or []),
     )

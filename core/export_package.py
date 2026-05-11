@@ -162,8 +162,9 @@ def build_export_plan(
     for source in part_sources:
         used_part_indices_by_region.setdefault(source.region.key, set()).add(source.part_index)
 
+    cached_collect_used_groups = _cached_group_collector(collect_used_groups)
     for source in part_sources:
-        object_usages = _build_object_usages(source, collect_used_groups)
+        object_usages = _build_object_usages(source, cached_collect_used_groups)
         source_palette = _union_usage_groups(object_usages)
         if len(source_palette) <= max_bones_per_part:
             planned_parts.append(_part_plan_from_source(source, object_usages, source.part_index))
@@ -198,6 +199,20 @@ def build_export_plan(
     return ExportPlan(root_collection_name=root_name, parts=sorted_parts, warnings=tuple(warnings))
 
 
+def _cached_group_collector(collect_used_groups: Callable[[object], Iterable[int]]) -> Callable[[object], tuple[int, ...]]:
+    used_groups_by_object: dict[int, tuple[int, ...]] = {}
+
+    def collect(mesh_obj) -> tuple[int, ...]:
+        key = id(mesh_obj)
+        cached = used_groups_by_object.get(key)
+        if cached is None:
+            cached = tuple(sorted({int(value) for value in collect_used_groups(mesh_obj) if int(value) >= 0}))
+            used_groups_by_object[key] = cached
+        return cached
+
+    return collect
+
+
 def write_part_palette_files(buffer_dir: str, plan: ExportPlan) -> list[dict]:
     """Write all part palette files and return manifest-ready palette records."""
 
@@ -227,6 +242,13 @@ def part_palette_manifest_record(part: ExportPartPlan, file_path: str = "") -> d
         "resource_suffix": part.resource_suffix,
         "generated": bool(part.generated),
         "split_reason": part.split_reason,
+        "object_usages": [
+            {
+                "object": usage.name,
+                "used_global_groups": list(usage.used_global_groups),
+            }
+            for usage in part.object_usages
+        ],
     }
 
 

@@ -359,12 +359,12 @@ def create_blender_object_from_geometry(
         _store_int_attribute(
             mesh,
             f"bmc_blend_index_{channel_index}",
-            [record[channel_index] for record in geometry.blend_indices],
+            _component_column(geometry.blend_indices, channel_index, dtype="int32"),
         )
         _store_float_attribute(
             mesh,
             f"bmc_blend_weight_{channel_index}",
-            [record[channel_index] for record in geometry.blend_weights],
+            _component_column(geometry.blend_weights, channel_index, dtype="float32"),
         )
     timings["attributes"] = time.perf_counter() - stage_start
 
@@ -1426,11 +1426,15 @@ def _store_texcoord_semantic_attributes(mesh, records: list[dict]) -> None:
 
 
 def _component_values(values, component_index: int):
+    return _component_column(values, component_index, dtype="float32")
+
+
+def _component_column(values, component_index: int, *, dtype):
     np = require_numpy()
-    array = np.asarray(values)
+    array = np.asarray(values, dtype=np.dtype(dtype))
     if array.ndim < 2 or int(component_index) >= int(array.shape[1]):
-        return np.zeros((len(values),), dtype=np.float32)
-    return array[:, int(component_index)]
+        return np.zeros((len(values),), dtype=np.dtype(dtype))
+    return array[:, int(component_index)].astype(np.dtype(dtype), copy=False)
 
 
 def _store_snorm_byte_color_attribute(mesh, name: str, values: list[tuple[int, ...]]) -> None:

@@ -378,16 +378,38 @@ def _normalize_vertex_layout(layout: dict) -> dict[str, dict]:
 
 
 def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartCache) -> tuple[list[_LoopVertex], list[int], list[_ObjectDrawRange]]:
+    np = require_numpy()
     loop_vertices: list[_LoopVertex] = []
     indices: list[int] = []
     object_draws: list[_ObjectDrawRange] = []
-    next_index = 0
+    range_arrays: list[tuple] = []
+    can_cache_range_arrays = True
     for mesh_obj in part.mesh_objects:
         object_start_index = len(indices)
         object_start_vertex = len(loop_vertices)
         mesh = export_cache.object_mesh_cache(mesh_obj).mesh
         if mesh is None:
             continue
+        fast_collected = _collect_mesh_loop_vertices_fast(mesh_obj, mesh, object_start_vertex)
+        if fast_collected is not None:
+            mesh_loop_vertices, mesh_indices, vertex_indices, loop_indices = fast_collected
+            loop_vertices.extend(mesh_loop_vertices)
+            indices.extend(mesh_indices)
+            object_end_vertex = len(loop_vertices)
+            range_arrays.append((object_start_vertex, object_end_vertex, vertex_indices, loop_indices))
+            object_index_count = len(indices) - object_start_index
+            if object_index_count > 0:
+                object_draws.append(
+                    _ObjectDrawRange(
+                        object_name=str(getattr(mesh_obj, "name", "") or ""),
+                        start_index=object_start_index,
+                        index_count=object_index_count,
+                        start_vertex=object_start_vertex,
+                        vertex_count=len(loop_vertices) - object_start_vertex,
+                    )
+                )
+            continue
+        can_cache_range_arrays = False
         for polygon in getattr(mesh, "polygons", []) or []:
             loop_indices = [int(value) for value in getattr(polygon, "loop_indices", []) or []]
             if len(loop_indices) < 3:
@@ -395,6 +417,7 @@ def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartC
             polygon_loop_vertices: list[int] = []
             for loop_index in loop_indices:
                 loop = getattr(mesh, "loops", [])[loop_index]
+                output_index = len(loop_vertices)
                 loop_vertices.append(
                     _LoopVertex(
                         mesh_obj=mesh_obj,
@@ -404,8 +427,7 @@ def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartC
                         polygon=polygon,
                     )
                 )
-                polygon_loop_vertices.append(next_index)
-                next_index += 1
+                polygon_loop_vertices.append(output_index)
             for index in range(1, len(polygon_loop_vertices) - 1):
                 triangle = (
                     polygon_loop_vertices[0],
@@ -422,9 +444,68 @@ def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartC
                     index_count=object_index_count,
                     start_vertex=object_start_vertex,
                     vertex_count=len(loop_vertices) - object_start_vertex,
+                    )
                 )
+    if can_cache_range_arrays and loop_vertices:
+        export_cache.loop_vertex_range_arrays[(id(loop_vertices), len(loop_vertices))] = tuple(
+            (
+                int(start),
+                int(end),
+                np.asarray(vertex_indices, dtype=np.intp),
+                np.asarray(loop_indices, dtype=np.intp),
             )
+            for start, end, vertex_indices, loop_indices in range_arrays
+        )
     return loop_vertices, indices, object_draws
+
+
+def _collect_mesh_loop_vertices_fast(mesh_obj, mesh, object_start_vertex: int) -> tuple[list[_LoopVertex], list[int], object, object] | None:
+    np = require_numpy()
+    loops = getattr(mesh, "loops", []) or []
+    loop_count = len(loops)
+    if loop_count <= 0:
+        return None
+
+    loop_triangles = getattr(mesh, "loop_triangles", None)
+    if loop_triangles is None or len(loop_triangles) <= 0:
+        calc_loop_triangles = getattr(mesh, "calc_loop_triangles", None)
+        if callable(calc_loop_triangles):
+            try:
+                calc_loop_triangles()
+            except Exception:
+                return None
+            loop_triangles = getattr(mesh, "loop_triangles", None)
+    if loop_triangles is None or len(loop_triangles) <= 0:
+        return None
+
+    try:
+        vertex_indices = foreach_get_array(loops, "vertex_index", dtype=np.int64)
+        triangle_loops = foreach_get_array(loop_triangles, "loops", dtype=np.int64, shape=(3,))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if vertex_indices.size < loop_count or triangle_loops.size == 0:
+        return None
+    if int(np.max(triangle_loops)) >= loop_count or int(np.min(triangle_loops)) < 0:
+        return None
+
+    loop_vertices = [
+        _LoopVertex(
+            mesh_obj=mesh_obj,
+            mesh=mesh,
+            vertex_index=int(vertex_indices[loop_index]),
+            loop_index=int(loop_index),
+            polygon=None,
+        )
+        for loop_index in range(loop_count)
+    ]
+    loop_indices = np.arange(loop_count, dtype=np.intp)
+    reversed_triangles = triangle_loops[:, [0, 2, 1]] + int(object_start_vertex)
+    return (
+        loop_vertices,
+        reversed_triangles.reshape(-1).astype(np.int64, copy=False).tolist(),
+        vertex_indices.astype(np.intp, copy=False),
+        loop_indices,
+    )
 
 
 def _prepare_vertex_slot(

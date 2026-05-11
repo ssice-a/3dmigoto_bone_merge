@@ -71,10 +71,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     uint4 bone_window = DumpedCB1[native_cb1_bone_row];
     uint src_current_base = bone_window.x;
     uint src_previous_base = bone_window.y;
-    uint source_count = bone_window.z;
     uint capture_valid = 0;
 
-    if (pair_count != 0 && source_count != 0 && !IsZero4(bone_window))
+    if (pair_count != 0 && !IsZero4(bone_window))
     {
         uint max_source_local_bone = 0;
         uint first_source_local_bone = 0;
@@ -99,7 +98,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         uint required_current_row = src_current_base + BMC_BONE_RESERVED_ROWS + max_source_local_bone * BMC_BONE_ROWS + (BMC_BONE_ROWS - 1);
         uint required_previous_row = src_previous_base + BMC_BONE_RESERVED_ROWS + max_source_local_bone * BMC_BONE_ROWS + (BMC_BONE_ROWS - 1);
 
-        if (max_source_local_bone < source_count && required_current_row < native_rows && required_previous_row < native_rows)
+        if (required_current_row < native_rows && required_previous_row < native_rows)
         {
             uint first_current_row = src_current_base + BMC_BONE_RESERVED_ROWS + first_source_local_bone * BMC_BONE_ROWS;
             uint4 row0 = NativeT0[first_current_row + 0];

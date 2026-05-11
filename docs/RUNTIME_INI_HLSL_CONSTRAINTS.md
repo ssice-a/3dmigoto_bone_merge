@@ -479,9 +479,12 @@ Inline       = default TextureOverride control flow
 ```
 
 Capture does not need to be guarded by `if vs == 200`. The compute shader must
-validate the extracted `cb1[5]` bone window and `vs-t0` bounds before it writes
-anything. Draw suppression and replay are still guarded separately, because
-capturing an IB does not by itself mean the original draw should be skipped.
+validate the extracted `cb1[5].x/.y` bone-window bases against the actual
+`vs-t0` bounds before it writes anything. Do not treat `cb1[5].z` as a reliable
+source bone count: in observed shadow draws it can be a small flag/count value
+while `BLENDINDICES` still reference high local bone indices. Draw suppression
+and replay are still guarded separately, because capturing an IB does not by
+itself mean the original draw should be skipped.
 
 ## Capture Record Selector
 
@@ -592,6 +595,10 @@ native_previous_base = cb1[instance_cb_base + 5].y
 current  row = native_current_base  + 3 + source_local_bone * 3 + row
 previous row = native_previous_base + 3 + source_local_bone * 3 + row
 ```
+
+Only `.x/.y` are used as `vs-t0` base addresses for capture. The capture
+shader checks the computed current/previous rows against the bound `vs-t0`
+dimensions; it does not reject a record because `source_local_bone >= cb1[...].z`.
 
 For the observed capture stage, each shadow draw is single-instance, so the
 native instance slot read by capture is normally slot 0. The destination

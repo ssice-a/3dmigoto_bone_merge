@@ -688,28 +688,28 @@ def _build_lod_shadow_replay_plans(
     lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
     stage = _normalize_shadow_stage(lod_snapshot)
     raw_lod_records = _raw_lod_shadow_records(capture_manifest, lod_capture_records)
-    chains = _lod_shadow_capture_chains(raw_lod_records, stage)
-    if not geometry_records or not lod_replay_links or not chains:
+    if not geometry_records or not lod_replay_links:
         return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
 
-    plans: list[dict] = []
-    for chain in chains:
-        plan = _build_lod_shadow_replay_plan_for_chain(
+    chains = _lod_shadow_capture_chains(raw_lod_records, stage)
+    if not chains:
+        return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
+
+    plans = [
+        _build_lod_shadow_replay_plan_for_chain(
             capture_manifest,
             geometry_records,
             lod_replay_links,
             lod_capture_records,
             chain,
+            stage,
         )
-        if bool(plan.get("enabled", False)) or plan.get("reason") in {"lod_shadow_coverage_incomplete", "no_lod_exported_shadow_parts"}:
-            plans.append(plan)
+        for chain in chains
+    ]
     enabled_plans = [plan for plan in plans if bool(plan.get("enabled", False))]
     if enabled_plans:
-        return _merge_lod_shadow_plans_by_host(enabled_plans)
-    if plans:
-        return plans
-    else:
-        return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
+        return [*_merge_lod_shadow_plans_by_host(enabled_plans), *[plan for plan in plans if not bool(plan.get("enabled", False))]]
+    return plans
 
 
 def _build_lod_profile_chains(capture_manifest: dict, lod_capture_records: list[dict]) -> list[dict]:
@@ -723,6 +723,7 @@ def _build_lod_shadow_replay_plan_for_chain(
     lod_replay_links: list[dict],
     lod_capture_records: list[dict],
     chain: dict,
+    stage: dict,
 ) -> dict:
     host_key = _key_from_payload(dict(chain.get("host_key", {}) or {}))
     host_draw_index = _int_default(chain.get("host_draw_index"), -1)
@@ -736,10 +737,9 @@ def _build_lod_shadow_replay_plan_for_chain(
     }
     available_globals, coverage_records = _lod_shadow_available_globals_for_chain(
         lod_capture_records,
-        chain_keys=chain_keys,
         host_draw_index=host_draw_index,
-        chain_draw_start=_int_default(chain.get("draw_start"), -1),
-        chain_draw_end=_int_default(chain.get("draw_end"), -1),
+        stage_draw_start=_int_default(stage.get("stage_draw_start"), -1),
+        stage_draw_end=_int_default(stage.get("stage_draw_end"), -1),
     )
 
     roles_by_main_key = _shadow_roles_by_key(capture_manifest)
@@ -981,10 +981,9 @@ def _merge_lod_shadow_plans_by_host(plans: list[dict]) -> list[dict]:
 def _lod_shadow_available_globals_for_chain(
     lod_capture_records: list[dict],
     *,
-    chain_keys: set[tuple[str, int, int]],
     host_draw_index: int,
-    chain_draw_start: int,
-    chain_draw_end: int,
+    stage_draw_start: int,
+    stage_draw_end: int,
 ) -> tuple[set[int], list[dict]]:
     if int(host_draw_index) < 0:
         return set(), []
@@ -994,14 +993,12 @@ def _lod_shadow_available_globals_for_chain(
 
     for record in lod_capture_records or []:
         key = _override_key(record)
-        if chain_keys and key not in chain_keys:
-            continue
         draw_indices = [
             int(value)
             for value in record.get("capture_draw_indices", []) or []
             if int(value) >= 0
             and int(value) <= int(host_draw_index)
-            and _draw_index_in_optional_stage_window(int(value), int(chain_draw_start), int(chain_draw_end))
+            and _draw_index_in_optional_stage_window(int(value), int(stage_draw_start), int(stage_draw_end))
         ]
         if not draw_indices:
             continue
@@ -1798,38 +1795,74 @@ def _profiled_shadow_lines(
     lod_shadow_hosts_by_key: dict[tuple[str, int, int], list[dict]],
     parts_by_suffix: dict[str, dict],
 ) -> list[str]:
-    return [
-        *_shadow_lines_for_profile(
-            key,
-            skip_keys=main_shadow_skip_keys,
-            hosts_by_key=main_shadow_hosts_by_key,
-            parts_by_suffix=parts_by_suffix,
-            indent="  ",
-        ),
-        *_shadow_lines_for_profile(
-            key,
-            skip_keys=lod_shadow_skip_keys,
-            hosts_by_key=lod_shadow_hosts_by_key,
-            parts_by_suffix=parts_by_suffix,
-            indent="  ",
-        ),
+    skip_keys = set(main_shadow_skip_keys).union(lod_shadow_skip_keys)
+    host_plans = [
+        *list(main_shadow_hosts_by_key.get(key, []) or []),
+        *list(lod_shadow_hosts_by_key.get(key, []) or []),
     ]
+    return _shadow_lines_for_profile(
+        key,
+        skip_keys=skip_keys,
+        host_plans=_merge_shadow_host_plans_for_output(host_plans, force_preserve_host_draw=key not in skip_keys),
+        parts_by_suffix=parts_by_suffix,
+        indent="  ",
+    )
 
 
 def _shadow_lines_for_profile(
     key: tuple[str, int, int],
     *,
     skip_keys: set[tuple[str, int, int]],
-    hosts_by_key: dict[tuple[str, int, int], list[dict]],
+    host_plans: list[dict],
     parts_by_suffix: dict[str, dict],
     indent: str,
 ) -> list[str]:
     lines: list[str] = []
     if key in skip_keys:
         lines.append(f"{indent}handling = skip")
-    for plan in hosts_by_key.get(key, []) or []:
+    for plan in host_plans or []:
         lines.extend(_shadow_host_replay_lines(plan, parts_by_suffix, indent=indent))
     return lines
+
+
+def _merge_shadow_host_plans_for_output(plans: list[dict], *, force_preserve_host_draw: bool) -> list[dict]:
+    merged_by_key: dict[tuple[str, int, int], dict] = {}
+    order: list[tuple[str, int, int]] = []
+    for plan in plans or []:
+        if not bool(plan.get("enabled", False)):
+            continue
+        host_key = _shadow_plan_host_key(plan)
+        if host_key is None:
+            continue
+        if host_key not in merged_by_key:
+            merged = dict(plan)
+            merged["transparent_parts"] = list(plan.get("transparent_parts", []) or [])
+            merged["normal_parts"] = list(plan.get("normal_parts", []) or [])
+            merged["skip_keys"] = list(plan.get("skip_keys", []) or [])
+            merged["preserve_host_draw"] = bool(force_preserve_host_draw)
+            merged_by_key[host_key] = merged
+            order.append(host_key)
+            continue
+        bucket = merged_by_key[host_key]
+        for field in ("transparent_parts", "normal_parts"):
+            for suffix in plan.get(field, []) or []:
+                if suffix not in bucket[field]:
+                    bucket[field].append(suffix)
+        existing_skip = {
+            _key_from_payload(dict(payload or {}))
+            for payload in bucket.get("skip_keys", []) or []
+            if _is_valid_override_key(_key_from_payload(dict(payload or {})))
+        }
+        for payload in plan.get("skip_keys", []) or []:
+            skip_key = _key_from_payload(dict(payload or {}))
+            if _is_valid_override_key(skip_key) and skip_key not in existing_skip:
+                bucket.setdefault("skip_keys", []).append(dict(payload))
+                existing_skip.add(skip_key)
+        bucket["preserve_host_draw"] = bool(force_preserve_host_draw)
+        if int(plan.get("host_draw_index", -1) or -1) > int(bucket.get("host_draw_index", -1) or -1):
+            bucket["host_draw_index"] = int(plan.get("host_draw_index", -1) or -1)
+            bucket["host_source"] = str(plan.get("host_source", bucket.get("host_source", "")) or "")
+    return [merged_by_key[key] for key in order]
 
 
 def _texture_override_section_name(suffix: str, *, has_lod: bool, has_main: bool) -> str:

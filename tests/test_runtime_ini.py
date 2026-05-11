@@ -111,6 +111,66 @@ class RuntimeIniTests(unittest.TestCase):
             self.assertIn("ResourceLodCaptureBoneMap", ini_text)
             self.assertIn("hash = bbbbbbbbbbbbbbbb", ini_text)
 
+    def test_same_override_key_branches_capture_map_by_lod_profile(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
+            "lod_manifest_snapshot": {"shadow_stage": {"shadow_vs_hashes": ["2222222222222222"]}},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-same-key",
+                    "lod_ib_hash": "aaaaaaaa",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 10,
+                    "lod_capture_draw_indices": [20, 21],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="main",
+            ib_hash="aaaaaaaa",
+            match_index_count=10,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="aaaaaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_10_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("aaaaaaaa", 10, 0, 6, object_names=["main_mesh"])],
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertTrue(runtime["uses_lod_profile_flag"])
+        self.assertIn("[Constants]\nglobal $bmc_profile_lod = 0", ini_text)
+        self.assertIn("if vs == 200\n  $bmc_profile_lod = 1\nendif", ini_text)
+        self.assertIn("if $bmc_profile_lod == 1", ini_text)
+        self.assertIn("  cs-t2 = ResourceLodCaptureBoneMap", ini_text)
+        self.assertIn("else\n  run = CustomShader_ExtractCB1", ini_text)
+        self.assertIn("  cs-t2 = ResourceMainCaptureBoneMap", ini_text)
+        self.assertIn("if vs == 200\n  $bmc_profile_lod = 0\nendif", ini_text)
+        self.assertIn("[CommandList_BMC_FrameEndReset]\nrun = CustomShader_ResetRuntimeState\n$bmc_profile_lod = 0", ini_text)
+        self.assertNotIn("x102", ini_text)
+
     def test_lod_replay_uses_lod_hash_but_main_export_geometry(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},

@@ -509,6 +509,20 @@ use record N from the currently bound capture map
 The alternative, one capture-map buffer per IB, was rejected because it creates
 too many resources and makes the INI noisier.
 
+When the same override key can be executed in both main and LOD capture
+profiles, the INI may emit a `$bmc_profile_lod` global:
+
+```ini
+[Constants]
+global $bmc_profile_lod = 0
+```
+
+The recognized LOD chain start sets this flag under `if vs == 200`, the shared
+record block branches between `ResourceLodCaptureBoneMap` and
+`ResourceMainCaptureBoneMap`, and the LOD chain host plus frame lifecycle reset
+the flag to `0`. This flag only selects the capture map; replay still uses the
+part's `PartLocalToGlobalBoneMap`.
+
 `x102` is reserved for future capture sequence flags. It must not be emitted or
 read while the generator cannot prove the multi-instance capture sequence:
 

@@ -68,6 +68,7 @@ def materialize_bonestore_runtime(
     lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
     lod_key_annotations = _build_lod_key_annotations(capture_manifest, geometry_payloads)
     shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
+    lod_profile_chains = _build_lod_profile_chains(lod_records)
     lod_shadow_replay_plans = _build_lod_shadow_replay_plans(capture_manifest, geometry_payloads, lod_replay_links, lod_records)
     lod_shadow_replay_plan = _primary_lod_shadow_replay_plan(lod_shadow_replay_plans)
     if _shadow_plan_needs_white_texture(shadow_replay_plan) or any(
@@ -113,6 +114,8 @@ def materialize_bonestore_runtime(
         "lod_capture_records": lod_records,
         "lod_replay_links": lod_replay_links,
         "lod_key_annotations": lod_key_annotations,
+        "lod_profile_chains": lod_profile_chains,
+        "uses_lod_profile_flag": _uses_lod_profile_flag(capture_records, lod_records),
         "palettes": palette_records,
         "geometry": geometry_payloads,
         "textures": texture_records,
@@ -148,6 +151,9 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
             "",
         ]
     )
+    lines.extend(_constants_sections(runtime_plan))
+    if lines and lines[-1] != "":
+        lines.append("")
     lines.extend(_shader_override_sections(runtime_plan))
     if lines and lines[-1] != "":
         lines.append("")
@@ -171,7 +177,7 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
         lines.extend(_texture_hash_override_sections(runtime_plan))
     if lines and lines[-1] != "":
         lines.append("")
-    lines.extend(_frame_lifecycle_sections())
+    lines.extend(_frame_lifecycle_sections(runtime_plan))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -697,6 +703,11 @@ def _build_lod_shadow_replay_plans(
         return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
 
 
+def _build_lod_profile_chains(lod_capture_records: list[dict]) -> list[dict]:
+    raw_lod_records = _raw_lod_shadow_records({}, lod_capture_records)
+    return _lod_shadow_capture_chains(raw_lod_records, {})
+
+
 def _build_lod_shadow_replay_plan_for_chain(
     capture_manifest: dict,
     geometry_records: list[dict],
@@ -877,12 +888,15 @@ def _lod_shadow_capture_chains(raw_records: list[dict], stage: dict) -> list[dic
     chains: list[dict] = []
     for chain_index, segment in enumerate(segments):
         key_values = {key for _draw, key in segment}
+        start_draw, start_key = min(segment, key=lambda item: (int(item[0]), item[1][0], int(item[1][1]), int(item[1][2])))
         host_draw, host_key = max(segment, key=lambda item: (int(item[0]), item[1][0], int(item[1][1]), int(item[1][2])))
         chains.append(
             {
                 "chain_index": int(chain_index),
                 "draw_start": int(min(draw for draw, _key in segment)),
                 "draw_end": int(max(draw for draw, _key in segment)),
+                "start_draw_index": int(start_draw),
+                "start_key": _key_payload(start_key),
                 "host_draw_index": int(host_draw),
                 "host_key": _key_payload(host_key),
                 "keys": [_key_payload(key) for key in sorted(key_values)],
@@ -1192,6 +1206,21 @@ def _capture_unavailable_global_bones(capture_manifest: dict) -> set[int]:
         count = int(pool_record.get("local_bone_count", 0) or 0)
         unavailable.update(range(base, base + max(0, count)))
     return unavailable
+
+
+def _uses_lod_profile_flag(capture_records: list[dict], lod_records: list[dict]) -> bool:
+    main_keys = {_override_key(record) for record in capture_records or []}
+    lod_keys = {_override_key(record) for record in lod_records or []}
+    return any(_is_valid_override_key(key) and key in lod_keys for key in main_keys)
+
+
+def _constants_sections(runtime_plan: dict) -> list[str]:
+    if not bool(runtime_plan.get("uses_lod_profile_flag", False)):
+        return []
+    return [
+        "[Constants]",
+        "global $bmc_profile_lod = 0",
+    ]
 
 
 def _shader_override_sections(runtime_plan: dict) -> list[str]:
@@ -1544,6 +1573,8 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
     lod_role_keys = _lod_texture_override_keys(capture_by_key, lod_geometry_by_key, lod_shadow_plans)
     main_role_keys = _main_texture_override_keys(capture_by_key, geometry_by_key, shadow_plan)
     lod_annotations_by_key = _lod_annotations_by_key(runtime_plan)
+    use_lod_profile_flag = bool(runtime_plan.get("uses_lod_profile_flag", False))
+    lod_profile_start_keys, lod_profile_end_keys = _lod_profile_marker_keys(runtime_plan) if use_lod_profile_flag else (set(), set())
 
     all_keys_set = set(capture_by_key).union(geometry_by_key).union(lod_geometry_by_key)
     all_keys_set.update(shadow_hosts_by_key)
@@ -1583,14 +1614,24 @@ def _texture_override_sections(runtime_plan: dict) -> list[str]:
             ]
         )
         has_capture_records = bool(grouped_records.get("main") or grouped_records.get("lod"))
+        if use_lod_profile_flag and key in lod_profile_start_keys:
+            lines.extend(
+                [
+                    "if vs == 200",
+                    "  $bmc_profile_lod = 1",
+                    "endif",
+                ]
+            )
         if has_capture_records:
-            lines.extend(_capture_record_lines(grouped_records, indent=""))
+            lines.extend(_capture_record_lines(grouped_records, indent="", use_lod_profile_flag=use_lod_profile_flag))
 
         shadow_lines: list[str] = []
         if key in shadow_skip_keys:
             shadow_lines.append("  handling = skip")
         for plan in shadow_hosts_by_key.get(key, []):
             shadow_lines.extend(_shadow_host_replay_lines(plan, geometry_by_suffix, indent="  "))
+        if use_lod_profile_flag and key in lod_profile_end_keys:
+            shadow_lines.append("  $bmc_profile_lod = 0")
         if shadow_lines:
             lines.append("if vs == 200")
             lines.extend(shadow_lines)
@@ -1652,6 +1693,19 @@ def _texture_override_section_name(suffix: str, *, has_lod: bool, has_main: bool
     return f"[TextureOverride_BMC_{suffix}{role_suffix}]"
 
 
+def _lod_profile_marker_keys(runtime_plan: dict) -> tuple[set[tuple[str, int, int]], set[tuple[str, int, int]]]:
+    start_keys: set[tuple[str, int, int]] = set()
+    end_keys: set[tuple[str, int, int]] = set()
+    for chain in runtime_plan.get("lod_profile_chains", []) or []:
+        start_key = _key_from_payload(dict(chain.get("start_key", {}) or {}))
+        if _is_valid_override_key(start_key):
+            start_keys.add(start_key)
+        host_key = _key_from_payload(dict(chain.get("host_key", {}) or {}))
+        if _is_valid_override_key(host_key):
+            end_keys.add(host_key)
+    return start_keys, end_keys
+
+
 def _lod_annotations_by_key(runtime_plan: dict) -> dict[tuple[str, int, int], dict]:
     annotations: dict[tuple[str, int, int], dict] = {}
     for annotation in runtime_plan.get("lod_key_annotations", []) or []:
@@ -1691,27 +1745,33 @@ def _visible_replay_lines(geometry_records: list[dict], runtime_plan: dict) -> l
     return lines
 
 
-def _capture_record_lines(grouped_records: dict, *, indent: str) -> list[str]:
+def _capture_record_lines(grouped_records: dict, *, indent: str, use_lod_profile_flag: bool = False) -> list[str]:
     lines: list[str] = []
-    for record_index in grouped_records.get("main", []) or []:
-        lines.extend(
-            [
-                f"{indent}run = CustomShader_ExtractCB1",
-                f"{indent}x100 = {record_index}",
-                f"{indent}cs-t2 = ResourceMainCaptureBoneMap",
-                f"{indent}run = CustomShader_RecordBones",
-            ]
-        )
-    for record_index in grouped_records.get("lod", []) or []:
-        lines.extend(
-            [
-                f"{indent}run = CustomShader_ExtractCB1",
-                f"{indent}x100 = {record_index}",
-                f"{indent}cs-t2 = ResourceLodCaptureBoneMap",
-                f"{indent}run = CustomShader_RecordBones",
-            ]
-        )
+    main_records = list(grouped_records.get("main", []) or [])
+    lod_records = list(grouped_records.get("lod", []) or [])
+    if use_lod_profile_flag and main_records and lod_records:
+        lines.append(f"{indent}if $bmc_profile_lod == 1")
+        for record_index in lod_records:
+            lines.extend(_capture_record_command_lines(record_index, "ResourceLodCaptureBoneMap", indent=f"{indent}  "))
+        lines.append(f"{indent}else")
+        for record_index in main_records:
+            lines.extend(_capture_record_command_lines(record_index, "ResourceMainCaptureBoneMap", indent=f"{indent}  "))
+        lines.append(f"{indent}endif")
+        return lines
+    for record_index in main_records:
+        lines.extend(_capture_record_command_lines(record_index, "ResourceMainCaptureBoneMap", indent=indent))
+    for record_index in lod_records:
+        lines.extend(_capture_record_command_lines(record_index, "ResourceLodCaptureBoneMap", indent=indent))
     return lines
+
+
+def _capture_record_command_lines(record_index: int, capture_map_resource: str, *, indent: str) -> list[str]:
+    return [
+        f"{indent}run = CustomShader_ExtractCB1",
+        f"{indent}x100 = {int(record_index)}",
+        f"{indent}cs-t2 = {capture_map_resource}",
+        f"{indent}run = CustomShader_RecordBones",
+    ]
 
 
 def _visible_replay_condition(runtime_plan: dict) -> str:
@@ -1910,8 +1970,8 @@ def _write_white_shadow_texture(path: str) -> str:
     return path
 
 
-def _frame_lifecycle_sections() -> list[str]:
-    return [
+def _frame_lifecycle_sections(runtime_plan: dict) -> list[str]:
+    lines = [
         "; -------------------------------------------------",
         "; Frame lifecycle",
         "; -------------------------------------------------",
@@ -1921,6 +1981,9 @@ def _frame_lifecycle_sections() -> list[str]:
         "[CommandList_BMC_FrameEndReset]",
         "run = CustomShader_ResetRuntimeState",
     ]
+    if bool(runtime_plan.get("uses_lod_profile_flag", False)):
+        lines.append("$bmc_profile_lod = 0")
+    return lines
 
 
 def _buffer_resource(name: str, payload: dict) -> list[str]:

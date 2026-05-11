@@ -117,18 +117,37 @@ If an override key or host section can execute in multiple capture profiles,
 recording must branch on an explicit context flag, such as:
 
 ```ini
+[Constants]
+global $bmc_profile_lod = 0
+
+; At the first draw of a recognized LOD capture chain:
+if vs == 200
+  $bmc_profile_lod = 1
+endif
+
 if $bmc_profile_lod == 1
+  run = CustomShader_ExtractCB1
   x100 = LOD_RECORD
   cs-t2 = ResourceLodCaptureBoneMap
+  run = CustomShader_RecordBones
 else
+  run = CustomShader_ExtractCB1
   x100 = MAIN_RECORD
   cs-t2 = ResourceMainCaptureBoneMap
+  run = CustomShader_RecordBones
 endif
-run = CustomShader_RecordBones
+
+; At the final host of that same LOD capture chain:
+if vs == 200
+  $bmc_profile_lod = 0
+endif
 ```
 
 The flag chooses how to write bones into `GlobalBonePool`. It must not be used
 as the authority for which exported parts to replay.
+
+Emit this flag only when an override key can be reached by both main and LOD
+record profiles. Keys that exist in only one profile keep direct capture blocks.
 
 ## Terms
 
@@ -281,6 +300,10 @@ The selector must distinguish the capture profile by context, such as:
 
 The generated runtime plan must be able to express separate main and LOD capture
 records for the same IB hash when their layouts differ.
+
+For same-key profile conflicts, the profile flag is a chain context marker, not
+a new draw identity. The start key of the recognized LOD chain sets it, the
+final host key resets it, and frame end resets it defensively.
 
 ## Coverage Validation
 

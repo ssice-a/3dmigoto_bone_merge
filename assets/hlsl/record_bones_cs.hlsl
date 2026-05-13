@@ -2,18 +2,15 @@
 //
 // t0 = native game vs-t0
 // t1 = dumped shader-visible cb1
-// t2 = MainCaptureBoneMap or LodCaptureBoneMap
+// t2 = per-IB CaptureBoneMap
 // u1 = GlobalBonePool
 // u2 = RuntimeState
-//
-// x100 = capture record index
 
 #include "bone_store_common.hlsli"
 
 StructuredBuffer<uint4> NativeT0 : register(t0);
 StructuredBuffer<uint4> DumpedCB1 : register(t1);
 Buffer<uint> CaptureBoneMap : register(t2);
-Texture1D<float4> IniParams : register(t120);
 
 RWStructuredBuffer<uint4> GlobalBonePool_UAV : register(u1);
 RWStructuredBuffer<uint4> RuntimeState_UAV : register(u2);
@@ -38,19 +35,11 @@ void EnsureCaptureSlot()
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    uint record_index = BMC_INI_PARAM_UINT(IniParams, BMC_CAPTURE_RECORD_INIPARAM);
-
     if (tid.x == 0)
     {
         EnsureCaptureSlot();
     }
     GroupMemoryBarrierWithGroupSync();
-
-    uint record_count = CaptureBoneMap[0];
-    if (record_index >= record_count)
-    {
-        return;
-    }
 
     uint slot = RuntimeState_UAV[BMC_STATE_HEADER].y;
     if (slot == BMC_INVALID_SLOT || slot >= BMC_MAX_INSTANCE_SLOTS)
@@ -58,10 +47,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
-    uint pair_table_uint_base = CaptureBoneMap[1];
-    uint record_base = BMC_CAPTURE_MAP_HEADER_UINTS + record_index * BMC_CAPTURE_RECORD_STRIDE;
-    uint pair_base = CaptureBoneMap[record_base + 0];
-    uint pair_count = CaptureBoneMap[record_base + 1];
+    uint pair_count = CaptureBoneMap[0];
     uint rows_to_copy = pair_count * BMC_BONE_ROWS;
 
     uint native_slot = 0;
@@ -80,7 +66,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
         for (uint pair_index = 0; pair_index < pair_count; ++pair_index)
         {
-            uint pair_offset = pair_table_uint_base + (pair_base + pair_index) * BMC_CAPTURE_PAIR_STRIDE;
+            uint pair_offset = BMC_CAPTURE_MAP_HEADER_UINTS + pair_index * BMC_CAPTURE_PAIR_STRIDE;
             uint source_local_bone = CaptureBoneMap[pair_offset + 0];
 
             if (pair_index == 0)
@@ -118,7 +104,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         {
             uint pair_index = pair_row / BMC_BONE_ROWS;
             uint row_in_bone = pair_row % BMC_BONE_ROWS;
-            uint pair_offset = pair_table_uint_base + (pair_base + pair_index) * BMC_CAPTURE_PAIR_STRIDE;
+            uint pair_offset = BMC_CAPTURE_MAP_HEADER_UINTS + pair_index * BMC_CAPTURE_PAIR_STRIDE;
             uint source_local_bone = CaptureBoneMap[pair_offset + 0];
             uint target_global_bone = CaptureBoneMap[pair_offset + 1];
 

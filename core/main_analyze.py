@@ -35,6 +35,12 @@ _IA_IB_RE = re.compile(
     r"^(?P<draw>\d{6}) IASetIndexBuffer\(.* Format:(?P<format>\d+), Offset:(?P<offset>\d+)\) "
     r"hash=(?P<hash>[0-9a-fA-F]+)\s*$"
 )
+_VS_CB_SET_RE = re.compile(
+    r"^(?P<draw>\d{6}) VSSetConstantBuffers1\(StartSlot:(?P<start>\d+), NumBuffers:(?P<count>\d+),"
+)
+_CB_RESOURCE_RE = re.compile(
+    r"^\s+(?P<slot>\d+): resource=.* first_constant=(?P<first>-?\d+) num_constants=(?P<count>-?\d+)"
+)
 _DRAW_INDEXED_RE = re.compile(
     r"^(?P<draw>\d{6}) DrawIndexed(?:Instanced)?\("
     r"(?:IndexCountPerInstance|IndexCount):(?P<count>\d+)"
@@ -78,6 +84,7 @@ class DrawState:
     ia_index_format: int = -1
     ia_index_offset: int = -1
     ia_backing_hash: str = ""
+    vs_cb1_first_constant: int = 0
 
 
 @dataclass
@@ -857,11 +864,20 @@ def _parse_draw_states(log_path: str) -> dict[int, DrawState]:
     current_ia_index_format = -1
     current_ia_index_offset = -1
     current_ia_backing_hash = ""
+    current_vs_cb1_first_constant = 0
+    pending_vs_cb_set = False
     draw_states: dict[int, DrawState] = {}
 
     with open(log_path, "r", encoding="utf-8", errors="replace") as file_handle:
         for raw_line in file_handle:
             line = raw_line.rstrip("\n")
+            if pending_vs_cb_set:
+                match = _CB_RESOURCE_RE.match(line)
+                if match:
+                    if int(match.group("slot")) == 1:
+                        current_vs_cb1_first_constant = int(match.group("first"))
+                    continue
+                pending_vs_cb_set = False
             match = _VS_SET_RE.match(line)
             if match:
                 current_vs = match.group("hash").lower()
@@ -880,6 +896,10 @@ def _parse_draw_states(log_path: str) -> dict[int, DrawState]:
                 current_ia_index_offset = int(match.group("offset"))
                 current_ia_backing_hash = match.group("hash").lower()
                 continue
+            match = _VS_CB_SET_RE.match(line)
+            if match:
+                pending_vs_cb_set = True
+                continue
             match = _DRAW_INDEXED_RE.match(line)
             if not match:
                 continue
@@ -896,6 +916,7 @@ def _parse_draw_states(log_path: str) -> dict[int, DrawState]:
                 ia_index_format=current_ia_index_format,
                 ia_index_offset=current_ia_index_offset,
                 ia_backing_hash=current_ia_backing_hash,
+                vs_cb1_first_constant=current_vs_cb1_first_constant,
             )
     return draw_states
 
@@ -1204,7 +1225,10 @@ def _build_draw_hit_payload(
     ib_binary_path = _binary_data_path_for_slot(draw_files, "ib")
     cb1_file = _first_slot_file(draw_files, "vs-cb1", "txt")
     vs_t0_file = _first_slot_file(draw_files, "vs-t0", "buf")
-    cb1_xy = _parse_cb1_xy(cb1_file.path if cb1_file else "")
+    cb1_xy = _parse_cb1_xy(
+        cb1_file.path if cb1_file else "",
+        first_constant=int(draw_state.vs_cb1_first_constant if draw_state else 0),
+    )
     return {
         "draw_index": dump_file.draw_index,
         "ib_hash": dump_file.resource_hash,
@@ -1238,16 +1262,17 @@ def _first_slot_file(draw_files: list[DumpFile], slot: str, extension: str = "")
     return None
 
 
-def _parse_cb1_xy(path: str) -> list[float]:
+def _parse_cb1_xy(path: str, *, first_constant: int = 0) -> list[float]:
     if not path or not os.path.exists(path):
         return [0.0, 0.0]
     values: dict[str, float] = {}
+    target_row = int(first_constant) + 5
     with open(path, "r", encoding="utf-8", errors="replace") as file_handle:
         for raw_line in file_handle:
             match = _CB1_RE.match(raw_line.strip())
             if not match:
                 continue
-            if int(match.group("row")) != 5:
+            if int(match.group("row")) != target_row:
                 continue
             component = match.group("component")
             if component in {"x", "y"}:

@@ -16,11 +16,9 @@ static const uint BMC_GLOBAL_SLOT_ROW_STRIDE = 200000;
 static const uint BMC_LOCAL_PREVIOUS_ROW_OFFSET = 1024;
 static const uint BMC_LOCAL_SLOT_ROW_STRIDE = 2048;
 
-static const uint BMC_CAPTURE_RECORD_INIPARAM = 100;
 static const uint BMC_LOCAL_BONE_COUNT_INIPARAM = 101;
 
 static const uint BMC_CAPTURE_MAP_HEADER_UINTS = 4;
-static const uint BMC_CAPTURE_RECORD_STRIDE = 4;
 static const uint BMC_CAPTURE_PAIR_STRIDE = 2;
 
 static const uint BMC_STATE_HEADER = 0;

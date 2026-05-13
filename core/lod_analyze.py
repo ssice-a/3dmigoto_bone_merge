@@ -182,12 +182,12 @@ def _try_analyze_lod_by_signatures(
     *,
     lod_level: int,
 ) -> dict | None:
-    """Build an LOD result without full point clouds when slot signatures prove enough.
+    """Build an LOD result without full point clouds only for identical IBs.
 
-    This fast path is intentionally conservative. It only accepts exact,
-    unambiguous VB2 slot-count links and then validates that the generated LOD
-    capture records fill every required canonical global bone. Ambiguous or
-    incomplete cases fall back to the full bone-cloud matcher.
+    Slot signatures are still useful to find replay relationships, but they are
+    not allowed to invent LOD local-to-global capture maps. The only safe
+    no-cloud capture case is the exact same IB identity, which reuses the main
+    local/global order.
     """
 
     canonical_global_count, main_records = _build_canonical_record_summaries(canonical_manifest)
@@ -249,7 +249,7 @@ def _try_analyze_lod_by_signatures(
                 "skipped_main_hash_lod_candidate_count": int(skipped_main_hash_count),
                 "canonical_match_point_count": 0,
                 "lod_match_point_count": 0,
-                "match_method": "vb2_slot_signature_fast_path",
+                "match_method": "same_ib_identity_fast_path",
                 "shadow_stage": dict(lod_manifest.get("shadow_stage", {}) or {}),
                 "generated_at": generated_at,
             }
@@ -1592,7 +1592,7 @@ def _build_lod_capture_records(
             if not lod_key:
                 continue
             for canonical_global in required_globals:
-                local_bone = _linked_lod_local_bone(link, lod_records.get(lod_key), dict(source or {}), int(canonical_global))
+                local_bone = _same_identity_lod_local_bone(link, lod_records.get(lod_key), int(canonical_global))
                 if local_bone >= 0:
                     add_pair(
                         lod_key,
@@ -1622,48 +1622,6 @@ def _link_required_globals(link: dict) -> list[int]:
     if count <= 0:
         return []
     return list(range(base, base + count))
-
-
-def _linked_lod_local_bone(link: dict, lod_record: dict | None, source: dict, canonical_global: int) -> int:
-    if not lod_record:
-        return -1
-    if str(source.get("relation_method", "") or "") == "vb2_slot_signature":
-        local_bone = _slot_signature_lod_local_bone(link, lod_record, canonical_global)
-        if local_bone >= 0:
-            return local_bone
-    return _same_identity_lod_local_bone(link, lod_record, canonical_global)
-
-
-def _slot_signature_lod_local_bone(link: dict, lod_record: dict | None, canonical_global: int) -> int:
-    if not lod_record:
-        return -1
-    base = int(link.get("global_bone_base", 0) or 0)
-    compact_index = int(canonical_global) - base
-    if compact_index < 0:
-        return -1
-    main_count = int(link.get("local_bone_count", 0) or 0)
-    if main_count > 0 and compact_index >= main_count:
-        return -1
-    lod_slots = _ordered_lod_signature_slots(lod_record)
-    if compact_index < len(lod_slots):
-        return int(lod_slots[compact_index])
-    lod_local_count = int(lod_record.get("lod_source_local_bone_count", lod_record.get("lod_local_bone_count", 0)) or 0)
-    if 0 <= compact_index < lod_local_count:
-        return compact_index
-    return -1
-
-
-def _ordered_lod_signature_slots(lod_record: dict) -> list[int]:
-    for key in ("lod_used_local_bone_indices", "used_local_bone_indices"):
-        values = [int(value) for value in lod_record.get(key, []) or [] if int(value) >= 0]
-        if values:
-            return values
-    signature = dict(lod_record.get("vb2_signature", {}) or {})
-    values = [int(value) for value in signature.get("used_slots", []) or [] if int(value) >= 0]
-    if values:
-        return values
-    count = int(lod_record.get("lod_local_bone_count", lod_record.get("local_bone_count", 0)) or 0)
-    return list(range(max(0, count)))
 
 
 def _same_identity_lod_local_bone(link: dict, lod_record: dict | None, canonical_global: int) -> int:

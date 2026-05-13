@@ -480,7 +480,8 @@ class ExportPackageTests(unittest.TestCase):
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Index.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Position.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Blend.buf").exists())
-            self.assertTrue((buffer_dir / "MainCaptureBoneMap.buf").exists())
+            self.assertTrue((buffer_dir / "640d1c0e_46845_0_MAIN-CaptureBoneMap.buf").exists())
+            self.assertFalse((buffer_dir / "MainCaptureBoneMap.buf").exists())
             self.assertFalse((buffer_dir / "MainCaptureRecords.buf").exists())
             self.assertFalse((buffer_dir / "MainCaptureSourceLocalBones.buf").exists())
             self.assertFalse((buffer_dir / "LodCaptureBoneMap.buf").exists())
@@ -493,7 +494,7 @@ class ExportPackageTests(unittest.TestCase):
             self.assertIn("performance", result)
             self.assertNotIn("timings", export_manifest["geometry_buffers"][0])
             self.assertNotIn("stats", export_manifest["geometry_buffers"][0])
-            self.assertIn("main_capture_bone_map", export_manifest["runtime"]["buffers"])
+            self.assertIn("capture_bone_maps", export_manifest["runtime"]["buffers"])
             self.assertEqual(
                 struct.unpack("<3I", (buffer_dir / "640d1c0e-46845-0_part00-Index.buf").read_bytes()),
                 (0, 2, 1),

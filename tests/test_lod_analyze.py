@@ -102,7 +102,7 @@ class LodAnalyzeTests(unittest.TestCase):
             [(4, 10), (4, 11)],
         )
 
-    def test_lod_capture_records_use_vb2_slot_order_before_point_cloud_candidates(self):
+    def test_lod_capture_records_use_point_cloud_candidates_before_vb2_slot_order(self):
         lod_records = {
             "lod_hair-3-0": {
                 "lod_record_key": "lod_hair-3-0",
@@ -167,10 +167,10 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual(records[0]["lod_record_key"], "lod_hair-3-0")
         self.assertEqual(
             [(pair["lod_local_bone"], pair["canonical_global_bone"]) for pair in records[0]["scatter_pairs"]],
-            [(0, 234), (1, 235), (2, 236)],
+            [(0, 236), (1, 234), (2, 235)],
         )
 
-    def test_lod_signature_fast_path_skips_point_cloud_when_exact_and_unambiguous(self):
+    def test_lod_signature_fast_path_only_skips_point_cloud_for_same_ib(self):
         canonical_manifest = {
             "frameanalysis_dir": "C:/fake-main",
             "bone_pool_order": [
@@ -189,7 +189,7 @@ class LodAnalyzeTests(unittest.TestCase):
             "frameanalysis_dir": "C:/fake-lod",
             "candidate_ibs": [
                 {
-                    "ib_hash": "lod",
+                    "ib_hash": "main",
                     "match_first_index": 0,
                     "match_index_count": 3,
                     "shadow_capture_ready": True,
@@ -210,10 +210,20 @@ class LodAnalyzeTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["lod_frameanalysis"][0]["match_method"], "vb2_slot_signature_fast_path")
+        self.assertEqual(result["lod_frameanalysis"][0]["match_method"], "same_ib_identity_fast_path")
         self.assertEqual(
             [(pair["lod_local_bone"], pair["canonical_global_bone"]) for pair in result["lod_capture_records"][0]["scatter_pairs"]],
             [(0, 10), (1, 11), (2, 12)],
+        )
+
+        lod_manifest["candidate_ibs"][0]["ib_hash"] = "lod"
+        self.assertIsNone(
+            lod_analyze._try_analyze_lod_by_signatures(
+                canonical_manifest,
+                lod_manifest,
+                "C:/fake-lod",
+                lod_level=1,
+            )
         )
 
     def test_lod_links_drop_sparse_noise_sources(self):

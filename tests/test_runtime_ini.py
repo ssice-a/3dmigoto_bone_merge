@@ -46,10 +46,10 @@ class RuntimeIniTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette])
-            map_path = runtime["buffers"]["main_capture_bone_map"]["file_path"]
+            map_path = runtime["buffers"]["capture_bone_maps"][0]["file_path"]
 
             self.assertEqual(
-                (1, 8, 3, 0, 0, 3, 3, 0, 2, 10, 52, 11, 248, 12),
+                (3, 3, 0, 0, 2, 10, 52, 11, 248, 12),
                 _read_uints(map_path),
             )
 
@@ -58,9 +58,9 @@ class RuntimeIniTests(unittest.TestCase):
             self.assertNotIn("match_priority", ini_text)
             self.assertNotIn("x102", ini_text)
             self.assertNotIn("ResourceBoneMeta", ini_text)
-            self.assertIn("ResourceMainCaptureBoneMap", ini_text)
+            self.assertIn("ResourceCaptureBoneMap_12345678_42_0_MAIN", ini_text)
             self.assertNotIn("ResourceMainCaptureSourceLocalBones", ini_text)
-            self.assertIn("x100 = 0", ini_text)
+            self.assertNotIn("x100 =", ini_text)
             self.assertIn("ResourcePartLocalToGlobalBoneMap_12345678_42_0", ini_text)
             self.assertNotIn("CommandList_BuildLocalBoneBuffer", ini_text)
 
@@ -96,19 +96,24 @@ class RuntimeIniTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [])
+            lod_map_path = next(
+                payload["file_path"]
+                for payload in runtime["buffers"]["capture_bone_maps"]
+                if payload["resource_name"] == "ResourceCaptureBoneMap_87654321_77_5_LOD"
+            )
             self.assertEqual(
-                (1, 8, 2, 1, 0, 2, 1, 1, 0, 0, 0, 1),
-                _read_uints(runtime["buffers"]["lod_capture_bone_map"]["file_path"]),
+                (2, 1, 1, 0, 0, 0, 0, 1),
+                _read_uints(lod_map_path),
             )
 
             ini_text = ini_export.build_bonestore_ini_content(runtime)
             self.assertIn("hash = 87654321", ini_text)
             self.assertIn("[TextureOverride_BMC_87654321_77_5_LOD]", ini_text)
             self.assertNotIn("match_first_index = 5", ini_text)
-            self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", ini_text)
+            self.assertIn("cs-t2 = ResourceCaptureBoneMap_87654321_77_5_LOD", ini_text)
             self.assertIn("run = CustomShader_RecordBones", ini_text)
             self.assertNotIn("CustomShader_RecordBonesScatter", ini_text)
-            self.assertIn("ResourceLodCaptureBoneMap", ini_text)
+            self.assertIn("ResourceCaptureBoneMap_87654321_77_5_LOD", ini_text)
             self.assertIn("hash = bbbbbbbbbbbbbbbb", ini_text)
 
     def test_same_override_key_records_all_capture_maps(self):
@@ -178,8 +183,9 @@ class RuntimeIniTests(unittest.TestCase):
 
         self.assertFalse(runtime["uses_lod_profile_flag"])
         self.assertNotIn("$bmc_profile_lod", ini_text)
-        self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", ini_text)
-        self.assertIn("cs-t2 = ResourceMainCaptureBoneMap", ini_text)
+        self.assertIn("cs-t2 = ResourceCaptureBoneMap_aaaaaaaa_10_0_MAIN_LOD", ini_text)
+        self.assertNotIn("ResourceMainCaptureBoneMap", ini_text)
+        self.assertNotIn("ResourceLodCaptureBoneMap", ini_text)
         self.assertNotIn("x102", ini_text)
 
     def test_same_override_key_emits_all_shadow_replay_without_lod_profile(self):
@@ -368,7 +374,7 @@ class RuntimeIniTests(unittest.TestCase):
             {"ib_hash": "bbbbbbbb", "match_first_index": 0, "match_index_count": 20},
             runtime["lod_profile_chains"][0]["host_key"],
         )
-        self.assertEqual(["aaaaaaaa"], [record["ib_hash"] for record in runtime["lod_capture_records"]])
+        self.assertEqual(["aaaaaaaa", "bbbbbbbb"], [record["ib_hash"] for record in runtime["lod_capture_records"]])
         host_section = ini_text[
             ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_0_LOD]") :
             ini_text.index("[Present]")
@@ -508,7 +514,7 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]")
         ]
         self.assertNotIn("$bmc_profile_lod", main_only_section)
-        self.assertIn("cs-t2 = ResourceMainCaptureBoneMap", main_only_section)
+        self.assertIn("cs-t2 = ResourceCaptureBoneMap_bbbbbbbb_20_0_MAIN", main_only_section)
         self.assertNotIn("ResourceLodCaptureBoneMap", main_only_section)
         self.assertNotIn("$bmc_profile_lod", ini_text)
         self.assertIn("if vs == 200\n  draw = from_caller", ini_text)
@@ -605,7 +611,13 @@ class RuntimeIniTests(unittest.TestCase):
                     _geometry_record("main_b", 20, 0, 3, object_names=["b"]),
                 ],
             )
-            lod_capture_bone_map = _read_uints(runtime["buffers"]["lod_capture_bone_map"]["file_path"])
+            lod_capture_bone_map = _read_uints(
+                next(
+                    payload["file_path"]
+                    for payload in runtime["buffers"]["capture_bone_maps"]
+                    if payload["resource_name"] == "ResourceCaptureBoneMap_lod_a_30_0_LOD"
+                )
+            )
 
         self.assertEqual([0, 1], runtime["main_required_global_bones"])
         self.assertEqual([0], runtime["lod_required_global_bones"])
@@ -613,9 +625,9 @@ class RuntimeIniTests(unittest.TestCase):
             [[0], [1]],
             [record["canonical_global_bones"] for record in runtime["capture_records"]],
         )
-        self.assertEqual([[0]], [record["canonical_global_bones"] for record in runtime["lod_capture_records"]])
+        self.assertEqual([[0, 1]], [record["canonical_global_bones"] for record in runtime["lod_capture_records"]])
         self.assertEqual(
-            (1, 8, 1, 1, 0, 1, 2, 1, 0, 0),
+            (2, 2, 1, 0, 0, 0, 1, 1),
             lod_capture_bone_map,
         )
 
@@ -721,7 +733,7 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertNotIn("hash = bbbbbbbb ;", lod_section)
         self.assertNotIn("LOD maps to main", lod_section)
         self.assertNotIn("LOD replay exported", lod_section)
-        self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", lod_section)
+        self.assertIn("cs-t2 = ResourceCaptureBoneMap_bbbbbbbb_20_5_LOD", lod_section)
         self.assertIn("if vs != 200", lod_section)
         self.assertIn("; replay aaaaaaaa_10_0_part00", lod_section)
         self.assertIn("ResourcePart_aaaaaaaa_10_0_part00_Index", lod_section)
@@ -1039,8 +1051,8 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text.index("[TextureOverride_BMC_cccccccc_30_0_LOD]")
         ]
         self.assertIn("hash = cccccccc", host_section)
-        self.assertIn("x100 = 1", host_section)
-        self.assertIn("cs-t2 = ResourceLodCaptureBoneMap", host_section)
+        self.assertIn("cs-t2 = ResourceCaptureBoneMap_cccccccc_30_0_LOD", host_section)
+        self.assertNotIn("x100 =", host_section)
         self.assertNotIn("  handling = skip", host_section)
         self.assertIn("  draw = from_caller", host_section)
         self.assertIn("; delayed normal shadow replay", host_section)
@@ -1319,7 +1331,8 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("[ResourcePart_12345678_42_0_part00_Index]", ini_text)
         self.assertIn("if vs != 200", ini_text)
         self.assertIn("  handling = skip", ini_text)
-        self.assertIn("if vs == 200\n  run = CustomShader_ExtractCB1\n  x100 = 0\n  cs-t2 = ResourceMainCaptureBoneMap\n  run = CustomShader_RecordBones\nendif", ini_text)
+        self.assertIn("if vs == 200\n  run = CustomShader_ExtractCB1\n  cs-t2 = ResourceCaptureBoneMap_12345678_42_0_MAIN\n  run = CustomShader_RecordBones\nendif", ini_text)
+        self.assertNotIn("x100 =", ini_text)
         self.assertNotIn("visible fallback main bone capture", ini_text)
         self.assertIn("  x101 = 2", ini_text)
         self.assertIn("  run = CustomShader_GatherLocalBones", ini_text)
@@ -1348,7 +1361,8 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
         section = ini_text[ini_text.index("[TextureOverride_BMC_12345678_42_0]") :]
-        self.assertIn("if vs == 200\n  run = CustomShader_ExtractCB1\n  x100 = 0\n  cs-t2 = ResourceMainCaptureBoneMap\n  run = CustomShader_RecordBones\nendif", section)
+        self.assertIn("if vs == 200\n  run = CustomShader_ExtractCB1\n  cs-t2 = ResourceCaptureBoneMap_12345678_42_0_MAIN\n  run = CustomShader_RecordBones\nendif", section)
+        self.assertNotIn("x100 =", section)
         self.assertNotIn("if vs != 200", section)
         self.assertNotIn("visible fallback main bone capture", section)
         self.assertNotIn("  handling = skip", section)

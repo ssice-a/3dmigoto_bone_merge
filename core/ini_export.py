@@ -62,10 +62,10 @@ def materialize_bonestore_runtime(
         capture_manifest,
         required_globals=lod_required_globals,
     )
-    capture_bone_map_resources = _materialize_capture_bone_map_resources(
-        buffer_dir,
-        normalized_output_dir,
-        capture_records,
+    lod_records = _augment_lod_capture_records_for_shadow_chains(
+        capture_manifest,
+        geometry_payloads,
+        lod_replay_links,
         lod_records,
     )
     texture_records, texture_warnings = _materialize_texture_records(normalized_output_dir, texture_mark_payload or {})
@@ -77,8 +77,15 @@ def materialize_bonestore_runtime(
     shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
     lod_profile_chains = _build_lod_profile_chains(capture_manifest, lod_records)
     lod_shadow_replay_plans = _build_lod_shadow_replay_plans(capture_manifest, geometry_payloads, lod_replay_links, lod_records)
+    _validate_lod_shadow_replay_plans(lod_shadow_replay_plans)
     lod_shadow_replay_plan = _primary_lod_shadow_replay_plan(lod_shadow_replay_plans)
     uses_lod_profile_flag = False
+    capture_bone_map_resources = _materialize_capture_bone_map_resources(
+        buffer_dir,
+        normalized_output_dir,
+        capture_records,
+        lod_records,
+    )
     if _shadow_plan_needs_white_texture(shadow_replay_plan) or any(
         _shadow_plan_needs_white_texture(plan) for plan in lod_shadow_replay_plans
     ):
@@ -172,7 +179,7 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
 
 def _build_main_capture_records(capture_manifest: dict, *, required_globals: set[int] | None = None) -> list[dict]:
     records: list[dict] = []
-    _ = required_globals
+    required_filter = {int(value) for value in required_globals} if required_globals is not None else None
 
     for pool_record in capture_manifest.get("bone_pool_order", []) or []:
         if not bool(pool_record.get("bone_capture_available", pool_record.get("shadow_capture_ready", False))):
@@ -185,6 +192,8 @@ def _build_main_capture_records(capture_manifest: dict, *, required_globals: set
         pairs: list[tuple[int, int]] = []
         for compact_index, source_local_bone in enumerate(used_indices):
             canonical_global_bone = int(capture_store_base) + compact_index
+            if required_filter is not None and canonical_global_bone not in required_filter:
+                continue
             pairs.append((int(source_local_bone), canonical_global_bone))
         if not pairs:
             continue
@@ -248,6 +257,181 @@ def _build_lod_capture_records(capture_manifest: dict, *, required_globals: set[
         )
 
     return records
+
+
+def _augment_lod_capture_records_for_shadow_chains(
+    capture_manifest: dict,
+    geometry_records: list[dict],
+    lod_replay_links: list[dict],
+    lod_capture_records: list[dict],
+) -> list[dict]:
+    """Fill chain-local LOD shadow gaps by letting missing globals inherit a same-part captured donor."""
+
+    if not lod_capture_records or not lod_replay_links or not geometry_records:
+        return lod_capture_records
+
+    lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
+    stage = _normalize_shadow_stage(lod_snapshot)
+    raw_records = _raw_lod_shadow_records(capture_manifest, lod_capture_records)
+    chains = _lod_shadow_capture_chains(raw_records, stage)
+    if not chains:
+        return lod_capture_records
+
+    geometry_by_suffix = _geometry_records_by_suffix(geometry_records)
+    roles_by_main_key = _shadow_roles_by_key(capture_manifest)
+    records = [dict(record) for record in lod_capture_records]
+
+    for chain in chains:
+        _augment_lod_capture_records_for_shadow_chain(
+            records,
+            chain,
+            stage,
+            geometry_by_suffix,
+            roles_by_main_key,
+            lod_replay_links,
+        )
+
+    _refresh_lod_capture_record_metadata(records)
+    return records
+
+
+def _augment_lod_capture_records_for_shadow_chain(
+    lod_capture_records: list[dict],
+    chain: dict,
+    stage: dict,
+    geometry_by_suffix: dict[str, dict],
+    roles_by_main_key: dict[tuple[str, int, int], set[str]],
+    lod_replay_links: list[dict],
+) -> None:
+    host_draw_index = _int_default(chain.get("host_draw_index"), -1)
+    if host_draw_index < 0:
+        return
+
+    chain_keys = {
+        _key_from_payload(dict(payload or {}))
+        for payload in chain.get("keys", []) or []
+        if _is_valid_override_key(_key_from_payload(dict(payload or {})))
+    }
+    donor_index = _lod_shadow_chain_donor_index(
+        lod_capture_records,
+        host_draw_index=host_draw_index,
+        stage_draw_start=_int_default(stage.get("stage_draw_start"), -1),
+        stage_draw_end=_int_default(stage.get("stage_draw_end"), -1),
+    )
+    if not donor_index:
+        return
+
+    for link in lod_replay_links:
+        if not _lod_replay_link_matches_chain(link, chain):
+            continue
+        lod_key = _key_from_payload(dict(link.get("lod_key", {}) or {}))
+        if not _is_valid_override_key(lod_key):
+            continue
+        if chain_keys and lod_key not in chain_keys:
+            continue
+        for geometry_item in _lod_link_geometry_items(link):
+            suffix = str(geometry_item.get("resource_suffix", "") or "")
+            geometry_record = geometry_by_suffix.get(suffix)
+            if geometry_record is None:
+                continue
+            main_key = _key_from_payload(dict(geometry_item.get("main_key", {}) or {}))
+            main_roles = roles_by_main_key.get(main_key, set())
+            if not main_roles.intersection({"transparent_shadow", "normal_shadow"}):
+                continue
+            required_globals = _geometry_required_global_bones(geometry_record)
+            if not required_globals:
+                continue
+            available_in_part = sorted(global_bone for global_bone in required_globals if global_bone in donor_index)
+            if not available_in_part:
+                continue
+            missing_globals = sorted(global_bone for global_bone in required_globals if global_bone not in donor_index)
+            for missing_global in missing_globals:
+                donor_global = min(available_in_part, key=lambda value: (abs(int(value) - int(missing_global)), int(value)))
+                donor = donor_index.get(donor_global)
+                if donor is None:
+                    continue
+                _append_lod_capture_donor_pair(
+                    donor["record"],
+                    lod_local_bone=int(donor["lod_local_bone"]),
+                    missing_global=int(missing_global),
+                    donor_global=int(donor_global),
+                    geometry_suffix=suffix,
+                )
+
+
+def _lod_shadow_chain_donor_index(
+    lod_capture_records: list[dict],
+    *,
+    host_draw_index: int,
+    stage_draw_start: int,
+    stage_draw_end: int,
+) -> dict[int, dict]:
+    donors: dict[int, dict] = {}
+    for record in lod_capture_records or []:
+        draw_indices = [
+            int(value)
+            for value in record.get("capture_draw_indices", []) or []
+            if int(value) >= 0
+            and int(value) <= int(host_draw_index)
+            and _draw_index_in_optional_stage_window(int(value), int(stage_draw_start), int(stage_draw_end))
+        ]
+        if not draw_indices:
+            continue
+        draw_index = max(draw_indices)
+        for pair in record.get("capture_pairs", []) or []:
+            try:
+                lod_local_bone, canonical_global = pair
+            except (TypeError, ValueError):
+                continue
+            lod_local_bone = int(lod_local_bone)
+            canonical_global = int(canonical_global)
+            if lod_local_bone < 0 or canonical_global < 0:
+                continue
+            current = donors.get(canonical_global)
+            payload = {
+                "record": record,
+                "lod_local_bone": lod_local_bone,
+                "draw_index": draw_index,
+            }
+            if current is None or int(draw_index) > int(current.get("draw_index", -1)):
+                donors[canonical_global] = payload
+    return donors
+
+
+def _append_lod_capture_donor_pair(
+    record: dict,
+    *,
+    lod_local_bone: int,
+    missing_global: int,
+    donor_global: int,
+    geometry_suffix: str,
+) -> None:
+    pairs = [(int(local), int(global_bone)) for local, global_bone in record.get("capture_pairs", []) or []]
+    pair = (int(lod_local_bone), int(missing_global))
+    if pair not in pairs:
+        pairs.append(pair)
+        record["capture_pairs"] = pairs
+    inherited = list(record.get("auto_lod_donor_pairs", []) or [])
+    payload = {
+        "lod_local_bone": int(lod_local_bone),
+        "canonical_global_bone": int(missing_global),
+        "donor_global_bone": int(donor_global),
+        "method": "same_part_shadow_chain_donor",
+        "geometry_suffix": str(geometry_suffix or ""),
+    }
+    if payload not in inherited:
+        inherited.append(payload)
+    record["auto_lod_donor_pairs"] = inherited
+
+
+def _refresh_lod_capture_record_metadata(records: list[dict]) -> None:
+    for record in records:
+        pairs = [(int(local), int(global_bone)) for local, global_bone in record.get("capture_pairs", []) or []]
+        pairs = sorted(set(pairs), key=lambda item: (item[0], item[1]))
+        record["capture_pairs"] = pairs
+        record["canonical_global_bones"] = sorted({int(global_bone) for _local, global_bone in pairs if int(global_bone) >= 0})
+        record["pair_count"] = len(pairs)
+        record["dispatch_rows"] = len(pairs) * 3
 
 
 def _materialize_capture_bone_map_resources(
@@ -755,6 +939,29 @@ def _build_lod_shadow_replay_plan(
 ) -> dict:
     return _primary_lod_shadow_replay_plan(
         _build_lod_shadow_replay_plans(capture_manifest, geometry_records, lod_replay_links, lod_capture_records)
+    )
+
+
+def _validate_lod_shadow_replay_plans(plans: list[dict]) -> None:
+    missing_items: list[str] = []
+    for plan in plans or []:
+        for missing in plan.get("missing_links", []) or []:
+            lod_key = _key_from_payload(dict(missing.get("lod_key", {}) or {}))
+            suffixes = [str(value) for value in missing.get("geometry_suffixes", []) or [] if str(value)]
+            globals_text = ", ".join(f"G{int(value)}" for value in (missing.get("missing_global_bones", []) or [])[:12])
+            if int(missing.get("missing_global_count", 0) or 0) > 12:
+                globals_text += ", ..."
+            missing_items.append(
+                f"{lod_key[0]}-{lod_key[2]}-{lod_key[1]} -> {', '.join(suffixes) or '<unknown>'}: {globals_text}"
+            )
+    if not missing_items:
+        return
+    shown = "; ".join(missing_items[:4])
+    if len(missing_items) > 4:
+        shown += "; ..."
+    raise ValueError(
+        "LOD shadow replay cannot capture all required export bones in its host chain. "
+        f"Missing chain-local global bone coverage: {shown}"
     )
 
 

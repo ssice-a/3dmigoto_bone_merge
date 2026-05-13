@@ -1568,6 +1568,17 @@ def _build_lod_capture_records(
             "score": float(dict(mapping or {}).get("score", 0.0)),
             "votes": int(dict(mapping or {}).get("votes", 0)),
         }
+        optional_fields = (
+            "average_distance",
+            "status",
+            "donor_global_bone",
+            "match_method",
+            "note",
+        )
+        mapping_payload = dict(mapping or {})
+        for field in optional_fields:
+            if field in mapping_payload:
+                pair[field] = mapping_payload[field]
         bucket = pairs_by_lod.setdefault(lod_key, {})
         pair_key = canonical_global
         current = bucket.get(pair_key)
@@ -1605,6 +1616,10 @@ def _build_lod_capture_records(
                 if mapping is not None:
                     add_pair(lod_key, int(mapping.get("lod_local_bone", -1)), int(canonical_global), mapping)
                     continue
+            _inherit_missing_link_pairs_from_same_lod_part(
+                pairs_by_lod.setdefault(lod_key, {}),
+                required_globals,
+            )
 
     records = []
     for lod_key, pair_map in sorted(pairs_by_lod.items(), key=lambda item: (-len(item[1]), item[0])):
@@ -1614,6 +1629,31 @@ def _build_lod_capture_records(
         pairs = list(pair_map.values())
         records.append({**lod_record, "scatter_pairs": sorted(pairs, key=lambda item: (item["lod_local_bone"], item["canonical_global_bone"]))})
     return records
+
+
+def _inherit_missing_link_pairs_from_same_lod_part(pair_map: dict[int, dict], required_globals: list[int]) -> None:
+    available_globals = sorted(int(global_bone) for global_bone in required_globals if int(global_bone) in pair_map)
+    if not available_globals:
+        return
+    for canonical_global in sorted(int(global_bone) for global_bone in required_globals):
+        if canonical_global in pair_map:
+            continue
+        donor_global = min(available_globals, key=lambda value: (abs(int(value) - canonical_global), int(value)))
+        donor = dict(pair_map.get(donor_global) or {})
+        lod_local_bone = int(donor.get("lod_local_bone", -1))
+        if lod_local_bone < 0:
+            continue
+        pair_map[canonical_global] = {
+            "lod_local_bone": lod_local_bone,
+            "canonical_global_bone": canonical_global,
+            "score": float(donor.get("score", 0.0) or 0.0) * 0.75,
+            "votes": int(donor.get("votes", 0) or 0),
+            "average_distance": float(donor.get("average_distance", 0.0) or 0.0),
+            "status": "same_lod_part_donor",
+            "donor_global_bone": int(donor_global),
+            "match_method": "same_lod_part_donor",
+            "note": f"G{canonical_global} inherits LOD local bone {lod_local_bone} from same-link donor G{donor_global}.",
+        }
 
 
 def _link_required_globals(link: dict) -> list[int]:

@@ -841,7 +841,7 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("; replay aaaaaaaa_10_0_part00", lod_section)
         self.assertIn("; Blender objects: shadow_body", lod_section)
 
-    def test_lod_shadow_replay_does_not_skip_when_coverage_is_incomplete(self):
+    def test_lod_shadow_replay_inherits_missing_same_part_chain_bones(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
             "lod_manifest_snapshot": {
@@ -923,17 +923,111 @@ class RuntimeIniTests(unittest.TestCase):
             )
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
-        self.assertFalse(runtime["lod_shadow_replay_plan"]["enabled"])
-        self.assertEqual("lod_shadow_coverage_incomplete", runtime["lod_shadow_replay_plan"]["reason"])
-        self.assertEqual(1, runtime["lod_shadow_replay_plan"]["missing_links"][0]["missing_global_count"])
+        self.assertTrue(runtime["lod_shadow_replay_plan"]["enabled"])
+        self.assertEqual([], runtime["lod_shadow_replay_plan"]["missing_links"])
+        self.assertEqual([[0, 1]], [record["canonical_global_bones"] for record in runtime["lod_capture_records"]])
+        self.assertEqual(
+            [
+                {
+                    "lod_local_bone": 0,
+                    "canonical_global_bone": 1,
+                    "donor_global_bone": 0,
+                    "method": "same_part_shadow_chain_donor",
+                    "geometry_suffix": "aaaaaaaa_10_0_part00",
+                }
+            ],
+            runtime["lod_capture_records"][0]["auto_lod_donor_pairs"],
+        )
         lod_section = ini_text[
             ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_5_LOD]") :
             ini_text.index("[Present]")
         ]
         self.assertIn("if vs == 200", lod_section)
         self.assertIn("  run = CustomShader_RecordBones", lod_section)
-        self.assertNotIn("  handling = skip\nendif", lod_section)
-        self.assertNotIn("; delayed normal shadow replay", lod_section)
+        self.assertIn("  handling = skip", lod_section)
+        self.assertIn("; delayed normal shadow replay", lod_section)
+
+    def test_lod_shadow_replay_blocks_when_chain_has_no_same_part_donor(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
+            "lod_manifest_snapshot": {
+                "shadow_stage": {
+                    "shadow_vs_hashes": ["2222222222222222"],
+                    "host_ib_hash": "bbbbbbbb",
+                    "host_match_first_index": 5,
+                    "host_match_index_count": 20,
+                    "host_draw_index": 50,
+                }
+            },
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 2,
+                    "used_local_bone_indices": [0, 1],
+                    "bone_capture_available": True,
+                }
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 10,
+                    "ib_hash": "aaaaaaaa",
+                    "first_index": 0,
+                    "index_count": 10,
+                    "pass_role": "normal_shadow",
+                }
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-body",
+                    "lod_ib_hash": "bbbbbbbb",
+                    "lod_match_first_index": 5,
+                    "lod_match_index_count": 20,
+                    "lod_capture_draw_indices": [50],
+                    "lod_local_bone_count": 1,
+                    "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
+                }
+            ],
+            "lod_links": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-body",
+                            "lod_ib_hash": "bbbbbbbb",
+                            "lod_match_first_index": 5,
+                            "lod_match_index_count": 20,
+                            "mapped_global_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="main",
+            ib_hash="aaaaaaaa",
+            match_index_count=10,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(1,),
+            file_name="aaaaaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_10_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "LOD shadow replay cannot capture"):
+                ini_export.materialize_bonestore_runtime(
+                    tmpdir,
+                    manifest,
+                    [palette],
+                    [_geometry_record("aaaaaaaa", 10, 0, 6, object_names=["shadow_body"])],
+                )
 
     def test_lod_shadow_replay_uses_shadow_stage_host(self):
         manifest = {

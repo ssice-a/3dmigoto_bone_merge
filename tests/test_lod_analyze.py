@@ -170,6 +170,47 @@ class LodAnalyzeTests(unittest.TestCase):
             [(0, 236), (1, 234), (2, 235)],
         )
 
+    def test_lod_capture_inherits_missing_link_bones_from_same_lod_part(self):
+        lod_records = {
+            "lod_body-3-0": {
+                "lod_record_key": "lod_body-3-0",
+                "lod_ib_hash": "lod_body",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 3,
+            },
+        }
+        lod_links = [
+            {
+                "source_key": "main_body-3-0",
+                "ib_hash": "main_body",
+                "match_first_index": 0,
+                "match_index_count": 3,
+                "global_bone_base": 10,
+                "local_bone_count": 3,
+                "used_local_bone_indices": [0, 1, 2],
+                "lod_sources": [{"lod_record_key": "lod_body-3-0"}],
+            }
+        ]
+        global_candidates = {
+            10: [{"lod_record_key": "lod_body-3-0", "lod_local_bone": 4, "score": 5.0, "votes": 5, "average_distance": 0.01}],
+            12: [{"lod_record_key": "lod_body-3-0", "lod_local_bone": 8, "score": 4.0, "votes": 4, "average_distance": 0.02}],
+        }
+
+        records = lod_analyze._build_lod_capture_records(
+            lod_records,
+            {},
+            lod_links=lod_links,
+            global_candidates=global_candidates,
+        )
+
+        self.assertEqual(len(records), 1)
+        pairs = {int(pair["canonical_global_bone"]): pair for pair in records[0]["scatter_pairs"]}
+        self.assertEqual(4, pairs[10]["lod_local_bone"])
+        self.assertEqual(4, pairs[11]["lod_local_bone"])
+        self.assertEqual(10, pairs[11]["donor_global_bone"])
+        self.assertEqual("same_lod_part_donor", pairs[11]["status"])
+        self.assertEqual(8, pairs[12]["lod_local_bone"])
+
     def test_lod_signature_fast_path_only_skips_point_cloud_for_same_ib(self):
         canonical_manifest = {
             "frameanalysis_dir": "C:/fake-main",

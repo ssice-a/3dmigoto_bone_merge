@@ -869,7 +869,7 @@ def _allowed_group_pairs_from_caches(source_cache: dict, target_cache: dict) -> 
         target_group = int(target_groups[int(target_position)])
         source_cloud = source_group_clouds[source_group]
         target_cloud = target_group_clouds[target_group]
-        if np.intersect1d(source_cloud["cell_codes"], target_cloud["expanded_cell_codes"], assume_unique=True).size:
+        if not source_cloud["cell_keys"].isdisjoint(target_cloud["expanded_cell_keys"]):
             allowed.add((int(source_group), int(target_group)))
     return allowed
 

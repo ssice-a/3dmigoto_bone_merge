@@ -170,6 +170,52 @@ class LodAnalyzeTests(unittest.TestCase):
             [(0, 234), (1, 235), (2, 236)],
         )
 
+    def test_lod_signature_fast_path_skips_point_cloud_when_exact_and_unambiguous(self):
+        canonical_manifest = {
+            "frameanalysis_dir": "C:/fake-main",
+            "bone_pool_order": [
+                {
+                    "ib_hash": "main",
+                    "match_first_index": 0,
+                    "match_index_count": 3,
+                    "global_bone_base": 10,
+                    "local_bone_count": 3,
+                    "used_local_bone_indices": [0, 1, 2],
+                    "bone_capture_available": True,
+                }
+            ],
+        }
+        lod_manifest = {
+            "frameanalysis_dir": "C:/fake-lod",
+            "candidate_ibs": [
+                {
+                    "ib_hash": "lod",
+                    "match_first_index": 0,
+                    "match_index_count": 3,
+                    "shadow_capture_ready": True,
+                    "shadow_draw_indices": [7],
+                    "local_bone_count": 3,
+                    "source_local_bone_count": 3,
+                    "used_local_bone_indices": [0, 1, 2],
+                }
+            ],
+            "shadow_stage": {},
+        }
+
+        result = lod_analyze._try_analyze_lod_by_signatures(
+            canonical_manifest,
+            lod_manifest,
+            "C:/fake-lod",
+            lod_level=1,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["lod_frameanalysis"][0]["match_method"], "vb2_slot_signature_fast_path")
+        self.assertEqual(
+            [(pair["lod_local_bone"], pair["canonical_global_bone"]) for pair in result["lod_capture_records"][0]["scatter_pairs"]],
+            [(0, 10), (1, 11), (2, 12)],
+        )
+
     def test_lod_links_drop_sparse_noise_sources(self):
         main_records = [
             {

@@ -14,7 +14,7 @@ from .numpy_buffers import assign_bytes, foreach_get_array, object_attribute_arr
 from .uv_transform import DEFAULT_UV_FLIP_V
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _LoopVertex:
     mesh_obj: object
     mesh: object

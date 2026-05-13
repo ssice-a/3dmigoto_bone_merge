@@ -48,26 +48,26 @@ _LOD_SLOT_NEAR_RATIO_TOLERANCE = 0.35
 _LOD_SHADOW_CHAIN_GAP = 12
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WeightedPoint:
     position: tuple[float, float, float]
     weights: tuple[tuple[object, float], ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PointGeometry:
     positions: list[tuple[float, float, float]]
     blend_indices: list[tuple[int, int, int, int]]
     blend_weights: list[tuple[float, float, float, float]]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BoneSample:
     position: tuple[float, float, float]
     weight: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LodBoneSample:
     position: tuple[float, float, float]
     weight: float
@@ -94,8 +94,17 @@ def analyze_lod_for_manifest(
     if not canonical_manifest.get("bone_pool_order"):
         raise ValueError("Build Global Bone Pool before Analyze LOD")
 
-    main_points, canonical_global_count, main_records = _build_canonical_point_cloud(canonical_manifest)
     lod_manifest = _analyze_main_frameanalysis_cached(normalized_lod_dir)
+    quick_result = _try_analyze_lod_by_signatures(
+        canonical_manifest,
+        lod_manifest,
+        normalized_lod_dir,
+        lod_level=int(lod_level),
+    )
+    if quick_result is not None:
+        return quick_result
+
+    main_points, canonical_global_count, main_records = _build_canonical_point_cloud(canonical_manifest)
     lod_points, lod_records, skipped_main_hash_count = _build_lod_point_cloud(
         lod_manifest,
     )
@@ -163,6 +172,256 @@ def analyze_lod_for_manifest(
         "lod_review": review,
         "validation": validation,
         "lod_manifest_snapshot": _lod_manifest_snapshot(lod_manifest),
+    }
+
+
+def _try_analyze_lod_by_signatures(
+    canonical_manifest: dict,
+    lod_manifest: dict,
+    frameanalysis_dir: str,
+    *,
+    lod_level: int,
+) -> dict | None:
+    """Build an LOD result without full point clouds when slot signatures prove enough.
+
+    This fast path is intentionally conservative. It only accepts exact,
+    unambiguous VB2 slot-count links and then validates that the generated LOD
+    capture records fill every required canonical global bone. Ambiguous or
+    incomplete cases fall back to the full bone-cloud matcher.
+    """
+
+    canonical_global_count, main_records = _build_canonical_record_summaries(canonical_manifest)
+    lod_records, skipped_main_hash_count = _build_lod_record_summaries(lod_manifest)
+    if not main_records or not lod_records:
+        return None
+
+    lod_chains = _build_lod_record_chains(lod_records)
+    links = _build_lod_links(main_records, lod_records, {}, lod_chains=lod_chains)
+    if not _signature_links_are_unambiguous(main_records, lod_records, links):
+        return None
+
+    capture_records = _build_lod_capture_records(
+        lod_records,
+        {},
+        lod_links=links,
+        global_candidates={},
+    )
+    if not capture_records:
+        return None
+
+    review = review_lod_global_pool_coverage(canonical_manifest, capture_records)
+    if not bool(review.get("runtime_safe", False)):
+        return None
+
+    ignored_global_bones = _lod_match_excluded_global_bones(canonical_manifest)
+    mapping = _capture_records_to_lod_mapping(
+        canonical_global_count,
+        capture_records,
+        ignored_global_bones=ignored_global_bones,
+    )
+    validation = list(review["validation"])
+    validation.extend(
+        {
+            **entry,
+            "source": "lod_frameanalysis",
+        }
+        for entry in lod_manifest.get("validation", []) or []
+    )
+
+    variant_id = _build_lod_variant_id(frameanalysis_dir, capture_records)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "lod_frameanalysis": [
+            {
+                "lod_level": int(lod_level),
+                "variant_id": variant_id,
+                "frameanalysis_dir": os.path.abspath(frameanalysis_dir),
+                "candidate_count": len(lod_manifest.get("candidate_ibs", []) or []),
+                "capture_candidate_count": len(lod_records),
+                "matched_global_bone_count": len(mapping["global_to_lod"]),
+                "total_global_bone_count": int(canonical_global_count),
+                "required_global_bone_count": int(mapping["required_global_bone_count"]),
+                "ignored_lod_global_bone_count": int(mapping["ignored_global_bone_count"]),
+                "match_tolerance": 0.0,
+                "matched_vertex_count": 0,
+                "lod_vertex_count": 0,
+                "lod_chain_count": int(len(lod_chains)),
+                "skipped_main_hash_lod_candidate_count": int(skipped_main_hash_count),
+                "canonical_match_point_count": 0,
+                "lod_match_point_count": 0,
+                "match_method": "vb2_slot_signature_fast_path",
+                "shadow_stage": dict(lod_manifest.get("shadow_stage", {}) or {}),
+                "generated_at": generated_at,
+            }
+        ],
+        "lod_links": links,
+        "lod_chains": lod_chains,
+        "lod_capture_records": capture_records,
+        "lod_mapping": mapping["mapping_entries"],
+        "lod_review": review,
+        "validation": validation,
+        "lod_manifest_snapshot": _lod_manifest_snapshot(lod_manifest),
+    }
+
+
+def _build_canonical_record_summaries(canonical_manifest: dict) -> tuple[int, list[dict]]:
+    records: list[dict] = []
+    canonical_global_count = 0
+    for record in canonical_manifest.get("bone_pool_order", []) or []:
+        source_key = _source_key_from_candidate(record)
+        global_base = int(record.get("global_bone_base", record.get("capture_store_base", 0)) or 0)
+        local_count = int(record.get("local_bone_count", 0) or 0)
+        canonical_global_count = max(canonical_global_count, global_base + local_count)
+        if _record_lod_match_excluded(record):
+            continue
+        if local_count <= 0:
+            continue
+        records.append(
+            {
+                "source_key": source_key,
+                "ib_hash": str(record.get("ib_hash", "") or "").lower(),
+                "match_first_index": int(record.get("match_first_index", 0) or 0),
+                "match_index_count": int(record.get("match_index_count", 0) or 0),
+                "global_bone_base": global_base,
+                "local_bone_count": local_count,
+                "used_local_bone_indices": [int(value) for value in record.get("used_local_bone_indices", []) or []],
+                "vb2_signature": dict(record.get("vb2_signature", {}) or {}),
+            }
+        )
+    return canonical_global_count, records
+
+
+def _build_lod_record_summaries(
+    lod_manifest: dict,
+    *,
+    excluded_ib_hashes: set[str] | None = None,
+) -> tuple[dict[str, dict], int]:
+    normalized_excluded_ib_hashes = {str(value).lower() for value in (excluded_ib_hashes or set()) if str(value)}
+    lod_records: dict[str, dict] = {}
+    skipped_main_hash_count = 0
+    for candidate in lod_manifest.get("candidate_ibs", []) or []:
+        if not bool(candidate.get("enabled", True)):
+            continue
+        if not bool(candidate.get("shadow_capture_ready", False)):
+            continue
+        if bool(candidate.get("lod_match_excluded", False)):
+            continue
+        if int(candidate.get("local_bone_count", 0) or 0) <= 0:
+            continue
+        ib_hash = str(candidate.get("ib_hash", "") or "").lower()
+        if ib_hash in normalized_excluded_ib_hashes:
+            skipped_main_hash_count += 1
+            continue
+        source_key = _source_key_from_candidate(candidate)
+        lod_records[source_key] = _lod_record_payload(
+            candidate,
+            source_key,
+            vb2_signature=dict(candidate.get("vb2_signature", {}) or {}),
+        )
+    return lod_records, skipped_main_hash_count
+
+
+def _signature_links_are_unambiguous(main_records: list[dict], lod_records: dict[str, dict], links: list[dict]) -> bool:
+    if not links:
+        return False
+    main_by_key = {
+        str(record.get("source_key", "") or f"__main_{index}"): record
+        for index, record in enumerate(main_records)
+    }
+    matched_count = 0
+    for link in links:
+        sources = list(link.get("lod_sources", []) or [])
+        if not sources:
+            return False
+        if len(sources) != 1:
+            return False
+        source = dict(sources[0] or {})
+        if str(source.get("relation_method", "") or "") != "vb2_slot_signature":
+            return False
+        if int(source.get("slot_delta", -1)) != 0:
+            return False
+        main_record = main_by_key.get(str(link.get("source_key", "") or ""))
+        if not main_record:
+            return False
+        main_slot_count = _relation_slot_count(main_record)
+        exact_candidates = [
+            lod_key
+            for lod_key, lod_record in lod_records.items()
+            if _relation_slot_count(lod_record) == main_slot_count
+        ]
+        if len(exact_candidates) != 1:
+            return False
+        if str(source.get("lod_record_key", "") or "") != str(exact_candidates[0]):
+            return False
+        matched_count += 1
+    return matched_count > 0
+
+
+def _capture_records_to_lod_mapping(
+    canonical_global_count: int,
+    capture_records: list[dict],
+    *,
+    ignored_global_bones: set[int],
+) -> dict:
+    best_by_global: dict[int, dict] = {}
+    for record in capture_records:
+        lod_key = str(record.get("lod_record_key", "") or "")
+        for pair in record.get("scatter_pairs", []) or []:
+            canonical_global = int(pair.get("canonical_global_bone", -1))
+            lod_local_bone = int(pair.get("lod_local_bone", -1))
+            if canonical_global < 0 or lod_local_bone < 0:
+                continue
+            entry = {
+                "canonical_global_bone": canonical_global,
+                "lod_record_key": lod_key,
+                "lod_local_bone": lod_local_bone,
+                "score": float(pair.get("score", 0.0) or 0.0),
+                "votes": int(pair.get("votes", 0) or 0),
+                "average_distance": 0.0,
+                "status": "matched",
+            }
+            current = best_by_global.get(canonical_global)
+            if current is None or _mapping_entry_rank(entry) > _mapping_entry_rank(current):
+                best_by_global[canonical_global] = entry
+
+    mapping_entries = []
+    global_to_lod = {}
+    for canonical_global in range(int(canonical_global_count)):
+        if canonical_global in ignored_global_bones:
+            mapping_entries.append(
+                {
+                    "canonical_global_bone": canonical_global,
+                    "lod_record_key": "",
+                    "lod_local_bone": -1,
+                    "score": 0.0,
+                    "votes": 0,
+                    "average_distance": 0.0,
+                    "status": "ignored_lod_match_excluded",
+                }
+            )
+            continue
+        entry = best_by_global.get(canonical_global)
+        if entry is None:
+            mapping_entries.append(
+                {
+                    "canonical_global_bone": canonical_global,
+                    "lod_record_key": "",
+                    "lod_local_bone": -1,
+                    "score": 0.0,
+                    "votes": 0,
+                    "average_distance": 0.0,
+                    "status": "unmatched",
+                }
+            )
+            continue
+        mapping_entries.append(entry)
+        global_to_lod[canonical_global] = entry
+
+    return {
+        "global_to_lod": global_to_lod,
+        "mapping_entries": mapping_entries,
+        "ignored_global_bone_count": len(ignored_global_bones),
+        "required_global_bone_count": max(0, int(canonical_global_count) - len(ignored_global_bones)),
     }
 
 

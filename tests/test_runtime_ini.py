@@ -54,6 +54,8 @@ class RuntimeIniTests(unittest.TestCase):
             )
 
             ini_text = ini_export.build_bonestore_ini_content(runtime)
+            part_map_path = Path(tmpdir) / "Buffer" / "12345678-42-0-PartLocalToGlobalBoneMap.buf"
+            self.assertEqual((3, 10, 11, 12), _read_uints(str(part_map_path)))
             self.assertNotIn("namespace =", ini_text)
             self.assertNotIn("match_priority", ini_text)
             self.assertNotIn("x102", ini_text)
@@ -1420,6 +1422,8 @@ class RuntimeIniTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette], geometry)
             ini_text = ini_export.build_bonestore_ini_content(runtime)
+            part_map_path = Path(tmpdir) / "Buffer" / "12345678-42-0_part00-PartLocalToGlobalBoneMap.buf"
+            part_map_values = _read_uints(str(part_map_path))
 
         self.assertIn("[ResourcePart_12345678_42_0_part00_Position]", ini_text)
         self.assertIn("[ResourcePart_12345678_42_0_part00_Index]", ini_text)
@@ -1428,7 +1432,8 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("if vs == 200\n  run = CustomShader_ExtractCB1\n  cs-t2 = ResourceCaptureBoneMap_12345678_42_0_MAIN\n  run = CustomShader_RecordBones\nendif", ini_text)
         self.assertNotIn("x100 =", ini_text)
         self.assertNotIn("visible fallback main bone capture", ini_text)
-        self.assertIn("  x101 = 2", ini_text)
+        self.assertNotIn("x101 =", ini_text)
+        self.assertEqual((2, 0, 1), part_map_values)
         self.assertIn("  run = CustomShader_GatherLocalBones", ini_text)
         self.assertIn("  vs-t0 = ResourceLocalBonePool_SRV", ini_text)
         self.assertIn("  vb3 = ResourcePart_12345678_42_0_part00_Position", ini_text)

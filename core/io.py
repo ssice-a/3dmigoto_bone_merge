@@ -46,3 +46,8 @@ def write_uint32_buffer(path: str, values) -> str:
     with open(path, "wb") as file_handle:
         file_handle.write(packed.tobytes())
     return path
+
+
+def write_counted_uint32_buffer(path: str, values) -> str:
+    uint_values = [int(value) for value in values]
+    return write_uint32_buffer(path, [len(uint_values), *uint_values])

@@ -28,6 +28,47 @@ EXPORT_MODE_ITEMS = (
     ("BUFFER_AND_INI", "Buffer + INI", "Export buffer files, HLSL assets, export_manifest.json, and BoneStore.ini"),
 )
 
+_TEXTURE_MARK_PAYLOAD_CACHE: dict[int, tuple[tuple, dict]] = {}
+
+
+def _texture_mark_cache_id(scene) -> int:
+    return id(scene)
+
+
+def _manifest_file_signature(scene) -> tuple[str, int, int]:
+    manifest_path = bpy.path.abspath(str(getattr(scene, "bmc_manifest_path", "") or ""))
+    if not manifest_path:
+        return ("", 0, 0)
+    try:
+        stat = os.stat(manifest_path)
+    except OSError:
+        return (os.path.abspath(manifest_path), 0, 0)
+    return (os.path.abspath(manifest_path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _stored_texture_mark_payload_text(scene) -> str:
+    stored = str(getattr(scene, "bmc_texture_marks_json", "") or "").strip()
+    if stored:
+        return stored
+    export_collection = getattr(scene, "bmc_export_collection", None)
+    if export_collection is None:
+        return ""
+    try:
+        return str(export_collection.get(BMC_TEXTURE_MARKS_PROP, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _texture_mark_payload_cache_key(scene) -> tuple:
+    return (_manifest_file_signature(scene), _stored_texture_mark_payload_text(scene))
+
+
+def clear_texture_mark_payload_cache(scene=None) -> None:
+    if scene is None:
+        _TEXTURE_MARK_PAYLOAD_CACHE.clear()
+        return
+    _TEXTURE_MARK_PAYLOAD_CACHE.pop(_texture_mark_cache_id(scene), None)
+
 
 class BMC_CandidateItem(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(name="Enabled", default=True)
@@ -161,6 +202,7 @@ def _read_manifest_payload(scene) -> dict:
 
 
 def _store_texture_mark_payload_on_scene(scene, payload: dict) -> None:
+    clear_texture_mark_payload_cache(scene)
     serialized = dump_texture_mark_payload(payload)
     scene.bmc_texture_marks_json = serialized
     if getattr(scene, "bmc_export_collection", None) is not None:
@@ -168,9 +210,13 @@ def _store_texture_mark_payload_on_scene(scene, payload: dict) -> None:
 
 
 def texture_mark_payload_from_scene(scene) -> dict:
-    stored = str(getattr(scene, "bmc_texture_marks_json", "") or "").strip()
-    if not stored and getattr(scene, "bmc_export_collection", None) is not None:
-        stored = str(scene.bmc_export_collection.get(BMC_TEXTURE_MARKS_PROP, "") or "")
+    cache_id = _texture_mark_cache_id(scene)
+    cache_key = _texture_mark_payload_cache_key(scene)
+    cached = _TEXTURE_MARK_PAYLOAD_CACHE.get(cache_id)
+    if cached and cached[0] == cache_key:
+        return cached[1]
+
+    stored = _stored_texture_mark_payload_text(scene)
     existing = load_texture_mark_payload(stored)
     manifest = _read_manifest_payload(scene)
     if manifest.get("texture_candidates"):
@@ -179,11 +225,14 @@ def texture_mark_payload_from_scene(scene) -> dict:
         payload = existing
     if payload and dump_texture_mark_payload(payload) != stored:
         _store_texture_mark_payload_on_scene(scene, payload)
+        cache_key = _texture_mark_payload_cache_key(scene)
+    _TEXTURE_MARK_PAYLOAD_CACHE[cache_id] = (cache_key, payload)
     return payload
 
 
 def store_texture_mark_payload_on_scene(scene, payload: dict) -> None:
     _store_texture_mark_payload_on_scene(scene, payload)
+    _TEXTURE_MARK_PAYLOAD_CACHE[_texture_mark_cache_id(scene)] = (_texture_mark_payload_cache_key(scene), payload)
 
 
 def _texture_region_items(self, context):  # pylint: disable=unused-argument
@@ -460,6 +509,7 @@ def register_addon_properties():
     bpy.types.Scene.bmc_toggle_draw_set_index = bpy.props.IntProperty(name="Toggle Draw Set Index", default=0, min=0)
 
 def unregister_addon_properties():
+    clear_texture_mark_payload_cache()
     for owner, attribute_name in REGISTERED_PROPERTY_PATHS:
         if hasattr(owner, attribute_name):
             delattr(owner, attribute_name)

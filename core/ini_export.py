@@ -10,7 +10,7 @@ from pathlib import Path
 from ..constants import BONESTORE_INI_FILE_NAME, BUFFER_EXPORT_DIR_NAME
 from .data_types import get_runtime_shader_filters
 from .export_names import ini_filename_from_collection_name
-from .io import ensure_directory, write_uint32_buffer
+from .io import ensure_directory, write_counted_uint32_buffer, write_uint32_buffer
 from .models import LocalPaletteRecord
 from .texture_converter import write_game_texture
 from .texture_marks import marked_texture_bindings, validate_texture_hash
@@ -572,8 +572,7 @@ def _normalize_palette_records(output_directory: str, local_palette_records: lis
         palette_values = tuple(int(value) for value in record.palette_values)
         file_name = record.file_name or f"{suffix}-PartLocalToGlobalBoneMap.buf"
         file_path = record.file_path or os.path.join(buffer_dir, file_name)
-        if not os.path.exists(file_path):
-            write_uint32_buffer(file_path, palette_values)
+        write_counted_uint32_buffer(file_path, palette_values)
         normalized_records.append(
             {
                 "object_name": str(record.object_name),
@@ -2410,10 +2409,8 @@ def _shadow_plan_has_toggle_replay(shadow_plan: dict, parts_by_suffix: dict[str,
 
 def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
     suffix = str(record.get("resource_suffix", "") or "")
-    local_bone_count = _local_bone_count_for_resource_suffix(record)
     lines = [
         f"{indent}; replay {suffix}",
-        f"{indent}x101 = {local_bone_count}",
         f"{indent}cs-t2 = ResourcePartLocalToGlobalBoneMap_{suffix}",
         f"{indent}run = CustomShader_GatherLocalBones",
         f"{indent}vs-t0 = ResourceLocalBonePool_SRV",
@@ -2502,10 +2499,6 @@ def _blender_object_comment(record: dict) -> str:
     if not names:
         return ""
     return ", ".join(name.replace("\n", " ").replace("\r", " ") for name in names)
-
-
-def _local_bone_count_for_resource_suffix(record: dict) -> int:
-    return int(record.get("local_bone_count", 0) or 0)
 
 
 def _shadow_plan_host_key(shadow_plan: dict) -> tuple[str, int, int] | None:

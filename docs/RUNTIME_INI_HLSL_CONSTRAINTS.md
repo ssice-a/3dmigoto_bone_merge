@@ -282,7 +282,6 @@ if vs != 200 && vs != 204
   handling = skip
   run = CustomShader_ExtractCB1
   ; replay <exported_part>
-  x101 = <part_local_bone_count>
   cs-t2 = ResourcePartLocalToGlobalBoneMap_<exported_part>
   run = CustomShader_GatherLocalBones
   vs-t0 = ResourceLocalBonePool_SRV
@@ -296,6 +295,18 @@ if vs != 200 && vs != 204
   drawindexedinstanced = <index_count>,INSTANCE_COUNT,0,0,FIRST_INSTANCE
 endif
 ```
+
+`ResourcePartLocalToGlobalBoneMap_<exported_part>` owns its own count. Its
+buffer layout is:
+
+```text
+uint[0]    = part local bone count
+uint[1..]  = part local bone index -> canonical global bone index
+```
+
+Do not emit `x101` or any other INI-side local bone count for replay. The count
+and the map must stay in the same buffer so stale INI constants cannot disagree
+with the palette file.
 
 Early shadow source whose own original shadow is replaced later:
 

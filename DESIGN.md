@@ -424,13 +424,16 @@ Consume pass:
 
 ```ini
 run = CustomShader_ExtractCB1
-x101 = <local_bone_count>
 cs-t2 = ResourcePartLocalToGlobalBoneMap_<part>
 run = CustomShader_GatherLocalBones
 vs-t0 = ResourceLocalBonePool_SRV
 run = CustomShader_RedirectCB1
 vs-cb1 = ResourceFakeCB1
 ```
+
+`PartLocalToGlobalBoneMap` is a counted buffer. `uint[0]` is the part local bone
+count and `uint[1..]` maps part-local bone indices to canonical global bones.
+The consume path must not emit `x101`; the map and its count are one resource.
 
 `RedirectCB1` is part of the default consume path. Once `ResourceLocalBonePool_SRV` is bound as `vs-t0`, the original native bone-window rows would point outside the local pool. `RedirectCB1` must preserve all current `cb1` values except shader-visible `cb1[slot * 16 + 5].x/y`, which are rewritten to the local palette bases:
 

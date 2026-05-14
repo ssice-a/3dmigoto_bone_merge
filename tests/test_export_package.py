@@ -477,6 +477,10 @@ class ExportPackageTests(unittest.TestCase):
             self.assertEqual(result["hlsl_dir"], "")
             buffer_dir = Path(tmpdir) / "Buffer"
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-PartLocalToGlobalBoneMap.buf").exists())
+            self.assertEqual(
+                struct.unpack("<3I", (buffer_dir / "640d1c0e-46845-0_part00-PartLocalToGlobalBoneMap.buf").read_bytes()),
+                (2, 0, 4),
+            )
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Index.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Position.buf").exists())
             self.assertTrue((buffer_dir / "640d1c0e-46845-0_part00-Blend.buf").exists())

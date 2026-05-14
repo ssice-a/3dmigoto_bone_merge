@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from ..constants import BI4_MAX_BONE_COUNT
-from .io import write_uint32_buffer
+from .io import write_counted_uint32_buffer, write_uint32_buffer
 
 
 _REGION_COLLECTION_RE = re.compile(
@@ -220,7 +220,7 @@ def write_part_palette_files(buffer_dir: str, plan: ExportPlan) -> list[dict]:
     records: list[dict] = []
     for part in plan.parts:
         file_path = os.path.join(buffer_dir, part.palette_file_name)
-        write_uint32_buffer(file_path, part.palette_values)
+        write_counted_uint32_buffer(file_path, part.palette_values)
         records.append(part_palette_manifest_record(part, file_path))
     return records
 

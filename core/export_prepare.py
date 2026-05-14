@@ -118,7 +118,7 @@ def prepare_export_collection(
         ),
     }
     manifest_dir = ensure_directory(internal_manifest_dir or normalized_output_dir)
-    manifest_path = write_json(os.path.join(manifest_dir, EXPORT_MANIFEST_FILE_NAME), manifest)
+    manifest_path = write_json(os.path.join(manifest_dir, EXPORT_MANIFEST_FILE_NAME), manifest, compact=True)
     timings["manifest"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
@@ -296,7 +296,7 @@ def regenerate_bonestore_runtime_files(
             "lod_shadow_replay_plans": list(runtime_plan.get("lod_shadow_replay_plans", []) or []),
             "buffers": dict(runtime_plan.get("buffers", {}) or {}),
         }
-        write_json(normalized_export_manifest_path, export_manifest)
+        write_json(normalized_export_manifest_path, export_manifest, compact=True)
     return ini_path
 
 

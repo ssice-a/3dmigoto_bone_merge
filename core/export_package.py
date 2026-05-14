@@ -255,6 +255,10 @@ def part_palette_manifest_record(part: ExportPartPlan, file_path: str = "") -> d
 def write_r32_index_buffer(path: str, indices: Iterable[int]) -> str:
     """Write an index buffer as little-endian DXGI_FORMAT_R32_UINT."""
 
+    numpy_written = _write_numpy_r32_index_buffer(path, indices)
+    if numpy_written is not None:
+        return numpy_written
+
     values = []
     for index in indices:
         value = int(index)
@@ -262,6 +266,31 @@ def write_r32_index_buffer(path: str, indices: Iterable[int]) -> str:
             raise ValueError(f"R32 index cannot be negative: {value}")
         values.append(value)
     return write_uint32_buffer(path, values)
+
+
+def _write_numpy_r32_index_buffer(path: str, indices: Iterable[int]) -> str | None:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        return None
+    try:
+        values = np.asarray(indices)
+    except Exception:
+        return None
+    if values.dtype == object and values.ndim == 0:
+        return None
+    if values.size:
+        if bool(np.any(values < 0)):
+            raise ValueError(f"R32 index cannot be negative: {int(values.min())}")
+        if bool(np.any(values > 0xFFFFFFFF)):
+            raise ValueError(f"R32 index exceeds uint32: {int(values.max())}")
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    packed = np.ascontiguousarray(values.astype("<u4", copy=False).reshape(-1))
+    with open(path, "wb") as file_handle:
+        file_handle.write(packed.tobytes())
+    return path
 
 
 def _collect_region_part_sources(region_collection, identity: ExportRegionIdentity, warnings: list[str]) -> list[_PartSource]:

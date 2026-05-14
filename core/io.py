@@ -14,12 +14,15 @@ def ensure_directory(path: str) -> str:
     return normalized_path
 
 
-def write_json(path: str, payload) -> str:
+def write_json(path: str, payload, *, compact: bool = False) -> str:
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as file_handle:
-        json.dump(payload, file_handle, indent=2, ensure_ascii=False)
+        if compact:
+            json.dump(payload, file_handle, ensure_ascii=False, separators=(",", ":"))
+        else:
+            json.dump(payload, file_handle, indent=2, ensure_ascii=False)
         file_handle.write("\n")
     return path
 

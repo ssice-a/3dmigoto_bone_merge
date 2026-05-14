@@ -129,7 +129,7 @@ def write_main_analysis_manifest(
     normalized_frameanalysis_dir = os.path.abspath(frameanalysis_dir)
     normalized_output_dir = os.path.abspath(output_dir or normalized_frameanalysis_dir)
     payload = analyze_main_frameanalysis(normalized_frameanalysis_dir, target_ib_hashes or [])
-    manifest_path = write_json(os.path.join(normalized_output_dir, CAPTURE_MANIFEST_FILE_NAME), payload)
+    manifest_path = write_json(os.path.join(normalized_output_dir, CAPTURE_MANIFEST_FILE_NAME), payload, compact=True)
     return payload, manifest_path
 
 

@@ -378,6 +378,10 @@ def _normalize_vertex_layout(layout: dict) -> dict[str, dict]:
 
 
 def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartCache) -> tuple[list[_LoopVertex], list[int], list[_ObjectDrawRange]]:
+    fast_result = _collect_part_loop_vertices_all_fast(part, export_cache)
+    if fast_result is not None:
+        return fast_result
+
     np = require_numpy()
     loop_vertices: list[_LoopVertex] = []
     indices: list[int] = []
@@ -459,7 +463,112 @@ def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartC
     return loop_vertices, indices, object_draws
 
 
+def _collect_part_loop_vertices_all_fast(
+    part: ExportPartPlan,
+    export_cache: _ExportPartCache,
+) -> tuple[list[_LoopVertex], list[int], list[_ObjectDrawRange]] | None:
+    """Collect loop ranges without materializing one Python object per loop.
+
+    The vertex slot writers only need a representative loop object per mesh
+    range plus cached vertex/loop index arrays.  Avoiding per-loop _LoopVertex
+    construction removes a large Python-object hotspot for normal Blender
+    meshes while preserving the existing slow fallback for unusual meshes.
+    """
+
+    np = require_numpy()
+    fast_entries: list[tuple[object, object, int, object, object, object]] = []
+    for mesh_obj in part.mesh_objects:
+        mesh = export_cache.object_mesh_cache(mesh_obj).mesh
+        if mesh is None:
+            continue
+        fast_collected = _collect_mesh_loop_arrays_fast(mesh)
+        if fast_collected is None:
+            return None
+        loop_count, relative_indices, vertex_indices, loop_indices = fast_collected
+        if int(loop_count) <= 0:
+            continue
+        fast_entries.append((mesh_obj, mesh, int(loop_count), relative_indices, vertex_indices, loop_indices))
+
+    if not fast_entries:
+        return [], [], []
+
+    loop_vertices: list[_LoopVertex] = []
+    indices: list[int] = []
+    object_draws: list[_ObjectDrawRange] = []
+    range_arrays: list[tuple[int, int, object, object]] = []
+
+    for mesh_obj, mesh, loop_count, relative_indices, vertex_indices, loop_indices in fast_entries:
+        object_start_index = len(indices)
+        object_start_vertex = len(loop_vertices)
+        representative = _LoopVertex(
+            mesh_obj=mesh_obj,
+            mesh=mesh,
+            vertex_index=int(vertex_indices[0]) if getattr(vertex_indices, "size", 0) else 0,
+            loop_index=int(loop_indices[0]) if getattr(loop_indices, "size", 0) else 0,
+            polygon=None,
+        )
+        loop_vertices.append(representative)
+        if loop_count > 1:
+            loop_vertices.extend([None] * (loop_count - 1))  # type: ignore[list-item]
+
+        absolute_indices = np.asarray(relative_indices, dtype=np.int64) + int(object_start_vertex)
+        indices.extend(absolute_indices.reshape(-1).tolist())
+
+        object_end_vertex = len(loop_vertices)
+        range_arrays.append((object_start_vertex, object_end_vertex, vertex_indices, loop_indices))
+        object_index_count = len(indices) - object_start_index
+        if object_index_count > 0:
+            object_draws.append(
+                _ObjectDrawRange(
+                    object_name=str(getattr(mesh_obj, "name", "") or ""),
+                    start_index=object_start_index,
+                    index_count=object_index_count,
+                    start_vertex=object_start_vertex,
+                    vertex_count=object_end_vertex - object_start_vertex,
+                )
+            )
+
+    if loop_vertices:
+        export_cache.loop_vertex_range_arrays[(id(loop_vertices), len(loop_vertices))] = tuple(
+            (
+                int(start),
+                int(end),
+                np.asarray(vertex_indices, dtype=np.intp),
+                np.asarray(loop_indices, dtype=np.intp),
+            )
+            for start, end, vertex_indices, loop_indices in range_arrays
+        )
+    return loop_vertices, indices, object_draws
+
+
 def _collect_mesh_loop_vertices_fast(mesh_obj, mesh, object_start_vertex: int) -> tuple[list[_LoopVertex], list[int], object, object] | None:
+    np = require_numpy()
+    fast_collected = _collect_mesh_loop_arrays_fast(mesh)
+    if fast_collected is None:
+        return None
+    loop_count, relative_indices, vertex_indices, loop_indices = fast_collected
+    if int(loop_count) <= 0:
+        return None
+    loop_vertices = [
+        _LoopVertex(
+            mesh_obj=mesh_obj,
+            mesh=mesh,
+            vertex_index=int(vertex_indices[loop_index]),
+            loop_index=int(loop_index),
+            polygon=None,
+        )
+        for loop_index in range(int(loop_count))
+    ]
+    indices = (np.asarray(relative_indices, dtype=np.int64) + int(object_start_vertex)).reshape(-1).tolist()
+    return (
+        loop_vertices,
+        indices,
+        vertex_indices.astype(np.intp, copy=False),
+        loop_indices,
+    )
+
+
+def _collect_mesh_loop_arrays_fast(mesh) -> tuple[int, object, object, object] | None:
     np = require_numpy()
     loops = getattr(mesh, "loops", []) or []
     loop_count = len(loops)
@@ -488,21 +597,11 @@ def _collect_mesh_loop_vertices_fast(mesh_obj, mesh, object_start_vertex: int) -
     if int(np.max(triangle_loops)) >= loop_count or int(np.min(triangle_loops)) < 0:
         return None
 
-    loop_vertices = [
-        _LoopVertex(
-            mesh_obj=mesh_obj,
-            mesh=mesh,
-            vertex_index=int(vertex_indices[loop_index]),
-            loop_index=int(loop_index),
-            polygon=None,
-        )
-        for loop_index in range(loop_count)
-    ]
     loop_indices = np.arange(loop_count, dtype=np.intp)
-    reversed_triangles = triangle_loops[:, [0, 2, 1]] + int(object_start_vertex)
+    reversed_triangles = triangle_loops[:, [0, 2, 1]]
     return (
-        loop_vertices,
-        reversed_triangles.reshape(-1).astype(np.int64, copy=False).tolist(),
+        int(loop_count),
+        reversed_triangles.reshape(-1).astype(np.int64, copy=False),
         vertex_indices.astype(np.intp, copy=False),
         loop_indices,
     )

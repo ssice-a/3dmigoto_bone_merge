@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -12,6 +13,7 @@ from ..constants import (
     CAPTURE_MANIFEST_FILE_NAME,
     EXPORT_MANIFEST_FILE_NAME,
     BMC_TEXTURE_MARKS_PROP,
+    BMC_TOGGLE_DRAW_SETS_PROP,
 )
 from .export_names import ini_filename_from_collection_name
 from .hlsl_assets import export_required_hlsl
@@ -21,6 +23,7 @@ from .models import LocalPaletteRecord
 from .export_buffers import write_part_geometry_buffers
 from .export_package import build_export_plan, write_part_palette_files
 from .texture_marks import load_texture_mark_payload
+from .toggle_draw_sets import apply_toggle_draw_sets_to_geometry, normalize_toggle_draw_sets
 from .vertex_groups import collect_weighted_numeric_vertex_groups
 
 
@@ -76,6 +79,9 @@ def prepare_export_collection(
     stage_start = time.perf_counter()
     local_palette_records = [_local_palette_record_from_export_record(record) for record in palette_records]
     texture_mark_payload = _read_texture_marks_for_export(context, source_collection)
+    toggle_draw_sets = _read_toggle_draw_sets_for_export(context, source_collection)
+    geometry_records, toggle_warnings = apply_toggle_draw_sets_to_geometry(geometry_records, toggle_draw_sets)
+    warnings = [*list(export_plan.warnings), *toggle_warnings]
     object_records = []
     for part in export_plan.parts:
         for usage in part.object_usages:
@@ -103,13 +109,14 @@ def prepare_export_collection(
         "palettes": palette_records,
         "geometry_buffers": _public_geometry_records(geometry_records),
         "texture_marks": texture_mark_payload,
+        "toggle_draw_sets": toggle_draw_sets,
         "export_options": {
             "mirror_flip": bool(getattr(context.scene, "bmc_mirror_flip", True)),
             "uv_flip_v": bool(getattr(context.scene, "bmc_uv_flip_v", True)),
             "filter_residual": bool(filter_residual),
         },
         "objects": object_records,
-        "warnings": list(export_plan.warnings),
+        "warnings": warnings,
         "note": (
             "Export Root Collection child collections are final IB regions. "
             "A region without partNN children exports its direct mesh objects as implicit part00 with per-object draw ranges. "
@@ -141,7 +148,7 @@ def prepare_export_collection(
         "hlsl_dir": hlsl_dir,
         "objects": len(object_records),
         "palettes": len(palette_records),
-        "warnings": list(export_plan.warnings),
+        "warnings": warnings,
         "timings": {name: round(seconds, 3) for name, seconds in timings.items()},
         "performance": {
             "geometry": _geometry_performance_summary(geometry_records),
@@ -253,12 +260,14 @@ def regenerate_bonestore_runtime_files(
         filter_residual = bool(export_options.get("filter_residual", True))
     geometry_records = list(export_manifest.get("geometry_buffers", []) or []) if isinstance(export_manifest, dict) else []
     texture_mark_payload = dict(export_manifest.get("texture_marks", {}) or {}) if isinstance(export_manifest, dict) else {}
+    toggle_draw_sets = list(export_manifest.get("toggle_draw_sets", []) or []) if isinstance(export_manifest, dict) else []
     runtime_plan = materialize_bonestore_runtime(
         output_dir,
         manifest,
         palette_records,
         geometry_records,
         texture_mark_payload,
+        toggle_draw_sets,
         filter_residual=bool(filter_residual),
     )
     ini_file_name = _ini_file_name_from_export_manifest(export_manifest)
@@ -286,6 +295,7 @@ def regenerate_bonestore_runtime_files(
             "palettes": list(runtime_plan.get("palettes", []) or []),
             "geometry": list(runtime_plan.get("geometry", []) or []),
             "textures": list(runtime_plan.get("textures", []) or []),
+            "toggle_draw_sets": list(runtime_plan.get("toggle_draw_sets", []) or []),
             "shader_filter_overrides": list(runtime_plan.get("shader_filter_overrides", []) or []),
             "visible_replay_excluded_filter_indices": list(
                 runtime_plan.get("visible_replay_excluded_filter_indices", []) or []
@@ -323,6 +333,25 @@ def _read_texture_marks_for_export(context, source_collection) -> dict:
         raw_payload = str(context.scene.bmc_texture_marks_json or "")
     payload = load_texture_mark_payload(raw_payload)
     return payload if payload.get("marks") else {}
+
+
+def _read_toggle_draw_sets_for_export(context, source_collection) -> list[dict]:
+    scene = getattr(context, "scene", None)
+    scene_groups = getattr(scene, "bmc_toggle_draw_sets", None)
+    normalized = normalize_toggle_draw_sets(scene_groups)
+    if normalized:
+        return normalized
+    raw_payload = ""
+    collection_get = getattr(source_collection, "get", None)
+    if source_collection is not None and callable(collection_get):
+        raw_payload = str(collection_get(BMC_TOGGLE_DRAW_SETS_PROP, "") or "")
+    if not raw_payload:
+        return []
+    try:
+        payload = json.loads(raw_payload)
+    except (TypeError, ValueError):
+        return []
+    return normalize_toggle_draw_sets(payload if isinstance(payload, list) else [])
 
 
 def _local_palette_record_from_export_record(record: dict) -> LocalPaletteRecord:

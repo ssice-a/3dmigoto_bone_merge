@@ -1922,6 +1922,84 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("  drawindexedinstanced = 3,INSTANCE_COUNT,3,0,FIRST_INSTANCE", ini_text)
         self.assertNotIn("  drawindexedinstanced = 6,INSTANCE_COUNT,0,0,FIRST_INSTANCE", ini_text)
 
+    def test_toggle_draw_sets_emit_keys_and_guard_object_draws(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 42,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="part",
+            ib_hash="aaaaaaaa",
+            match_index_count=42,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="aaaaaaaa-42-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_42_0_part00",
+            match_first_index=0,
+        )
+        geometry = _geometry_record(
+            "aaaaaaaa",
+            42,
+            0,
+            6,
+            object_names=["body", "hair"],
+            object_draws=[
+                {"object_name": "body", "start_index": 0, "index_count": 3, "base_vertex": 0},
+                {
+                    "object_name": "hair",
+                    "start_index": 3,
+                    "index_count": 3,
+                    "base_vertex": 0,
+                    "toggle_group_id": "hair",
+                    "toggle_variable": "$bmc_toggle_hair",
+                    "toggle_value": 1,
+                    "toggle_condition": "$bmc_toggle_hair == 1",
+                },
+            ],
+        )
+        toggle_draw_sets = [
+            {
+                "toggle_id": "hair",
+                "label": "Hair",
+                "key": "ctrl F6",
+                "default_value": 0,
+                "values": [
+                    {"value": 0, "label": "Off", "objects": []},
+                    {"value": 1, "label": "On", "objects": ["hair"]},
+                ],
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [geometry],
+                toggle_draw_sets=toggle_draw_sets,
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertIn("[Constants]", ini_text)
+        self.assertIn("global persist $bmc_toggle_hair = 0", ini_text)
+        self.assertIn("[Key_BMC_Toggle_hair]", ini_text)
+        self.assertIn("key = ctrl F6", ini_text)
+        self.assertIn("$bmc_toggle_hair = 0,1", ini_text)
+        self.assertIn("if $bmc_toggle_hair == 1", ini_text)
+        self.assertIn("    drawindexedinstanced = 3,INSTANCE_COUNT,3,0,FIRST_INSTANCE", ini_text)
+
 
 def _read_uints(path: str) -> tuple[int, ...]:
     with open(path, "rb") as handle:

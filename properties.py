@@ -6,7 +6,12 @@ import os
 
 import bpy
 
-from .constants import BMC_GLOBAL_POOL_GENERATION_PROP, BMC_GLOBAL_SOURCE_KEY_PROP, BMC_TEXTURE_MARKS_PROP
+from .constants import (
+    BMC_GLOBAL_POOL_GENERATION_PROP,
+    BMC_GLOBAL_SOURCE_KEY_PROP,
+    BMC_TEXTURE_MARKS_PROP,
+    BMC_TOGGLE_DRAW_SETS_PROP,
+)
 from .core.io import read_json
 from .core.texture_marks import (
     build_texture_mark_payload,
@@ -78,6 +83,26 @@ class BMC_TextureMarkItem(bpy.types.PropertyGroup):
     rt_count: bpy.props.IntProperty(name="RT Count", default=-1, min=-1)
 
 
+class BMC_ToggleDrawObjectItem(bpy.types.PropertyGroup):
+    object_name: bpy.props.StringProperty(name="Object", default="")
+
+
+class BMC_ToggleDrawValueItem(bpy.types.PropertyGroup):
+    value: bpy.props.IntProperty(name="Value", default=0, min=0)
+    label: bpy.props.StringProperty(name="Label", default="")
+    objects: bpy.props.CollectionProperty(type=BMC_ToggleDrawObjectItem)
+
+
+class BMC_ToggleDrawSetItem(bpy.types.PropertyGroup):
+    enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+    toggle_id: bpy.props.StringProperty(name="ID", default="")
+    label: bpy.props.StringProperty(name="Label", default="")
+    key: bpy.props.StringProperty(name="Key", default="")
+    default_value: bpy.props.IntProperty(name="Default", default=0, min=0)
+    active_value_index: bpy.props.IntProperty(name="Value Index", default=0, min=0)
+    values: bpy.props.CollectionProperty(type=BMC_ToggleDrawValueItem)
+
+
 REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Object, "merge_ib_hash"),
     (bpy.types.Object, "merge_match_index_count"),
@@ -119,6 +144,8 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_texture_draw"),
     (bpy.types.Scene, "bmc_texture_mark_items"),
     (bpy.types.Scene, "bmc_texture_mark_index"),
+    (bpy.types.Scene, "bmc_toggle_draw_sets"),
+    (bpy.types.Scene, "bmc_toggle_draw_set_index"),
 )
 
 
@@ -429,6 +456,8 @@ def register_addon_properties():
     )
     bpy.types.Scene.bmc_texture_mark_items = bpy.props.CollectionProperty(type=BMC_TextureMarkItem)
     bpy.types.Scene.bmc_texture_mark_index = bpy.props.IntProperty(name="Texture Mark Index", default=0, min=0)
+    bpy.types.Scene.bmc_toggle_draw_sets = bpy.props.CollectionProperty(type=BMC_ToggleDrawSetItem)
+    bpy.types.Scene.bmc_toggle_draw_set_index = bpy.props.IntProperty(name="Toggle Draw Set Index", default=0, min=0)
 
 def unregister_addon_properties():
     for owner, attribute_name in REGISTERED_PROPERTY_PATHS:

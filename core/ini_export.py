@@ -14,6 +14,7 @@ from .io import ensure_directory, write_uint32_buffer
 from .models import LocalPaletteRecord
 from .texture_converter import write_game_texture
 from .texture_marks import marked_texture_bindings, validate_texture_hash
+from .toggle_draw_sets import normalize_toggle_draw_sets
 
 
 _SAFE_SUFFIX_RE = re.compile(r"[^0-9A-Za-z_]+")
@@ -40,6 +41,7 @@ def materialize_bonestore_runtime(
     local_palette_records: list[LocalPaletteRecord],
     geometry_records: list[dict] | None = None,
     texture_mark_payload: dict | None = None,
+    toggle_draw_sets: list[dict] | None = None,
     filter_residual: bool = True,
 ) -> dict:
     """Write static runtime buffers and return the normalized runtime plan."""
@@ -49,6 +51,7 @@ def materialize_bonestore_runtime(
     _remove_legacy_capture_bone_maps(buffer_dir)
 
     palette_records = _normalize_palette_records(normalized_output_dir, local_palette_records)
+    toggle_records = normalize_toggle_draw_sets(toggle_draw_sets or [])
     geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
     _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
     lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
@@ -116,6 +119,7 @@ def materialize_bonestore_runtime(
         "palettes": palette_records,
         "geometry": geometry_payloads,
         "textures": texture_records,
+        "toggle_draw_sets": toggle_records,
         "texture_warnings": texture_warnings,
         "shadow_stage": _normalize_shadow_stage(capture_manifest),
         "shadow_replay_plan": shadow_replay_plan,
@@ -148,6 +152,9 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
         ]
     )
     lines.extend(_constants_sections(runtime_plan))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_toggle_control_sections(runtime_plan))
     if lines and lines[-1] != "":
         lines.append("")
     lines.extend(_shader_override_sections(runtime_plan))
@@ -650,16 +657,25 @@ def _normalize_object_draws(record: dict, index_count: int) -> list[dict]:
         if start_index < 0 or start_index >= int(index_count):
             continue
         count = min(count, int(index_count) - start_index)
-        draws.append(
-            {
-                "object_name": str(draw.get("object_name", "") or ""),
-                "start_index": start_index,
-                "index_count": count,
-                "base_vertex": int(draw.get("base_vertex", 0) or 0),
-                "start_vertex": int(draw.get("start_vertex", 0) or 0),
-                "vertex_count": int(draw.get("vertex_count", 0) or 0),
-            }
-        )
+        normalized_draw = {
+            "object_name": str(draw.get("object_name", "") or ""),
+            "start_index": start_index,
+            "index_count": count,
+            "base_vertex": int(draw.get("base_vertex", 0) or 0),
+            "start_vertex": int(draw.get("start_vertex", 0) or 0),
+            "vertex_count": int(draw.get("vertex_count", 0) or 0),
+        }
+        for field_name in (
+            "toggle_group_id",
+            "toggle_label",
+            "toggle_variable",
+            "toggle_value",
+            "toggle_value_label",
+            "toggle_condition",
+        ):
+            if field_name in draw:
+                normalized_draw[field_name] = draw.get(field_name)
+        draws.append(normalized_draw)
     return draws
 
 
@@ -1654,7 +1670,54 @@ def _capture_unavailable_source_details(unavailable_by_global: dict[int, dict], 
 
 
 def _constants_sections(runtime_plan: dict) -> list[str]:
-    return []
+    toggle_groups = _runtime_toggle_draw_sets(runtime_plan)
+    if not toggle_groups:
+        return []
+    lines = ["[Constants]"]
+    for group in toggle_groups:
+        variable = str(group.get("variable", "") or "")
+        if not variable:
+            continue
+        lines.append(f"global persist {variable} = {int(group.get('default_value', 0) or 0)}")
+    return lines if len(lines) > 1 else []
+
+
+def _toggle_control_sections(runtime_plan: dict) -> list[str]:
+    toggle_groups = _runtime_toggle_draw_sets(runtime_plan)
+    if not toggle_groups:
+        return []
+    lines: list[str] = [
+        "; -------------------------------------------------",
+        "; Toggle draw sets",
+        "; -------------------------------------------------",
+    ]
+    for group in toggle_groups:
+        key = str(group.get("key", "") or "").strip()
+        variable = str(group.get("variable", "") or "").strip()
+        if not key or not variable:
+            continue
+        values = sorted({int(value.get("value", 0) or 0) for value in group.get("values", []) or []})
+        if not values:
+            continue
+        label = str(group.get("label", "") or group.get("id", "") or "Toggle").replace("\n", " ").replace("\r", " ")
+        section_suffix = _safe_suffix(f"BMC_Toggle_{group.get('id', label)}")
+        lines.extend(
+            [
+                f"; {label}",
+                f"[Key_{section_suffix}]",
+                f"key = {key}",
+                "type = cycle",
+                f"{variable} = " + ",".join(str(value) for value in values),
+                "",
+            ]
+        )
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines if len(lines) > 3 else []
+
+
+def _runtime_toggle_draw_sets(runtime_plan: dict) -> list[dict]:
+    return normalize_toggle_draw_sets(runtime_plan.get("toggle_draw_sets", []) or [])
 
 
 def _shader_override_sections(runtime_plan: dict) -> list[str]:
@@ -2342,14 +2405,40 @@ def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
     if vb0:
         lines.append(f"{indent}vb3 = {vb0.get('resource_name')}")
     for draw in _draw_ranges_for_record(record):
-        object_comment = _draw_object_comment(draw, record)
-        if object_comment:
-            lines.append(f"{indent}; Blender objects: {object_comment}")
-        index_count = int(draw.get("index_count", 0) or 0)
-        start_index = int(draw.get("start_index", 0) or 0)
-        base_vertex = int(draw.get("base_vertex", 0) or 0)
-        lines.append(f"{indent}drawindexedinstanced = {index_count},INSTANCE_COUNT,{start_index},{base_vertex},FIRST_INSTANCE")
+        condition = _draw_toggle_condition(draw)
+        if condition:
+            lines.append(f"{indent}if {condition}")
+            lines.extend(_drawindexed_lines(draw, record, indent=f"{indent}  "))
+            lines.append(f"{indent}endif")
+        else:
+            lines.extend(_drawindexed_lines(draw, record, indent=indent))
     return lines
+
+
+def _drawindexed_lines(draw: dict, record: dict, *, indent: str) -> list[str]:
+    lines: list[str] = []
+    object_comment = _draw_object_comment(draw, record)
+    if object_comment:
+        lines.append(f"{indent}; Blender objects: {object_comment}")
+    index_count = int(draw.get("index_count", 0) or 0)
+    start_index = int(draw.get("start_index", 0) or 0)
+    base_vertex = int(draw.get("base_vertex", 0) or 0)
+    lines.append(f"{indent}drawindexedinstanced = {index_count},INSTANCE_COUNT,{start_index},{base_vertex},FIRST_INSTANCE")
+    return lines
+
+
+def _draw_toggle_condition(draw: dict) -> str:
+    condition = str(draw.get("toggle_condition", "") or "").strip()
+    if condition:
+        return condition
+    variable = str(draw.get("toggle_variable", "") or "").strip()
+    if not variable:
+        return ""
+    try:
+        value = int(draw.get("toggle_value", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return f"{variable} == {value}"
 
 
 def _draw_ranges_for_record(record: dict) -> list[dict]:

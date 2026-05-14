@@ -14,6 +14,7 @@ from .constants import (
     BMC_GLOBAL_REMAP_PROP,
     BMC_GLOBAL_SOURCE_KEY_PROP,
     BMC_TEXTURE_SLOTS_PROP,
+    BMC_TOGGLE_DRAW_SETS_PROP,
     BMC_VERTEX_GROUP_STATE_PROP,
 )
 from .core.blender_ops import (
@@ -43,9 +44,47 @@ from .core.texture_marks import (
     validate_texture_hash,
 )
 from .core.texture_materials import apply_material_from_texture_bindings
+from .core.toggle_draw_sets import normalize_key_binding
 
 DEFAULT_EXPORT_COLLECTION_NAME = "BMC Export Sources"
 _EXPORT_REGION_NAME_RE = re.compile(r"(?P<hash>[0-9A-Fa-f]{8})[-_](?P<count>\d+)[-_](?P<first>\d+)")
+_KEY_EVENT_ALIASES = {
+    "ZERO": "0",
+    "ONE": "1",
+    "TWO": "2",
+    "THREE": "3",
+    "FOUR": "4",
+    "FIVE": "5",
+    "SIX": "6",
+    "SEVEN": "7",
+    "EIGHT": "8",
+    "NINE": "9",
+    "NUMPAD_0": "NUMPAD0",
+    "NUMPAD_1": "NUMPAD1",
+    "NUMPAD_2": "NUMPAD2",
+    "NUMPAD_3": "NUMPAD3",
+    "NUMPAD_4": "NUMPAD4",
+    "NUMPAD_5": "NUMPAD5",
+    "NUMPAD_6": "NUMPAD6",
+    "NUMPAD_7": "NUMPAD7",
+    "NUMPAD_8": "NUMPAD8",
+    "NUMPAD_9": "NUMPAD9",
+    "RET": "ENTER",
+    "SPACE": "SPACE",
+    "TAB": "TAB",
+    "MINUS": "MINUS",
+    "EQUAL": "EQUAL",
+    "LEFT_BRACKET": "LEFT_BRACKET",
+    "RIGHT_BRACKET": "RIGHT_BRACKET",
+    "SEMI_COLON": "SEMICOLON",
+    "QUOTE": "QUOTE",
+    "COMMA": "COMMA",
+    "PERIOD": "PERIOD",
+    "SLASH": "SLASH",
+    "BACK_SLASH": "BACKSLASH",
+    "ACCENT_GRAVE": "GRAVE",
+}
+_MODIFIER_EVENT_TYPES = {"LEFT_SHIFT", "RIGHT_SHIFT", "LEFT_CTRL", "RIGHT_CTRL", "LEFT_ALT", "RIGHT_ALT", "OSKEY"}
 
 
 
@@ -484,6 +523,115 @@ def _iter_collection_objects_recursive(collection):
         yield mesh_obj
     for child in collection.children:
         yield from _iter_collection_objects_recursive(child)
+
+
+def _toggle_payloads_from_scene(scene) -> list[dict]:
+    payloads: list[dict] = []
+    for toggle in getattr(scene, "bmc_toggle_draw_sets", []) or []:
+        values = []
+        for value_item in getattr(toggle, "values", []) or []:
+            values.append(
+                {
+                    "value": int(getattr(value_item, "value", 0) or 0),
+                    "label": str(getattr(value_item, "label", "") or ""),
+                    "objects": [
+                        {"object_name": str(getattr(object_item, "object_name", "") or "")}
+                        for object_item in getattr(value_item, "objects", []) or []
+                    ],
+                }
+            )
+        payloads.append(
+            {
+                "enabled": bool(getattr(toggle, "enabled", True)),
+                "toggle_id": str(getattr(toggle, "toggle_id", "") or ""),
+                "label": str(getattr(toggle, "label", "") or ""),
+                "key": str(getattr(toggle, "key", "") or ""),
+                "default_value": int(getattr(toggle, "default_value", 0) or 0),
+                "values": values,
+            }
+        )
+    return payloads
+
+
+def _sync_toggle_draw_sets_to_collection(scene) -> None:
+    payloads = _toggle_payloads_from_scene(scene)
+    collection = getattr(scene, "bmc_export_collection", None)
+    if collection is not None:
+        collection[BMC_TOGGLE_DRAW_SETS_PROP] = json.dumps(payloads, ensure_ascii=True, separators=(",", ":"))
+
+
+def _active_toggle(scene):
+    toggles = getattr(scene, "bmc_toggle_draw_sets", None)
+    if not toggles:
+        return None
+    index = int(getattr(scene, "bmc_toggle_draw_set_index", 0) or 0)
+    if index < 0 or index >= len(toggles):
+        return None
+    return toggles[index]
+
+
+def _active_toggle_value(toggle):
+    if toggle is None or not getattr(toggle, "values", None):
+        return None
+    index = int(getattr(toggle, "active_value_index", 0) or 0)
+    if index < 0 or index >= len(toggle.values):
+        return None
+    return toggle.values[index]
+
+
+def _next_toggle_id(scene) -> str:
+    used = {str(getattr(item, "toggle_id", "") or "").strip() for item in getattr(scene, "bmc_toggle_draw_sets", []) or []}
+    index = 1
+    while f"toggle_{index}" in used:
+        index += 1
+    return f"toggle_{index}"
+
+
+def _next_toggle_value(toggle) -> int:
+    used = {int(getattr(item, "value", 0) or 0) for item in getattr(toggle, "values", []) or []}
+    value = 0
+    while value in used:
+        value += 1
+    return value
+
+
+def _remove_object_from_all_toggle_values(scene, object_name: str) -> None:
+    object_name = str(object_name or "")
+    if not object_name:
+        return
+    for toggle in getattr(scene, "bmc_toggle_draw_sets", []) or []:
+        for value_item in getattr(toggle, "values", []) or []:
+            for index in reversed(range(len(value_item.objects))):
+                if value_item.objects[index].object_name == object_name:
+                    value_item.objects.remove(index)
+
+
+def _add_object_name_to_toggle_value(value_item, object_name: str) -> bool:
+    object_name = str(object_name or "")
+    if not object_name:
+        return False
+    for existing in value_item.objects:
+        if existing.object_name == object_name:
+            return False
+    object_item = value_item.objects.add()
+    object_item.object_name = object_name
+    return True
+
+
+def _event_to_key_binding(event) -> str:
+    event_type = str(getattr(event, "type", "") or "")
+    if not event_type or event_type in _MODIFIER_EVENT_TYPES:
+        return ""
+    key = _KEY_EVENT_ALIASES.get(event_type, event_type)
+    tokens: list[str] = []
+    if bool(getattr(event, "ctrl", False)):
+        tokens.append("ctrl")
+    if bool(getattr(event, "shift", False)):
+        tokens.append("shift")
+    if bool(getattr(event, "alt", False)):
+        tokens.append("alt")
+    tokens.append(key)
+    return normalize_key_binding(" ".join(tokens))
 
 
 def _object_candidate_identity(mesh_obj) -> tuple[str, int, int] | None:
@@ -1157,6 +1305,244 @@ def _identity_resolver_from_entries(mesh_objects: list[object], selected_entries
 
 
 
+
+
+class BMC_OT_toggle_draw_set_add(bpy.types.Operator):
+    bl_idname = "object.bmc_toggle_draw_set_add"
+    bl_label = "Add Toggle Draw Set"
+    bl_description = "Create a key-controlled draw set. Objects assigned to a value draw only when that value is active"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        toggle = scene.bmc_toggle_draw_sets.add()
+        toggle_id = _next_toggle_id(scene)
+        toggle.enabled = True
+        toggle.toggle_id = toggle_id
+        toggle.label = toggle_id.replace("_", " ").title()
+        toggle.key = ""
+        toggle.default_value = 0
+        value_item = toggle.values.add()
+        value_item.value = 0
+        value_item.label = "Value 0"
+        toggle.active_value_index = 0
+        scene.bmc_toggle_draw_set_index = len(scene.bmc_toggle_draw_sets) - 1
+        _sync_toggle_draw_sets_to_collection(scene)
+        return {"FINISHED"}
+
+
+class BMC_OT_toggle_draw_set_remove(bpy.types.Operator):
+    bl_idname = "object.bmc_toggle_draw_set_remove"
+    bl_label = "Remove Toggle Draw Set"
+    bl_description = "Remove the active key-controlled draw set"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(getattr(context.scene, "bmc_toggle_draw_sets", None))
+
+    def execute(self, context):
+        scene = context.scene
+        index = int(getattr(scene, "bmc_toggle_draw_set_index", 0) or 0)
+        if index < 0 or index >= len(scene.bmc_toggle_draw_sets):
+            return {"CANCELLED"}
+        scene.bmc_toggle_draw_sets.remove(index)
+        scene.bmc_toggle_draw_set_index = min(index, max(0, len(scene.bmc_toggle_draw_sets) - 1))
+        _sync_toggle_draw_sets_to_collection(scene)
+        return {"FINISHED"}
+
+
+class BMC_OT_toggle_draw_value_add(bpy.types.Operator):
+    bl_idname = "object.bmc_toggle_draw_value_add"
+    bl_label = "Add Toggle Value"
+    bl_description = "Add a value slot to the active toggle draw set"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return _active_toggle(context.scene) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        toggle = _active_toggle(scene)
+        if toggle is None:
+            return {"CANCELLED"}
+        value_number = _next_toggle_value(toggle)
+        value_item = toggle.values.add()
+        value_item.value = value_number
+        value_item.label = f"Value {value_number}"
+        toggle.active_value_index = len(toggle.values) - 1
+        _sync_toggle_draw_sets_to_collection(scene)
+        return {"FINISHED"}
+
+
+class BMC_OT_toggle_draw_value_remove(bpy.types.Operator):
+    bl_idname = "object.bmc_toggle_draw_value_remove"
+    bl_label = "Remove Toggle Value"
+    bl_description = "Remove a value slot from the active toggle draw set"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(default=-1)
+    value_index: bpy.props.IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        return _active_toggle(context.scene) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        group_index = int(self.group_index)
+        if group_index < 0:
+            group_index = int(getattr(scene, "bmc_toggle_draw_set_index", 0) or 0)
+        if group_index < 0 or group_index >= len(scene.bmc_toggle_draw_sets):
+            return {"CANCELLED"}
+        toggle = scene.bmc_toggle_draw_sets[group_index]
+        value_index = int(self.value_index)
+        if value_index < 0:
+            value_index = int(getattr(toggle, "active_value_index", 0) or 0)
+        if value_index < 0 or value_index >= len(toggle.values):
+            return {"CANCELLED"}
+        toggle.values.remove(value_index)
+        if not toggle.values:
+            value_item = toggle.values.add()
+            value_item.value = 0
+            value_item.label = "Value 0"
+        toggle.active_value_index = min(value_index, max(0, len(toggle.values) - 1))
+        valid_values = {int(item.value) for item in toggle.values}
+        if int(toggle.default_value) not in valid_values:
+            toggle.default_value = int(toggle.values[0].value)
+        _sync_toggle_draw_sets_to_collection(scene)
+        return {"FINISHED"}
+
+
+class BMC_OT_toggle_draw_value_add_selected(bpy.types.Operator):
+    bl_idname = "object.bmc_toggle_draw_value_add_selected"
+    bl_label = "Add Selected To Toggle Value"
+    bl_description = "Assign selected mesh objects to this toggle value. Existing toggle assignments for those objects are replaced"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(default=-1)
+    value_index: bpy.props.IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_selected_mesh_objects(context))
+
+    def execute(self, context):
+        scene = context.scene
+        group_index = int(self.group_index)
+        value_index = int(self.value_index)
+        if group_index < 0 or group_index >= len(scene.bmc_toggle_draw_sets):
+            return {"CANCELLED"}
+        toggle = scene.bmc_toggle_draw_sets[group_index]
+        if value_index < 0 or value_index >= len(toggle.values):
+            return {"CANCELLED"}
+        value_item = toggle.values[value_index]
+        added = 0
+        for mesh_obj in _selected_mesh_objects(context):
+            _remove_object_from_all_toggle_values(scene, mesh_obj.name)
+            if _add_object_name_to_toggle_value(value_item, mesh_obj.name):
+                added += 1
+        _sync_toggle_draw_sets_to_collection(scene)
+        self.report({"INFO"}, f"Assigned {added} selected object(s)")
+        return {"FINISHED"}
+
+
+class BMC_OT_toggle_draw_value_remove_selected(bpy.types.Operator):
+    bl_idname = "object.bmc_toggle_draw_value_remove_selected"
+    bl_label = "Remove Selected From Toggle Value"
+    bl_description = "Remove selected mesh objects from this toggle value"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(default=-1)
+    value_index: bpy.props.IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_selected_mesh_objects(context))
+
+    def execute(self, context):
+        scene = context.scene
+        group_index = int(self.group_index)
+        value_index = int(self.value_index)
+        if group_index < 0 or group_index >= len(scene.bmc_toggle_draw_sets):
+            return {"CANCELLED"}
+        toggle = scene.bmc_toggle_draw_sets[group_index]
+        if value_index < 0 or value_index >= len(toggle.values):
+            return {"CANCELLED"}
+        selected_names = {mesh_obj.name for mesh_obj in _selected_mesh_objects(context)}
+        value_item = toggle.values[value_index]
+        removed = 0
+        for index in reversed(range(len(value_item.objects))):
+            if value_item.objects[index].object_name in selected_names:
+                value_item.objects.remove(index)
+                removed += 1
+        _sync_toggle_draw_sets_to_collection(scene)
+        self.report({"INFO"}, f"Removed {removed} selected object(s)")
+        return {"FINISHED"}
+
+
+class BMC_OT_toggle_draw_value_select_objects(bpy.types.Operator):
+    bl_idname = "object.bmc_toggle_draw_value_select_objects"
+    bl_label = "Select Toggle Value Objects"
+    bl_description = "Select Blender objects assigned to this toggle value"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(default=-1)
+    value_index: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        group_index = int(self.group_index)
+        value_index = int(self.value_index)
+        if group_index < 0 or group_index >= len(scene.bmc_toggle_draw_sets):
+            return {"CANCELLED"}
+        toggle = scene.bmc_toggle_draw_sets[group_index]
+        if value_index < 0 or value_index >= len(toggle.values):
+            return {"CANCELLED"}
+        names = {item.object_name for item in toggle.values[value_index].objects if item.object_name}
+        selected_count = 0
+        active_obj = None
+        for obj in context.scene.objects:
+            should_select = obj.name in names
+            obj.select_set(should_select)
+            if should_select:
+                selected_count += 1
+                active_obj = active_obj or obj
+        if active_obj is not None:
+            context.view_layer.objects.active = active_obj
+        self.report({"INFO"}, f"Selected {selected_count} object(s)")
+        return {"FINISHED"}
+
+
+class BMC_OT_toggle_draw_set_record_key(bpy.types.Operator):
+    bl_idname = "object.bmc_toggle_draw_set_record_key"
+    bl_label = "Record Toggle Key"
+    bl_description = "Press a key or key combination to assign it to the active toggle draw set"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(default=-1)
+
+    def invoke(self, context, _event):
+        if self.group_index < 0 or self.group_index >= len(context.scene.bmc_toggle_draw_sets):
+            return {"CANCELLED"}
+        context.window_manager.modal_handler_add(self)
+        self.report({"INFO"}, "Press a key for this toggle; Esc cancels")
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            return {"CANCELLED"}
+        if event.value != "PRESS":
+            return {"RUNNING_MODAL"}
+        key_binding = _event_to_key_binding(event)
+        if not key_binding:
+            return {"RUNNING_MODAL"}
+        toggle = context.scene.bmc_toggle_draw_sets[int(self.group_index)]
+        toggle.key = key_binding
+        _sync_toggle_draw_sets_to_collection(context.scene)
+        self.report({"INFO"}, f"Recorded key: {key_binding}")
+        return {"FINISHED"}
 
 
 class BMC_OT_create_export_collection(bpy.types.Operator):

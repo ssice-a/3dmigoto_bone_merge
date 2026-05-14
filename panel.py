@@ -145,6 +145,20 @@ class BMC_UL_texture_mark_items(bpy.types.UIList):
             layout.label(text=item.hash_value[:8] or "?")
 
 
+class BMC_UL_toggle_draw_sets(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            label = item.label or item.toggle_id or "(toggle)"
+            row.label(text=label, icon="DRIVER")
+            row.label(text=item.key or "no key")
+            row.label(text=f"{len(item.values)} value(s)")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=item.label[:3] or "?")
+
+
 class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -239,6 +253,83 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         export_box.prop(scene, "bmc_filter_residual", text="过滤残影")
         export_box.prop(scene, "bmc_export_mode", text="")
         export_box.operator("object.bmc_prepare_export_collection", icon="EXPORT", text="Export")
+
+
+class VIEW3D_PT_bone_merge_toggle_draw_sets(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Bone Merge Capture"
+    bl_label = "Toggle Draw Sets"
+    bl_parent_id = "VIEW3D_PT_bone_merge_capture"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        if not _has_scene_props(scene, "bmc_toggle_draw_sets", "bmc_toggle_draw_set_index"):
+            layout.label(text="Toggle properties are not registered.", icon="ERROR")
+            return
+
+        row = layout.row()
+        row.template_list(
+            "BMC_UL_toggle_draw_sets",
+            "",
+            scene,
+            "bmc_toggle_draw_sets",
+            scene,
+            "bmc_toggle_draw_set_index",
+            rows=3,
+        )
+        buttons = row.column(align=True)
+        buttons.operator("object.bmc_toggle_draw_set_add", icon="ADD", text="")
+        buttons.operator("object.bmc_toggle_draw_set_remove", icon="REMOVE", text="")
+
+        if not scene.bmc_toggle_draw_sets:
+            layout.label(text="Objects not assigned here always draw.", icon="INFO")
+            return
+        group_index = min(int(scene.bmc_toggle_draw_set_index), len(scene.bmc_toggle_draw_sets) - 1)
+        toggle = scene.bmc_toggle_draw_sets[group_index]
+
+        detail = layout.box()
+        top = detail.row(align=True)
+        top.prop(toggle, "enabled", text="")
+        top.prop(toggle, "label", text="Label")
+        detail.prop(toggle, "toggle_id", text="ID")
+        key_row = detail.row(align=True)
+        key_row.prop(toggle, "key", text="Key")
+        op = key_row.operator("object.bmc_toggle_draw_set_record_key", icon="REC", text="Record")
+        op.group_index = group_index
+        detail.prop(toggle, "default_value", text="Default Value")
+
+        value_header = detail.row(align=True)
+        value_header.label(text="Values", icon="DOT")
+        value_header.operator("object.bmc_toggle_draw_value_add", icon="ADD", text="")
+        for value_index, value_item in enumerate(toggle.values):
+            value_box = detail.box()
+            value_row = value_box.row(align=True)
+            value_row.prop(value_item, "value", text="Value")
+            value_row.prop(value_item, "label", text="Label")
+            remove_op = value_row.operator("object.bmc_toggle_draw_value_remove", icon="REMOVE", text="")
+            remove_op.group_index = group_index
+            remove_op.value_index = value_index
+
+            objects = [item.object_name for item in value_item.objects if item.object_name]
+            value_box.label(text=f"Draws {len(objects)} object(s)")
+            for object_name in objects[:6]:
+                value_box.label(text=object_name, icon="MESH_DATA")
+            if len(objects) > 6:
+                value_box.label(text=f"... {len(objects) - 6} more")
+
+            actions = value_box.row(align=True)
+            add_op = actions.operator("object.bmc_toggle_draw_value_add_selected", icon="ADD", text="Add Selected")
+            add_op.group_index = group_index
+            add_op.value_index = value_index
+            remove_selected_op = actions.operator("object.bmc_toggle_draw_value_remove_selected", icon="REMOVE", text="Remove Selected")
+            remove_selected_op.group_index = group_index
+            remove_selected_op.value_index = value_index
+            select_op = actions.operator("object.bmc_toggle_draw_value_select_objects", icon="RESTRICT_SELECT_OFF", text="Select Objects")
+            select_op.group_index = group_index
+            select_op.value_index = value_index
 
 
 class VIEW3D_PT_bone_merge_texture_tools(bpy.types.Panel):

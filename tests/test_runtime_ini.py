@@ -1904,8 +1904,8 @@ class RuntimeIniTests(unittest.TestCase):
             "aaaaaaaa",
             42,
             0,
-            6,
-            object_names=["body", "hair"],
+            9,
+            object_names=["body", "hair", "ribbon"],
             object_draws=[
                 {"object_name": "body", "start_index": 0, "index_count": 3, "base_vertex": 0},
                 {"object_name": "hair", "start_index": 3, "index_count": 3, "base_vertex": 0},
@@ -1953,13 +1953,23 @@ class RuntimeIniTests(unittest.TestCase):
             "aaaaaaaa",
             42,
             0,
-            6,
-            object_names=["body", "hair"],
+            9,
+            object_names=["body", "hair", "ribbon"],
             object_draws=[
                 {"object_name": "body", "start_index": 0, "index_count": 3, "base_vertex": 0},
                 {
                     "object_name": "hair",
                     "start_index": 3,
+                    "index_count": 3,
+                    "base_vertex": 0,
+                    "toggle_group_id": "hair",
+                    "toggle_variable": "$bmc_toggle_hair",
+                    "toggle_value": 1,
+                    "toggle_condition": "$bmc_toggle_hair == 1",
+                },
+                {
+                    "object_name": "ribbon",
+                    "start_index": 6,
                     "index_count": 3,
                     "base_vertex": 0,
                     "toggle_group_id": "hair",
@@ -1997,8 +2007,87 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("[Key_BMC_Toggle_hair]", ini_text)
         self.assertIn("key = ctrl F6", ini_text)
         self.assertIn("$bmc_toggle_hair = 0,1", ini_text)
-        self.assertIn("if $bmc_toggle_hair == 1", ini_text)
+        self.assertEqual(1, ini_text.count("if $bmc_toggle_hair == 1"))
         self.assertIn("    drawindexedinstanced = 3,INSTANCE_COUNT,3,0,FIRST_INSTANCE", ini_text)
+        self.assertIn("    drawindexedinstanced = 3,INSTANCE_COUNT,6,0,FIRST_INSTANCE", ini_text)
+
+    def test_toggle_shadow_replay_suppresses_raw_caller_shadow(self):
+        manifest = {
+            "shadow_stage": {
+                "shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"],
+                "host_ib_hash": "bbbbbbbb",
+                "host_match_first_index": 5,
+                "host_match_index_count": 20,
+            },
+            "bone_pool_order": [
+                {
+                    "ib_hash": "aaaaaaaa",
+                    "match_first_index": 0,
+                    "match_index_count": 10,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 10,
+                    "ib_hash": "aaaaaaaa",
+                    "first_index": 0,
+                    "index_count": 10,
+                    "pass_role": "normal_shadow",
+                },
+                {
+                    "draw_index": 99,
+                    "ib_hash": "bbbbbbbb",
+                    "first_index": 5,
+                    "index_count": 20,
+                    "pass_role": "normal_shadow",
+                },
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="part",
+            ib_hash="aaaaaaaa",
+            match_index_count=10,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="aaaaaaaa-10-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="aaaaaaaa_10_0_part00",
+            match_first_index=0,
+        )
+        geometry = _geometry_record(
+            "aaaaaaaa",
+            10,
+            0,
+            3,
+            object_names=["hair"],
+            object_draws=[
+                {
+                    "object_name": "hair",
+                    "start_index": 0,
+                    "index_count": 3,
+                    "base_vertex": 0,
+                    "toggle_condition": "$bmc_toggle_hair == 1",
+                }
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette], [geometry])
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertTrue(runtime["shadow_replay_plan"]["preserve_host_draw"])
+        host_section = ini_text[
+            ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_5]") :
+            ini_text.index("[Present]")
+        ]
+        self.assertNotIn("  draw = from_caller", host_section)
+        self.assertIn("if vs == 200\n  handling = skip", host_section)
+        self.assertIn("if $bmc_toggle_hair == 1", host_section)
 
 
 def _read_uints(path: str) -> tuple[int, ...]:

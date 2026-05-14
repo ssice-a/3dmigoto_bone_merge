@@ -14,6 +14,38 @@ _MODIFIER_ALIASES = {
     "ALT": "alt",
     "SHIFT": "shift",
     "NO_MODIFIERS": "no_modifiers",
+    "UP": "VK_UP",
+    "UP_ARROW": "VK_UP",
+    "ARROW_UP": "VK_UP",
+    "DOWN": "VK_DOWN",
+    "DOWN_ARROW": "VK_DOWN",
+    "ARROW_DOWN": "VK_DOWN",
+    "LEFT": "VK_LEFT",
+    "LEFT_ARROW": "VK_LEFT",
+    "ARROW_LEFT": "VK_LEFT",
+    "RIGHT": "VK_RIGHT",
+    "RIGHT_ARROW": "VK_RIGHT",
+    "ARROW_RIGHT": "VK_RIGHT",
+    "NUMPAD0": "VK_NUMPAD0",
+    "NUMPAD_0": "VK_NUMPAD0",
+    "NUMPAD1": "VK_NUMPAD1",
+    "NUMPAD_1": "VK_NUMPAD1",
+    "NUMPAD2": "VK_NUMPAD2",
+    "NUMPAD_2": "VK_NUMPAD2",
+    "NUMPAD3": "VK_NUMPAD3",
+    "NUMPAD_3": "VK_NUMPAD3",
+    "NUMPAD4": "VK_NUMPAD4",
+    "NUMPAD_4": "VK_NUMPAD4",
+    "NUMPAD5": "VK_NUMPAD5",
+    "NUMPAD_5": "VK_NUMPAD5",
+    "NUMPAD6": "VK_NUMPAD6",
+    "NUMPAD_6": "VK_NUMPAD6",
+    "NUMPAD7": "VK_NUMPAD7",
+    "NUMPAD_7": "VK_NUMPAD7",
+    "NUMPAD8": "VK_NUMPAD8",
+    "NUMPAD_8": "VK_NUMPAD8",
+    "NUMPAD9": "VK_NUMPAD9",
+    "NUMPAD_9": "VK_NUMPAD9",
 }
 
 
@@ -106,7 +138,7 @@ def apply_toggle_draw_sets_to_geometry(geometry_records: list[dict], toggle_grou
 
 
 def _object_toggle_lookup(toggle_groups: list[dict]) -> dict[str, dict]:
-    lookup: dict[str, dict] = {}
+    grouped_lookup: dict[str, dict[str, dict]] = {}
     for group in toggle_groups or []:
         group_id = str(group.get("id", "") or "")
         variable = str(group.get("variable", "") or "")
@@ -120,20 +152,43 @@ def _object_toggle_lookup(toggle_groups: list[dict]) -> dict[str, dict]:
                 object_name = str(object_name or "")
                 if not object_name:
                     continue
-                if object_name in lookup:
-                    previous = lookup[object_name]
-                    raise ValueError(
-                        f"{object_name}: object is assigned to multiple toggle values "
-                        f"({previous.get('toggle_label')}={previous.get('toggle_value')} and {group_label}={value_number})"
-                    )
-                lookup[object_name] = {
-                    "toggle_group_id": group_id,
-                    "toggle_label": group_label,
-                    "toggle_variable": variable,
-                    "toggle_value": value_number,
-                    "toggle_value_label": value_label,
-                    "toggle_condition": f"{variable} == {value_number}",
-                }
+                group_lookup = grouped_lookup.setdefault(object_name, {})
+                assignment = group_lookup.setdefault(
+                    group_id,
+                    {
+                        "toggle_group_id": group_id,
+                        "toggle_label": group_label,
+                        "toggle_variable": variable,
+                        "values": {},
+                    },
+                )
+                assignment["values"][value_number] = value_label
+
+    lookup: dict[str, dict] = {}
+    for object_name, group_assignments in grouped_lookup.items():
+        group_conditions: list[str] = []
+        group_labels: list[str] = []
+        for assignment in group_assignments.values():
+            variable = str(assignment.get("toggle_variable", "") or "")
+            values_by_number = dict(assignment.get("values", {}) or {})
+            value_numbers = sorted(int(value_number) for value_number in values_by_number)
+            if not variable or not value_numbers:
+                continue
+            if len(value_numbers) == 1:
+                group_conditions.append(f"{variable} == {value_numbers[0]}")
+            else:
+                group_conditions.append("(" + " || ".join(f"{variable} == {value_number}" for value_number in value_numbers) + ")")
+            group_labels.append(str(assignment.get("toggle_label", "") or assignment.get("toggle_group_id", "")))
+        if not group_conditions:
+            continue
+        lookup[object_name] = {
+            "toggle_group_id": ",".join(str(assignment.get("toggle_group_id", "")) for assignment in group_assignments.values()),
+            "toggle_label": ",".join(label for label in group_labels if label),
+            "toggle_variable": "",
+            "toggle_value": "",
+            "toggle_value_label": "",
+            "toggle_condition": " && ".join(group_conditions),
+        }
     return lookup
 
 

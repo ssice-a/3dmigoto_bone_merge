@@ -44,7 +44,7 @@ class ToggleDrawSetTests(unittest.TestCase):
         self.assertNotIn("toggle_condition", body)
         self.assertEqual("$bmc_toggle_style == 0", hair["toggle_condition"])
 
-    def test_rejects_object_assigned_to_multiple_toggle_values(self):
+    def test_allows_object_assigned_to_multiple_toggle_values(self):
         groups = toggle_draw_sets.normalize_toggle_draw_sets(
             [
                 {
@@ -56,9 +56,23 @@ class ToggleDrawSetTests(unittest.TestCase):
                 }
             ]
         )
+        geometry = [
+            {
+                "object_draws": [
+                    {"object_name": "hair", "start_index": 0, "index_count": 3},
+                ],
+            }
+        ]
 
-        with self.assertRaises(ValueError):
-            toggle_draw_sets.apply_toggle_draw_sets_to_geometry([], groups)
+        updated, warnings = toggle_draw_sets.apply_toggle_draw_sets_to_geometry(geometry, groups)
+
+        self.assertEqual([], warnings)
+        self.assertEqual("($bmc_toggle_style == 0 || $bmc_toggle_style == 1)", updated[0]["object_draws"][0]["toggle_condition"])
+
+    def test_normalizes_blender_arrow_and_numpad_key_names(self):
+        self.assertEqual("VK_UP", toggle_draw_sets.normalize_key_binding("UP_ARROW"))
+        self.assertEqual("VK_NUMPAD8", toggle_draw_sets.normalize_key_binding("NUMPAD_8"))
+        self.assertEqual("ctrl VK_UP", toggle_draw_sets.normalize_key_binding("CTRL+UP_ARROW"))
 
 
 if __name__ == "__main__":

@@ -2222,7 +2222,8 @@ def _shadow_lines_for_profile(
     indent: str,
 ) -> list[str]:
     lines: list[str] = []
-    if key in skip_keys:
+    host_has_toggle_replay = any(_shadow_plan_has_toggle_replay(plan, parts_by_suffix) for plan in host_plans or [])
+    if key in skip_keys or host_has_toggle_replay:
         lines.append(f"{indent}handling = skip")
     for plan in host_plans or []:
         lines.extend(_shadow_host_replay_lines(plan, parts_by_suffix, indent=indent))
@@ -2369,7 +2370,7 @@ def _shadow_host_replay_lines(shadow_plan: dict, parts_by_suffix: dict[str, dict
         for suffix in shadow_plan.get("normal_parts", []) or []
         if suffix in parts_by_suffix
     ]
-    if _shadow_plan_preserves_host_draw(shadow_plan):
+    if _shadow_plan_preserves_host_draw(shadow_plan) and not _shadow_replay_has_toggle_draws(transparent_parts, normal_parts):
         lines.append(f"{indent}draw = from_caller")
     if transparent_parts:
         lines.append(f"{indent}; delayed transparent shadow replay")
@@ -2381,6 +2382,30 @@ def _shadow_host_replay_lines(shadow_plan: dict, parts_by_suffix: dict[str, dict
         for record in normal_parts:
             lines.extend(_replay_part_lines(record, indent=indent))
     return lines
+
+
+def _shadow_replay_has_toggle_draws(transparent_parts: list[dict], normal_parts: list[dict]) -> bool:
+    for record in [*transparent_parts, *normal_parts]:
+        for draw in _draw_ranges_for_record(record):
+            if _draw_toggle_condition(draw):
+                return True
+    return False
+
+
+def _shadow_plan_has_toggle_replay(shadow_plan: dict, parts_by_suffix: dict[str, dict]) -> bool:
+    if not bool(shadow_plan.get("enabled", False)):
+        return False
+    transparent_parts = [
+        parts_by_suffix[suffix]
+        for suffix in shadow_plan.get("transparent_parts", []) or []
+        if suffix in parts_by_suffix
+    ]
+    normal_parts = [
+        parts_by_suffix[suffix]
+        for suffix in shadow_plan.get("normal_parts", []) or []
+        if suffix in parts_by_suffix
+    ]
+    return _shadow_replay_has_toggle_draws(transparent_parts, normal_parts)
 
 
 def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
@@ -2404,14 +2429,20 @@ def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
     vb0 = vertex_buffers.get("vb0")
     if vb0:
         lines.append(f"{indent}vb3 = {vb0.get('resource_name')}")
-    for draw in _draw_ranges_for_record(record):
+    draw_ranges = _draw_ranges_for_record(record)
+    index = 0
+    while index < len(draw_ranges):
+        draw = draw_ranges[index]
         condition = _draw_toggle_condition(draw)
         if condition:
             lines.append(f"{indent}if {condition}")
-            lines.extend(_drawindexed_lines(draw, record, indent=f"{indent}  "))
+            while index < len(draw_ranges) and _draw_toggle_condition(draw_ranges[index]) == condition:
+                lines.extend(_drawindexed_lines(draw_ranges[index], record, indent=f"{indent}  "))
+                index += 1
             lines.append(f"{indent}endif")
-        else:
-            lines.extend(_drawindexed_lines(draw, record, indent=indent))
+            continue
+        lines.extend(_drawindexed_lines(draw, record, indent=indent))
+        index += 1
     return lines
 
 

@@ -59,16 +59,20 @@ _KEY_EVENT_ALIASES = {
     "SEVEN": "7",
     "EIGHT": "8",
     "NINE": "9",
-    "NUMPAD_0": "NUMPAD0",
-    "NUMPAD_1": "NUMPAD1",
-    "NUMPAD_2": "NUMPAD2",
-    "NUMPAD_3": "NUMPAD3",
-    "NUMPAD_4": "NUMPAD4",
-    "NUMPAD_5": "NUMPAD5",
-    "NUMPAD_6": "NUMPAD6",
-    "NUMPAD_7": "NUMPAD7",
-    "NUMPAD_8": "NUMPAD8",
-    "NUMPAD_9": "NUMPAD9",
+    "UP_ARROW": "VK_UP",
+    "DOWN_ARROW": "VK_DOWN",
+    "LEFT_ARROW": "VK_LEFT",
+    "RIGHT_ARROW": "VK_RIGHT",
+    "NUMPAD_0": "VK_NUMPAD0",
+    "NUMPAD_1": "VK_NUMPAD1",
+    "NUMPAD_2": "VK_NUMPAD2",
+    "NUMPAD_3": "VK_NUMPAD3",
+    "NUMPAD_4": "VK_NUMPAD4",
+    "NUMPAD_5": "VK_NUMPAD5",
+    "NUMPAD_6": "VK_NUMPAD6",
+    "NUMPAD_7": "VK_NUMPAD7",
+    "NUMPAD_8": "VK_NUMPAD8",
+    "NUMPAD_9": "VK_NUMPAD9",
     "RET": "ENTER",
     "SPACE": "SPACE",
     "TAB": "TAB",
@@ -593,17 +597,6 @@ def _next_toggle_value(toggle) -> int:
     while value in used:
         value += 1
     return value
-
-
-def _remove_object_from_all_toggle_values(scene, object_name: str) -> None:
-    object_name = str(object_name or "")
-    if not object_name:
-        return
-    for toggle in getattr(scene, "bmc_toggle_draw_sets", []) or []:
-        for value_item in getattr(toggle, "values", []) or []:
-            for index in reversed(range(len(value_item.objects))):
-                if value_item.objects[index].object_name == object_name:
-                    value_item.objects.remove(index)
 
 
 def _add_object_name_to_toggle_value(value_item, object_name: str) -> bool:
@@ -1440,7 +1433,6 @@ class BMC_OT_toggle_draw_value_add_selected(bpy.types.Operator):
         value_item = toggle.values[value_index]
         added = 0
         for mesh_obj in _selected_mesh_objects(context):
-            _remove_object_from_all_toggle_values(scene, mesh_obj.name)
             if _add_object_name_to_toggle_value(value_item, mesh_obj.name):
                 added += 1
         _sync_toggle_draw_sets_to_collection(scene)

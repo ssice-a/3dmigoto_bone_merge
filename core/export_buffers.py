@@ -174,7 +174,7 @@ class _PreparedVertexSlot:
     stride: int
     fields: list[dict]
     field_offsets: list[tuple[dict, int]]
-    output: bytearray
+    output: bytes | bytearray | None
 
 
 @dataclass(frozen=True)
@@ -377,7 +377,7 @@ def _normalize_vertex_layout(layout: dict) -> dict[str, dict]:
     return normalized
 
 
-def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartCache) -> tuple[list[_LoopVertex], list[int], list[_ObjectDrawRange]]:
+def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartCache):
     fast_result = _collect_part_loop_vertices_all_fast(part, export_cache)
     if fast_result is not None:
         return fast_result
@@ -466,7 +466,7 @@ def _collect_part_loop_vertices(part: ExportPartPlan, export_cache: _ExportPartC
 def _collect_part_loop_vertices_all_fast(
     part: ExportPartPlan,
     export_cache: _ExportPartCache,
-) -> tuple[list[_LoopVertex], list[int], list[_ObjectDrawRange]] | None:
+):
     """Collect loop ranges without materializing one Python object per loop.
 
     The vertex slot writers only need a representative loop object per mesh
@@ -493,12 +493,13 @@ def _collect_part_loop_vertices_all_fast(
         return [], [], []
 
     loop_vertices: list[_LoopVertex] = []
-    indices: list[int] = []
+    index_chunks: list[object] = []
+    index_cursor = 0
     object_draws: list[_ObjectDrawRange] = []
     range_arrays: list[tuple[int, int, object, object]] = []
 
     for mesh_obj, mesh, loop_count, relative_indices, vertex_indices, loop_indices in fast_entries:
-        object_start_index = len(indices)
+        object_start_index = index_cursor
         object_start_vertex = len(loop_vertices)
         representative = _LoopVertex(
             mesh_obj=mesh_obj,
@@ -512,11 +513,13 @@ def _collect_part_loop_vertices_all_fast(
             loop_vertices.extend([None] * (loop_count - 1))  # type: ignore[list-item]
 
         absolute_indices = np.asarray(relative_indices, dtype=np.int64) + int(object_start_vertex)
-        indices.extend(absolute_indices.reshape(-1).tolist())
+        absolute_indices = absolute_indices.reshape(-1)
+        index_chunks.append(absolute_indices)
+        index_cursor += int(absolute_indices.size)
 
         object_end_vertex = len(loop_vertices)
         range_arrays.append((object_start_vertex, object_end_vertex, vertex_indices, loop_indices))
-        object_index_count = len(indices) - object_start_index
+        object_index_count = index_cursor - object_start_index
         if object_index_count > 0:
             object_draws.append(
                 _ObjectDrawRange(
@@ -538,6 +541,7 @@ def _collect_part_loop_vertices_all_fast(
             )
             for start, end, vertex_indices, loop_indices in range_arrays
         )
+    indices = np.concatenate(index_chunks).astype(np.int64, copy=False) if index_chunks else np.zeros((0,), dtype=np.int64)
     return loop_vertices, indices, object_draws
 
 
@@ -632,7 +636,7 @@ def _prepare_vertex_slot(
         stride=stride,
         fields=fields,
         field_offsets=field_offsets,
-        output=bytearray(vertex_count * stride),
+        output=None,
     )
 
 
@@ -649,8 +653,11 @@ def _write_prepared_vertex_slots(
         directory = os.path.dirname(slot.file_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        output = slot.output
+        if output is None:
+            output = bytes(len(loop_vertices) * int(slot.stride))
         with open(slot.file_path, "wb") as file_handle:
-            file_handle.write(slot.output)
+            file_handle.write(output)
         slot_timings[f"{slot.slot_name}:{slot.role_name}"] = time.perf_counter() - stage_start
     return slot_timings
 
@@ -736,7 +743,7 @@ def _write_numpy_position_packed_normal_slot16(
             return False
         records["position"][start:end] = positions[vertex_indices]
         records["normal"][start:end] = normals[loop_indices]
-    slot.output[:] = records.tobytes()
+    slot.output = records.tobytes()
     return True
 
 
@@ -779,7 +786,7 @@ def _write_numpy_position_slot(
             if loop_indices.size and int(loop_indices.max()) >= len(normals):
                 return False
             _numpy_assign_bytes(records[start:end], int(normal3_offset), normals[loop_indices])
-    slot.output[:] = records.tobytes()
+    slot.output = records.tobytes()
     return True
 
 
@@ -842,7 +849,7 @@ def _write_numpy_texcoord_slot(
             if vertex_indices.size and int(vertex_indices.max()) >= len(values):
                 return False
             _numpy_assign_bytes(records[start:end], int(field_offset), values[vertex_indices])
-    slot.output[:] = records.tobytes()
+    slot.output = records.tobytes()
     return True
 
 
@@ -914,7 +921,7 @@ def _write_numpy_blend_slot(
             else:
                 indices_array = np.asarray(indices_array, dtype=np.uint8)
             _numpy_assign_bytes(records[start:end], indices_offset, indices_array)
-    slot.output[:] = records.tobytes()
+    slot.output = records.tobytes()
     return True
 
 

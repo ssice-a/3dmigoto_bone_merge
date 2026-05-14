@@ -129,10 +129,15 @@ def analyze_lod_for_manifest(
         lod_links=links,
         global_candidates=global_candidates,
     )
+    final_mapping = _capture_records_to_lod_mapping(
+        canonical_global_count,
+        capture_records,
+        ignored_global_bones=ignored_global_bones,
+    )
     review = review_lod_global_pool_coverage(canonical_manifest, capture_records)
     variant_id = _build_lod_variant_id(normalized_lod_dir, capture_records)
     generated_at = datetime.now(timezone.utc).isoformat()
-    validation = list(mapping["validation"])
+    validation = list(final_mapping["validation"])
     validation.extend(review["validation"])
     validation.extend(
         {
@@ -150,10 +155,10 @@ def analyze_lod_for_manifest(
                 "frameanalysis_dir": normalized_lod_dir,
                 "candidate_count": len(lod_manifest.get("candidate_ibs", []) or []),
                 "capture_candidate_count": len(lod_records),
-                "matched_global_bone_count": len(mapping["global_to_lod"]),
+                "matched_global_bone_count": len(final_mapping["global_to_lod"]),
                 "total_global_bone_count": int(canonical_global_count),
-                "required_global_bone_count": int(mapping["required_global_bone_count"]),
-                "ignored_lod_global_bone_count": int(mapping["ignored_global_bone_count"]),
+                "required_global_bone_count": int(final_mapping["required_global_bone_count"]),
+                "ignored_lod_global_bone_count": int(final_mapping["ignored_global_bone_count"]),
                 "match_tolerance": float(mapping["match_tolerance"]),
                 "matched_vertex_count": int(mapping["matched_vertex_count"]),
                 "lod_vertex_count": int(len(lod_points)),
@@ -168,7 +173,7 @@ def analyze_lod_for_manifest(
         "lod_links": links,
         "lod_chains": lod_chains,
         "lod_capture_records": capture_records,
-        "lod_mapping": mapping["mapping_entries"],
+        "lod_mapping": final_mapping["mapping_entries"],
         "lod_review": review,
         "validation": validation,
         "lod_manifest_snapshot": _lod_manifest_snapshot(lod_manifest),
@@ -377,9 +382,12 @@ def _capture_records_to_lod_mapping(
                 "lod_local_bone": lod_local_bone,
                 "score": float(pair.get("score", 0.0) or 0.0),
                 "votes": int(pair.get("votes", 0) or 0),
-                "average_distance": 0.0,
-                "status": "matched",
+                "average_distance": float(pair.get("average_distance", 0.0) or 0.0),
+                "status": str(pair.get("status", "") or "matched"),
             }
+            for field in ("donor_global_bone", "match_method", "note"):
+                if field in pair:
+                    entry[field] = pair[field]
             current = best_by_global.get(canonical_global)
             if current is None or _mapping_entry_rank(entry) > _mapping_entry_rank(current):
                 best_by_global[canonical_global] = entry
@@ -417,11 +425,25 @@ def _capture_records_to_lod_mapping(
         mapping_entries.append(entry)
         global_to_lod[canonical_global] = entry
 
+    unmatched_count = sum(1 for entry in mapping_entries if str(entry["status"]) == "unmatched")
+    required_global_count = max(0, int(canonical_global_count) - len(ignored_global_bones))
+    validation = []
+    if unmatched_count:
+        validation.append(
+            {
+                "severity": "warning",
+                "code": "lod_unmatched_global_bones",
+                "message": f"LOD mapping left {unmatched_count}/{required_global_count} required canonical global bone(s) unmatched.",
+                "draw_indices": [],
+            }
+        )
+
     return {
         "global_to_lod": global_to_lod,
         "mapping_entries": mapping_entries,
         "ignored_global_bone_count": len(ignored_global_bones),
-        "required_global_bone_count": max(0, int(canonical_global_count) - len(ignored_global_bones)),
+        "required_global_bone_count": required_global_count,
+        "validation": validation,
     }
 
 

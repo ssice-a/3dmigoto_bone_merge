@@ -211,6 +211,18 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual("same_lod_part_donor", pairs[11]["status"])
         self.assertEqual(8, pairs[12]["lod_local_bone"])
 
+        mapping = lod_analyze._capture_records_to_lod_mapping(
+            13,
+            records,
+            ignored_global_bones=set(range(10)),
+        )
+        entries = {int(entry["canonical_global_bone"]): entry for entry in mapping["mapping_entries"]}
+        self.assertEqual("same_lod_part_donor", entries[11]["status"])
+        self.assertEqual("lod_body-3-0", entries[11]["lod_record_key"])
+        self.assertEqual(4, entries[11]["lod_local_bone"])
+        self.assertEqual(10, entries[11]["donor_global_bone"])
+        self.assertNotIn(11, {int(entry["canonical_global_bone"]) for entry in mapping["mapping_entries"] if entry["status"] == "unmatched"})
+
     def test_lod_signature_fast_path_only_skips_point_cloud_for_same_ib(self):
         canonical_manifest = {
             "frameanalysis_dir": "C:/fake-main",

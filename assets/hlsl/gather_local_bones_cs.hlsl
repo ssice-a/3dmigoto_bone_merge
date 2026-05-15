@@ -13,7 +13,7 @@ Buffer<uint> PartLocalToGlobalBoneMap : register(t2);
 RWStructuredBuffer<uint4> LocalBonePool_UAV : register(u1);
 RWStructuredBuffer<uint4> RuntimeState_UAV : register(u2);
 
-[numthreads(64, 1, 1)]
+[numthreads(32, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
     uint local_bone_count = PartLocalToGlobalBoneMap[0];
@@ -37,7 +37,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         uint src_slot_base = slot * BMC_GLOBAL_SLOT_ROW_STRIDE;
         uint dst_slot_base = slot * BMC_LOCAL_SLOT_ROW_STRIDE;
 
-        for (uint local_row = tid.x; local_row < rows_to_copy; local_row += 64)
+        for (uint local_row = tid.x; local_row < rows_to_copy; local_row += 32)
         {
             uint local_bone = local_row / BMC_BONE_ROWS;
             uint row_in_bone = local_row % BMC_BONE_ROWS;

@@ -40,6 +40,9 @@ _BONE_SAMPLE_TARGET = 24
 _BONE_SAMPLE_TOP_WEIGHT_COUNT = 12
 _MIN_BONE_MATCH_SCORE = 0.01
 _MIN_BONE_MATCH_VOTES = 1
+_LOD_BONE_CANDIDATE_LIMIT = 5
+_LOD_COLLAPSE_MAX_FIELD_ERROR = 0.18
+_LOD_COLLAPSE_MIN_FIELD_COVERAGE = 0.65
 _LOD_BONE_MATCH_TOLERANCE_SCALES = (2.0, 4.0)
 _LOD_BONE_MATCH_FALLBACK_RATIO = 0.95
 _LOD_SLOT_DIRECT_ABS_TOLERANCE = 4
@@ -604,7 +607,6 @@ def build_lod_bone_cloud_mapping(
             break
 
     candidates_by_global: dict[int, list[dict]] = {}
-    best_by_global: dict[int, tuple[tuple[str, int], dict]] = {}
     for (lod_key, lod_local_bone, canonical_global), stats in best_stats.items():
         if int(canonical_global) < 0 or int(canonical_global) >= int(canonical_global_count):
             continue
@@ -614,10 +616,16 @@ def build_lod_bone_cloud_mapping(
             continue
         candidate = _lod_mapping_entry(canonical_global, lod_key, lod_local_bone, stats)
         candidates_by_global.setdefault(int(canonical_global), []).append(candidate)
-        current = best_by_global.get(int(canonical_global))
-        if current is None or _pair_rank(stats) > _pair_rank(current[1]):
-            best_by_global[int(canonical_global)] = ((str(lod_key), int(lod_local_bone)), stats)
 
+    for canonical_global, candidates in list(candidates_by_global.items()):
+        candidates_by_global[int(canonical_global)] = _sort_lod_mapping_candidates(candidates)[:_LOD_BONE_CANDIDATE_LIMIT]
+
+    selected_by_global = _resolve_lod_local_conflicts(
+        candidates_by_global,
+        canonical_clouds,
+        lod_clouds,
+        best_tolerance,
+    )
     mapping_entries = []
     global_to_lod: dict[int, dict] = {}
     for canonical_global in range(int(canonical_global_count)):
@@ -633,7 +641,7 @@ def build_lod_bone_cloud_mapping(
                 }
             )
             continue
-        selected = best_by_global.get(canonical_global)
+        selected = selected_by_global.get(canonical_global)
         if selected is None:
             mapping_entries.append(
                 {
@@ -646,22 +654,9 @@ def build_lod_bone_cloud_mapping(
                 }
             )
             continue
-        (lod_key, lod_local_bone), stats = selected
-        entry = _lod_mapping_entry(canonical_global, lod_key, lod_local_bone, stats)
+        entry = dict(selected)
         mapping_entries.append(entry)
         global_to_lod[int(canonical_global)] = entry
-
-    for canonical_global, candidates in list(candidates_by_global.items()):
-        candidates_by_global[int(canonical_global)] = sorted(
-            candidates,
-            key=lambda entry: (
-                -float(entry.get("score", 0.0)),
-                -int(entry.get("votes", 0)),
-                float(entry.get("average_distance", 0.0)),
-                str(entry.get("lod_record_key", "")),
-                int(entry.get("lod_local_bone", -1)),
-            ),
-        )
 
     unmatched_count = sum(1 for entry in mapping_entries if str(entry["status"]) == "unmatched")
     required_global_count = max(0, int(canonical_global_count) - len(ignored_global_bones))
@@ -905,6 +900,189 @@ def _lod_mapping_entry(canonical_global: int, lod_key: str, lod_local_bone: int,
         "average_distance": float(stats.get("distance_sum", 0.0)) / votes,
         "status": "matched",
     }
+
+
+def _sort_lod_mapping_candidates(candidates: list[dict]) -> list[dict]:
+    return sorted(
+        candidates,
+        key=lambda entry: (
+            -float(entry.get("score", 0.0)),
+            -int(entry.get("votes", 0)),
+            float(entry.get("average_distance", 0.0)),
+            str(entry.get("lod_record_key", "")),
+            int(entry.get("lod_local_bone", -1)),
+        ),
+    )
+
+
+def _resolve_lod_local_conflicts(
+    candidates_by_global: dict[int, list[dict]],
+    canonical_clouds: dict[int, list[BoneSample]],
+    lod_clouds: dict[tuple[str, int], list[LodBoneSample]],
+    match_tolerance: float,
+) -> dict[int, dict]:
+    """Select LOD candidates while rejecting bad many-global-to-one-local collapses.
+
+    A LOD local is allowed to feed multiple canonical globals only when its sampled
+    weight field matches the merged canonical weight field. This keeps legitimate
+    LOD bone collapses while avoiding accidental duplicate writes such as two
+    overlapping thigh globals both selecting the same source local.
+    """
+
+    selected: dict[int, dict] = {
+        int(canonical_global): dict(candidates[0])
+        for canonical_global, candidates in candidates_by_global.items()
+        if candidates
+    }
+    candidate_index: dict[int, int] = {
+        int(canonical_global): 0
+        for canonical_global, candidates in candidates_by_global.items()
+        if candidates
+    }
+
+    max_passes = max(1, sum(len(candidates) for candidates in candidates_by_global.values()) + 1)
+    for _pass_index in range(max_passes):
+        changed = False
+        groups: dict[tuple[str, int], list[int]] = {}
+        for canonical_global, candidate in selected.items():
+            key = (str(candidate.get("lod_record_key", "") or ""), int(candidate.get("lod_local_bone", -1)))
+            if key[0] and key[1] >= 0:
+                groups.setdefault(key, []).append(int(canonical_global))
+
+        for key, globals_for_key in groups.items():
+            if len(globals_for_key) <= 1:
+                continue
+            if _lod_local_collapse_is_valid(
+                key,
+                globals_for_key,
+                canonical_clouds,
+                lod_clouds,
+                match_tolerance,
+            ):
+                continue
+
+            winner = max(
+                globals_for_key,
+                key=lambda global_bone: _lod_candidate_conflict_rank(
+                    int(global_bone),
+                    selected[int(global_bone)],
+                    canonical_clouds,
+                ),
+            )
+            for canonical_global in globals_for_key:
+                canonical_global = int(canonical_global)
+                if canonical_global == int(winner):
+                    continue
+                next_candidate = _next_lod_candidate(
+                    candidates_by_global.get(canonical_global, []),
+                    candidate_index.get(canonical_global, 0),
+                    key,
+                )
+                if next_candidate is None:
+                    selected.pop(canonical_global, None)
+                    candidate_index[canonical_global] = len(candidates_by_global.get(canonical_global, []))
+                else:
+                    next_index, candidate = next_candidate
+                    selected[canonical_global] = dict(candidate)
+                    candidate_index[canonical_global] = int(next_index)
+                changed = True
+
+        if not changed:
+            break
+    return selected
+
+
+def _next_lod_candidate(
+    candidates: list[dict],
+    current_index: int,
+    rejected_key: tuple[str, int],
+) -> tuple[int, dict] | None:
+    for index in range(int(current_index) + 1, len(candidates)):
+        candidate = candidates[index]
+        key = (str(candidate.get("lod_record_key", "") or ""), int(candidate.get("lod_local_bone", -1)))
+        if key != rejected_key:
+            return int(index), candidate
+    return None
+
+
+def _lod_candidate_conflict_rank(
+    canonical_global: int,
+    candidate: dict,
+    canonical_clouds: dict[int, list[BoneSample]],
+) -> tuple[float, float, int, float, int]:
+    samples = canonical_clouds.get(int(canonical_global), [])
+    importance = sum(max(0.0, float(sample.weight)) for sample in samples)
+    return (
+        float(importance),
+        float(candidate.get("score", 0.0)),
+        int(candidate.get("votes", 0)),
+        -float(candidate.get("average_distance", 0.0)),
+        -int(canonical_global),
+    )
+
+
+def _lod_local_collapse_is_valid(
+    lod_key: tuple[str, int],
+    canonical_globals: list[int],
+    canonical_clouds: dict[int, list[BoneSample]],
+    lod_clouds: dict[tuple[str, int], list[LodBoneSample]],
+    match_tolerance: float,
+) -> bool:
+    cell_size = max(1.0e-6, float(match_tolerance) * 0.025)
+    canonical_field: dict[tuple[int, int, int], float] = {}
+    for canonical_global in canonical_globals:
+        global_field = _sample_weight_field(canonical_clouds.get(int(canonical_global), []), cell_size)
+        for position_key, weight in global_field.items():
+            canonical_field[position_key] = canonical_field.get(position_key, 0.0) + float(weight)
+    lod_field = _sample_weight_field(lod_clouds.get(lod_key, []), cell_size)
+    if not canonical_field or not lod_field:
+        return False
+
+    keys = set(canonical_field)
+    keys.update(lod_field)
+    total_error = 0.0
+    total_denominator = 0.0
+    overlap = 0.0
+    canonical_total = 0.0
+    for position_key in keys:
+        canonical_weight = float(canonical_field.get(position_key, 0.0))
+        lod_weight = float(lod_field.get(position_key, 0.0))
+        total_error += abs(canonical_weight - lod_weight)
+        total_denominator += max(canonical_weight, lod_weight)
+        overlap += min(canonical_weight, lod_weight)
+        canonical_total += canonical_weight
+
+    if total_denominator <= _WEIGHT_EPSILON or canonical_total <= _WEIGHT_EPSILON:
+        return False
+    field_error = total_error / total_denominator
+    coverage = overlap / canonical_total
+    return (
+        field_error <= _LOD_COLLAPSE_MAX_FIELD_ERROR
+        and coverage >= _LOD_COLLAPSE_MIN_FIELD_COVERAGE
+    )
+
+
+def _sample_weight_field(
+    samples: list[BoneSample] | list[LodBoneSample],
+    cell_size: float,
+) -> dict[tuple[int, int, int], float]:
+    field: dict[tuple[int, int, int], float] = {}
+    for sample in samples:
+        weight = float(sample.weight)
+        if weight <= _WEIGHT_EPSILON:
+            continue
+        key = _quantized_position_key(sample.position, cell_size)
+        field[key] = max(field.get(key, 0.0), weight)
+    return field
+
+
+def _quantized_position_key(position: tuple[float, float, float], cell_size: float) -> tuple[int, int, int]:
+    cell_size = max(1.0e-9, float(cell_size))
+    return (
+        int(round(float(position[0]) / cell_size)),
+        int(round(float(position[1]) / cell_size)),
+        int(round(float(position[2]) / cell_size)),
+    )
 
 
 def _analyze_main_frameanalysis_cached(frameanalysis_dir: str) -> dict:

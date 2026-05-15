@@ -56,7 +56,13 @@ def materialize_bonestore_runtime(
     _attach_palette_metadata_to_geometry(geometry_payloads, palette_records)
     lod_replay_links = _build_lod_replay_links(capture_manifest, geometry_payloads)
     main_required_globals = _runtime_required_global_bones(geometry_payloads, palette_records)
-    lod_required_globals = _lod_runtime_required_global_bones(geometry_payloads, palette_records, lod_replay_links)
+    lod_required_globals_by_key = _lod_runtime_required_global_bones_by_key(geometry_payloads, lod_replay_links)
+    lod_required_globals = _lod_runtime_required_global_bones(
+        geometry_payloads,
+        palette_records,
+        lod_replay_links,
+        required_by_key=lod_required_globals_by_key,
+    )
     capture_records = _build_main_capture_records(
         capture_manifest,
         required_globals=main_required_globals,
@@ -64,6 +70,7 @@ def materialize_bonestore_runtime(
     lod_records = _build_lod_capture_records(
         capture_manifest,
         required_globals=lod_required_globals,
+        required_globals_by_key=lod_required_globals_by_key,
     )
     lod_records = _augment_lod_capture_records_for_shadow_chains(
         capture_manifest,
@@ -116,6 +123,13 @@ def materialize_bonestore_runtime(
         "uses_lod_profile_flag": uses_lod_profile_flag,
         "main_required_global_bones": sorted(main_required_globals) if main_required_globals is not None else [],
         "lod_required_global_bones": sorted(lod_required_globals) if lod_required_globals is not None else [],
+        "lod_required_global_bones_by_key": [
+            {
+                "key": _key_payload(key),
+                "canonical_global_bones": sorted(values),
+            }
+            for key, values in sorted(lod_required_globals_by_key.items())
+        ],
         "palettes": palette_records,
         "geometry": geometry_payloads,
         "textures": texture_records,
@@ -227,20 +241,27 @@ def _build_main_capture_records(capture_manifest: dict, *, required_globals: set
     return records
 
 
-def _build_lod_capture_records(capture_manifest: dict, *, required_globals: set[int] | None = None) -> list[dict]:
+def _build_lod_capture_records(
+    capture_manifest: dict,
+    *,
+    required_globals: set[int] | None = None,
+    required_globals_by_key: dict[tuple[str, int, int], set[int]] | None = None,
+) -> list[dict]:
     records: list[dict] = []
-    _ = required_globals
+    required_filter = {int(value) for value in required_globals} if required_globals is not None else None
+    _ = required_globals_by_key
 
     for lod_record in capture_manifest.get("lod_capture_records", []) or []:
         raw_pairs = list(lod_record.get("scatter_pairs", []) or [])
-        pairs = [
-            (
-                int(pair.get("lod_local_bone", -1)),
-                int(pair.get("canonical_global_bone", -1)),
-            )
-            for pair in raw_pairs
-            if int(pair.get("lod_local_bone", -1)) >= 0 and int(pair.get("canonical_global_bone", -1)) >= 0
-        ]
+        pairs: list[tuple[int, int]] = []
+        for pair in raw_pairs:
+            lod_local_bone = int(pair.get("lod_local_bone", -1))
+            canonical_global_bone = int(pair.get("canonical_global_bone", -1))
+            if lod_local_bone < 0 or canonical_global_bone < 0:
+                continue
+            if required_filter is not None and canonical_global_bone not in required_filter:
+                continue
+            pairs.append((lod_local_bone, canonical_global_bone))
         if not pairs:
             continue
 
@@ -1548,11 +1569,18 @@ def _lod_runtime_required_global_bones(
     geometry_records: list[dict],
     palette_records: list[dict],
     lod_replay_links: list[dict],
+    *,
+    required_by_key: dict[tuple[str, int, int], set[int]] | None = None,
 ) -> set[int] | None:
     if not geometry_records and not palette_records:
         return None
     if not lod_replay_links:
         return set()
+    if required_by_key is not None:
+        required: set[int] = set()
+        for values in required_by_key.values():
+            required.update(int(value) for value in values if int(value) >= 0)
+        return required
     geometry_by_suffix = {
         str(record.get("resource_suffix", "") or ""): record
         for record in geometry_records or []
@@ -1564,6 +1592,30 @@ def _lod_runtime_required_global_bones(
         if geometry_record is not None:
             required.update(_geometry_required_global_bones(geometry_record))
     return required
+
+
+def _lod_runtime_required_global_bones_by_key(
+    geometry_records: list[dict],
+    lod_replay_links: list[dict],
+) -> dict[tuple[str, int, int], set[int]]:
+    geometry_by_suffix = {
+        str(record.get("resource_suffix", "") or ""): record
+        for record in geometry_records or []
+        if str(record.get("resource_suffix", "") or "")
+    }
+    required_by_key: dict[tuple[str, int, int], set[int]] = {}
+    for link in lod_replay_links or []:
+        lod_key = _key_from_payload(dict(link.get("lod_key", {}) or {}))
+        if not _is_valid_override_key(lod_key):
+            continue
+        bucket = required_by_key.setdefault(lod_key, set())
+        for geometry_item in _lod_link_geometry_items(link):
+            suffix = str(dict(geometry_item or {}).get("resource_suffix", "") or "")
+            geometry_record = geometry_by_suffix.get(suffix)
+            if geometry_record is None:
+                continue
+            bucket.update(_geometry_required_global_bones(geometry_record))
+    return required_by_key
 
 
 def _lod_replay_geometry_suffixes(lod_replay_links: list[dict]) -> set[str]:

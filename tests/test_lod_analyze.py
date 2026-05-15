@@ -61,6 +61,32 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual(result["global_to_lod"][20]["lod_record_key"], "lod_b-6-0")
         self.assertEqual(result["global_to_lod"][20]["lod_local_bone"], 2)
 
+    def test_bone_cloud_mapping_splits_overlapping_lod_local_conflicts(self):
+        canonical_points = [
+            lod_analyze.WeightedPoint((0.0, 0.0, 0.0), ((124, 0.5), (125, 0.5))),
+            lod_analyze.WeightedPoint((0.01, 0.0, 0.0), ((124, 0.5), (125, 0.5))),
+            lod_analyze.WeightedPoint((1.0, 0.0, 0.0), ((140, 1.0),)),
+        ]
+        lod_points = [
+            lod_analyze.WeightedPoint(
+                (0.0, 0.0, 0.0),
+                ((("lod_leg-10-0", 35), 0.5), (("lod_leg-10-0", 36), 0.5)),
+            ),
+            lod_analyze.WeightedPoint(
+                (0.01, 0.0, 0.0),
+                ((("lod_leg-10-0", 35), 0.5), (("lod_leg-10-0", 36), 0.5)),
+            ),
+            lod_analyze.WeightedPoint((1.0, 0.0, 0.0), ((("lod_other-10-0", 1), 1.0),)),
+        ]
+
+        result = lod_analyze.build_lod_bone_cloud_mapping(canonical_points, lod_points, 150)
+
+        selected_locals = {
+            result["global_to_lod"][124]["lod_local_bone"],
+            result["global_to_lod"][125]["lod_local_bone"],
+        }
+        self.assertEqual({35, 36}, selected_locals)
+
     def test_bone_cloud_mapping_keeps_small_bone_samples(self):
         canonical_points = []
         lod_points = []

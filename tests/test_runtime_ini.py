@@ -376,7 +376,7 @@ class RuntimeIniTests(unittest.TestCase):
             {"ib_hash": "bbbbbbbb", "match_first_index": 0, "match_index_count": 20},
             runtime["lod_profile_chains"][0]["host_key"],
         )
-        self.assertEqual(["aaaaaaaa", "bbbbbbbb"], [record["ib_hash"] for record in runtime["lod_capture_records"]])
+        self.assertEqual(["aaaaaaaa"], [record["ib_hash"] for record in runtime["lod_capture_records"]])
         host_section = ini_text[
             ini_text.index("[TextureOverride_BMC_bbbbbbbb_20_0_LOD]") :
             ini_text.index("[Present]")
@@ -627,9 +627,109 @@ class RuntimeIniTests(unittest.TestCase):
             [[0], [1]],
             [record["canonical_global_bones"] for record in runtime["capture_records"]],
         )
-        self.assertEqual([[0, 1]], [record["canonical_global_bones"] for record in runtime["lod_capture_records"]])
+        self.assertEqual([[0]], [record["canonical_global_bones"] for record in runtime["lod_capture_records"]])
         self.assertEqual(
-            (2, 2, 1, 0, 0, 0, 1, 1),
+            (1, 2, 1, 0, 0, 0),
+            lod_capture_bone_map,
+        )
+
+    def test_lod_capture_records_follow_replayed_collection_palette(self):
+        manifest = {
+            "shadow_stage": {"shadow_vs_hashes": ["1111111111111111"]},
+            "lod_manifest_snapshot": {"shadow_stage": {"shadow_vs_hashes": ["2222222222222222"]}},
+            "bone_pool_order": [
+                {
+                    "ib_hash": "047e538d",
+                    "match_first_index": 0,
+                    "match_index_count": 17337,
+                    "global_bone_base": 232,
+                    "local_bone_count": 2,
+                    "used_local_bone_indices": [0, 1],
+                    "bone_capture_available": True,
+                },
+                {
+                    "ib_hash": "25937878",
+                    "match_first_index": 0,
+                    "match_index_count": 8718,
+                    "global_bone_base": 276,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                },
+            ],
+            "lod_capture_records": [
+                {
+                    "lod_record_key": "lod-259",
+                    "lod_ib_hash": "25937878",
+                    "lod_match_first_index": 0,
+                    "lod_match_index_count": 8718,
+                    "lod_capture_draw_indices": [45],
+                    "lod_local_bone_count": 80,
+                    "scatter_pairs": [
+                        {"lod_local_bone": 10, "canonical_global_bone": 232},
+                        {"lod_local_bone": 11, "canonical_global_bone": 233},
+                        {"lod_local_bone": 44, "canonical_global_bone": 276},
+                    ],
+                }
+            ],
+            "lod_links": [
+                {
+                    "ib_hash": "25937878",
+                    "match_first_index": 0,
+                    "match_index_count": 8718,
+                    "lod_sources": [
+                        {
+                            "lod_record_key": "lod-259",
+                            "lod_ib_hash": "25937878",
+                            "lod_match_first_index": 0,
+                            "lod_match_index_count": 8718,
+                            "mapped_global_count": 3,
+                        }
+                    ],
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="047-under-259",
+            ib_hash="25937878",
+            match_index_count=8718,
+            chunk_index=0,
+            local_bone_count=2,
+            palette_values=(232, 233),
+            file_name="25937878-8718-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="25937878_8718_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("25937878", 8718, 0, 17337, object_names=["047-under-259"])],
+            )
+            lod_capture_bone_map = _read_uints(
+                next(
+                    payload["file_path"]
+                    for payload in runtime["buffers"]["capture_bone_maps"]
+                    if payload["resource_name"] == "ResourceCaptureBoneMap_25937878_8718_0_LOD"
+                )
+            )
+
+        self.assertEqual([232, 233], runtime["lod_required_global_bones"])
+        self.assertEqual(
+            [
+                {
+                    "key": {"ib_hash": "25937878", "match_first_index": 0, "match_index_count": 8718},
+                    "canonical_global_bones": [232, 233],
+                }
+            ],
+            runtime["lod_required_global_bones_by_key"],
+        )
+        self.assertEqual([[232, 233]], [record["canonical_global_bones"] for record in runtime["lod_capture_records"]])
+        self.assertEqual(
+            (2, 80, 1, 0, 10, 232, 11, 233),
             lod_capture_bone_map,
         )
 

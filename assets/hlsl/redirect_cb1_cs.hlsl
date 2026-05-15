@@ -11,10 +11,10 @@ StructuredBuffer<uint4> DumpedCB1 : register(t0);
 RWStructuredBuffer<uint4> FakeCB1_UAV : register(u0);
 RWStructuredBuffer<uint4> RuntimeState_UAV : register(u2);
 
-[numthreads(64, 1, 1)]
+[numthreads(32, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    for (uint id = tid.x; id < BMC_CB1_ROW_COUNT; id += 64)
+    for (uint id = tid.x; id < BMC_CB1_ROW_COUNT; id += 32)
     {
         uint4 cb_data = DumpedCB1[id];
         uint active_slots = RuntimeState_UAV[BMC_STATE_HEADER].z;

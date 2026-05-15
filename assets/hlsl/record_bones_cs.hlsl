@@ -32,7 +32,7 @@ void EnsureCaptureSlot()
     }
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(32, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x == 0)
@@ -100,7 +100,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     if (capture_valid != 0)
     {
-        for (uint pair_row = tid.x; pair_row < rows_to_copy; pair_row += 64)
+        for (uint pair_row = tid.x; pair_row < rows_to_copy; pair_row += 32)
         {
             uint pair_index = pair_row / BMC_BONE_ROWS;
             uint row_in_bone = pair_row % BMC_BONE_ROWS;

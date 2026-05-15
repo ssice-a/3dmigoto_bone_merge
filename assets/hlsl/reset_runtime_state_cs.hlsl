@@ -5,7 +5,7 @@
 
 RWStructuredBuffer<uint4> RuntimeState_UAV : register(u2);
 
-[numthreads(64, 1, 1)]
+[numthreads(32, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x == 0)
@@ -16,7 +16,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint slot = tid.x; slot < BMC_MAX_INSTANCE_SLOTS; slot += 64)
+    for (uint slot = tid.x; slot < BMC_MAX_INSTANCE_SLOTS; slot += 32)
     {
         RuntimeState_UAV[BMC_STATE_SLOT_BASE + slot] = uint4(0, 0, 0, 0);
     }

@@ -256,9 +256,9 @@ def _write_part_geometry_buffers(
     vb_records: dict[str, dict] = {}
     prepared_slots: list[_PreparedVertexSlot] = []
     for slot_name, slot_layout in sorted(normalized_layout.items(), key=lambda item: item[0]):
-        if slot_name == "vb3":
-            # Runtime aliases vb3 to vb0 for this game layout, so exporting a
-            # duplicate position buffer only costs time and disk bandwidth.
+        if slot_name == "vb3" and _is_redundant_vb3_alias(slot_layout, normalized_layout):
+            # Some layouts alias vb3 to vb0, but eyelash-like layouts carry an
+            # independent vb3 stream. Only skip the true alias case.
             continue
         role_name = _slot_file_role(slot_name)
         file_name = f"{part.file_stem}-{role_name}.buf"
@@ -340,6 +340,16 @@ def _slot_file_role(slot_name: str) -> str:
     if normalized.startswith("vb") and normalized[2:].isdigit():
         return f"VB{int(normalized[2:])}"
     return normalized or "Vertex"
+
+
+def _is_redundant_vb3_alias(slot_layout: dict, normalized_layout: dict) -> bool:
+    vb0_layout = dict(normalized_layout.get("vb0", {}) or {})
+    if not vb0_layout:
+        return False
+    return (
+        int(slot_layout.get("stride", 0) or 0) == int(vb0_layout.get("stride", 0) or 0)
+        and list(slot_layout.get("fields", []) or []) == list(vb0_layout.get("fields", []) or [])
+    )
 
 
 def _normalize_vertex_layout(layout: dict) -> dict[str, dict]:
@@ -679,7 +689,18 @@ def _write_specialized_vertex_slot(
         return _write_position_slot(slot, field_plans, loop_vertices, export_cache)
     if role_name == "texcoord":
         return _write_texcoord_slot(slot, field_plans, loop_vertices, export_cache)
+    if _all_texcoord_field_plans(field_plans):
+        # Extra vertex streams such as eyelash vb3 can still carry TEXCOORD
+        # semantics.  Keep their independent file role while reusing the
+        # semantic writer instead of forcing every slot into vb1.
+        return _write_texcoord_slot(slot, field_plans, loop_vertices, export_cache)
     return False
+
+
+def _all_texcoord_field_plans(field_plans: list[tuple]) -> bool:
+    return bool(field_plans) and all(
+        plan[0] in {"uv", "texcoord_snorm4", "texcoord_float"} for plan in field_plans
+    )
 
 
 def _write_position_slot(

@@ -1888,9 +1888,11 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
         export_start = time.perf_counter()
         try:
             source_collection = _ensure_export_collection(context)
-            generate_ini = str(getattr(scene, "bmc_export_mode", "BUFFER_ONLY") or "BUFFER_ONLY") == "BUFFER_AND_INI"
+            export_mode = str(getattr(scene, "bmc_export_mode", "BUFFER_ONLY") or "BUFFER_ONLY")
+            generate_ini = export_mode in {"BUFFER_AND_INI", "SIMPLE_OVERRIDE"}
+            simple_override = export_mode == "SIMPLE_OVERRIDE"
             manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
-            if manifest_path and os.path.exists(manifest_path):
+            if manifest_path and os.path.exists(manifest_path) and not simple_override:
                 _raise_if_lod_unmatched_used_by_export(scene, read_json(manifest_path))
             result = prepare_export_collection(
                 context=context,
@@ -1900,6 +1902,7 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
                 internal_manifest_dir=None,
                 capture_manifest_path=scene.bmc_manifest_path,
                 generate_ini=generate_ini,
+                simple_override=simple_override,
                 filter_residual=bool(getattr(scene, "bmc_filter_residual", True)),
             )
         except Exception as exc:
@@ -1916,7 +1919,7 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
             store_mapping_payload_on_scene(scene, payload)
         except Exception:
             pass
-        mode_label = "buffers + INI" if generate_ini else "buffers"
+        mode_label = "simple override" if result.get("simple_override") else ("buffers + INI" if generate_ini else "buffers")
         message = f"Exported {mode_label}: {result['objects']} object(s), {result['palettes']} palette(s) to {result['output_dir']}"
         timings = dict(result.get("timings", {}) or {})
         if timings:

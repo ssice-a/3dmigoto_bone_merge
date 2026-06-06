@@ -508,6 +508,109 @@ class ExportPackageTests(unittest.TestCase):
                 12,
             )
 
+    def test_simple_override_keeps_source_local_blend_indices(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            layout = {
+                "buffers": {
+                    "vb0": {
+                        "slot": "vb0",
+                        "stride": 16,
+                        "elements": [
+                            {
+                                "semantic_name": "POSITION",
+                                "semantic_index": 0,
+                                "format": "R32G32B32_FLOAT",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    },
+                    "vb2": {
+                        "slot": "vb2",
+                        "stride": 12,
+                        "elements": [
+                            {
+                                "semantic_name": "BLENDWEIGHTS",
+                                "semantic_index": 0,
+                                "format": "R16G16B16A16_UNORM",
+                                "aligned_byte_offset": 0,
+                            },
+                            {
+                                "semantic_name": "BLENDINDICES",
+                                "semantic_index": 0,
+                                "format": "R8G8B8A8_UINT",
+                                "aligned_byte_offset": 8,
+                            },
+                        ],
+                    },
+                }
+            }
+            root = FakeCollection(
+                "Simple Export",
+                children=[
+                    FakeCollection(
+                        "640d1c0e-3-0",
+                        objects=[
+                            FakeObject(
+                                "cpu_skin",
+                                [10, 11],
+                                positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+                                triangles=[(0, 1, 2)],
+                            )
+                        ],
+                    )
+                ],
+            )
+            capture_manifest_path = Path(tmpdir) / "capture_manifest.json"
+            capture_manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vertex_layout_table": {"640d1c0e-3-0": layout},
+                        "bone_pool_order": [
+                            {
+                                "ib_hash": "640d1c0e",
+                                "match_first_index": 0,
+                                "match_index_count": 3,
+                                "global_bone_base": 10,
+                                "local_bone_count": 2,
+                                "source_local_bone_count": 5,
+                                "used_local_bone_indices": [2, 4],
+                                "bone_capture_available": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = export_prepare.prepare_export_collection(
+                context=FakeContext(tmpdir),
+                source_collection=root,
+                output_dir=tmpdir,
+                capture_manifest_path=str(capture_manifest_path),
+                generate_ini=True,
+                simple_override=True,
+            )
+
+            buffer_dir = Path(tmpdir) / "Buffer"
+            blend = (buffer_dir / "640d1c0e-3-0_part00-Blend.buf").read_bytes()
+            self.assertEqual(tuple(blend[8:12]), (2, 4, 0, 0))
+            self.assertEqual(Path(result["bonestore_ini_path"]).name, "Simple Export.ini")
+            ini_text = Path(result["bonestore_ini_path"]).read_text(encoding="utf-8")
+            self.assertIn("[TextureOverride_BMCSimple_640d1c0e_3_0]", ini_text)
+            self.assertIn("vb2 = ResourcePart_640d1c0e_3_0_part00_Blend", ini_text)
+            self.assertIn("drawindexedinstanced = 3,INSTANCE_COUNT,0,0,FIRST_INSTANCE", ini_text)
+            self.assertNotIn("CustomShader_GatherLocalBones", ini_text)
+            self.assertFalse((Path(tmpdir) / "hlsl").exists())
+            self.assertFalse((buffer_dir / "640d1c0e_3_0_MAIN-CaptureBoneMap.buf").exists())
+            export_manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(export_manifest["runtime"]["mode"], "simple_override")
+            self.assertEqual(export_manifest["runtime"]["ini_file_name"], "Simple Export.ini")
+            self.assertEqual(
+                export_manifest["runtime"]["geometry"][0]["vertex_buffers"]["vb2"]["resource_name"],
+                "ResourcePart_640d1c0e_3_0_part00_Blend",
+            )
+            self.assertEqual(export_manifest["runtime"]["textures"], [])
+
     def test_prepare_export_names_ini_after_export_root_collection(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = FakeCollection(

@@ -6,6 +6,8 @@ import json
 import os
 import time
 
+from dataclasses import replace
+
 from ..constants import (
     BI4_MAX_BONE_COUNT,
     BONESTORE_INI_FILE_NAME,
@@ -17,11 +19,16 @@ from ..constants import (
 )
 from .export_names import ini_filename_from_collection_name
 from .hlsl_assets import export_required_hlsl
-from .ini_export import materialize_bonestore_runtime, write_bonestore_ini
+from .ini_export import (
+    materialize_bonestore_runtime,
+    materialize_simple_override_runtime,
+    write_bonestore_ini,
+    write_simple_override_ini_from_runtime,
+)
 from .io import ensure_directory, read_json, write_json
 from .models import LocalPaletteRecord
 from .export_buffers import write_part_geometry_buffers
-from .export_package import build_export_plan, write_part_palette_files
+from .export_package import ExportPartPlan, ExportPlan, build_export_plan, write_part_palette_files
 from .texture_marks import load_texture_mark_payload
 from .toggle_draw_sets import apply_toggle_draw_sets_to_geometry, normalize_toggle_draw_sets
 from .vertex_groups import collect_weighted_numeric_vertex_groups
@@ -35,6 +42,7 @@ def prepare_export_collection(
     internal_manifest_dir: str | None = None,
     capture_manifest_path: str | None = None,
     generate_ini: bool = True,
+    simple_override: bool = False,
     filter_residual: bool = True,
 ):
     if source_collection is None:
@@ -47,7 +55,7 @@ def prepare_export_collection(
 
     normalized_output_dir = ensure_directory(output_dir or context.scene.bmc_output_dir or context.scene.bmc_frameanalysis_dir)
     buffer_dir = ensure_directory(os.path.join(normalized_output_dir, BUFFER_EXPORT_DIR_NAME))
-    hlsl_dir = export_required_hlsl(normalized_output_dir) if generate_ini else ""
+    hlsl_dir = export_required_hlsl(normalized_output_dir) if generate_ini and not simple_override else ""
     timings["setup"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
@@ -62,8 +70,11 @@ def prepare_export_collection(
     capture_manifest = _read_capture_manifest_for_export(normalized_output_dir, capture_manifest_path)
     timings["capture_manifest"] = time.perf_counter() - stage_start
 
+    if simple_override:
+        export_plan = _source_local_override_export_plan(export_plan, capture_manifest)
+
     stage_start = time.perf_counter()
-    palette_records = write_part_palette_files(buffer_dir, export_plan)
+    palette_records = [] if simple_override else write_part_palette_files(buffer_dir, export_plan)
     timings["palettes"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
@@ -129,14 +140,34 @@ def prepare_export_collection(
     timings["manifest"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
-    bonestore_ini_path = regenerate_bonestore_runtime_files(
-        output_dir=normalized_output_dir,
-        capture_manifest_path=capture_manifest_path,
-        export_manifest_path=manifest_path,
-        local_palette_records=local_palette_records,
-        write_ini=generate_ini,
-        filter_residual=filter_residual,
-    )
+    if simple_override:
+        runtime_plan = materialize_simple_override_runtime(
+            normalized_output_dir,
+            geometry_records,
+            texture_mark_payload=texture_mark_payload,
+            toggle_draw_sets=toggle_draw_sets,
+        )
+        runtime_plan["ini_file_name"] = manifest["ini_file_name"]
+        bonestore_ini_path = (
+            write_simple_override_ini_from_runtime(
+                normalized_output_dir,
+                runtime_plan,
+                ini_file_name=manifest["ini_file_name"],
+            )
+            if generate_ini
+            else ""
+        )
+        manifest["runtime"] = _simple_runtime_manifest(runtime_plan)
+        write_json(manifest_path, manifest, compact=True)
+    else:
+        bonestore_ini_path = regenerate_bonestore_runtime_files(
+            output_dir=normalized_output_dir,
+            capture_manifest_path=capture_manifest_path,
+            export_manifest_path=manifest_path,
+            local_palette_records=local_palette_records,
+            write_ini=generate_ini,
+            filter_residual=filter_residual,
+        )
     timings["runtime"] = time.perf_counter() - stage_start
     timings["total"] = time.perf_counter() - total_start
     return {
@@ -148,11 +179,28 @@ def prepare_export_collection(
         "hlsl_dir": hlsl_dir,
         "objects": len(object_records),
         "palettes": len(palette_records),
+        "simple_override": bool(simple_override),
         "warnings": warnings,
         "timings": {name: round(seconds, 3) for name, seconds in timings.items()},
         "performance": {
             "geometry": _geometry_performance_summary(geometry_records),
         },
+    }
+
+
+def _simple_runtime_manifest(runtime_plan: dict) -> dict:
+    return {
+        "schema_version": int(runtime_plan.get("schema_version", 1) or 1),
+        "mode": "simple_override",
+        "namespace": str(runtime_plan.get("namespace", "")),
+        "ini_file_name": str(runtime_plan.get("ini_file_name", "") or ""),
+        "geometry": list(runtime_plan.get("geometry", []) or []),
+        "textures": list(runtime_plan.get("textures", []) or []),
+        "toggle_draw_sets": list(runtime_plan.get("toggle_draw_sets", []) or []),
+        "texture_warnings": list(runtime_plan.get("texture_warnings", []) or []),
+        "visible_replay_excluded_filter_indices": list(
+            runtime_plan.get("visible_replay_excluded_filter_indices", []) or []
+        ),
     }
 
 
@@ -166,6 +214,73 @@ def _read_capture_manifest_for_export(output_dir: str, capture_manifest_path: st
     if not isinstance(manifest, dict):
         raise ValueError("capture_manifest.json is not an object")
     return manifest
+
+
+def _source_local_override_export_plan(export_plan: ExportPlan, capture_manifest: dict) -> ExportPlan:
+    """Rewrite part palettes so blend indices remain in the original draw local space."""
+
+    palette_by_key = _source_local_palette_index(capture_manifest)
+    adjusted_parts: list[ExportPartPlan] = []
+    for part in export_plan.parts:
+        key = (part.region.ib_hash.lower(), int(part.region.match_first_index), int(part.region.match_index_count))
+        source_palette = palette_by_key.get(key)
+        if source_palette is None:
+            raise ValueError(
+                f"{part.region.key}/{part.part_name}: Simple Override has no source local bone mapping in capture_manifest.bone_pool_order"
+            )
+        used_globals = sorted(
+            {
+                int(global_bone)
+                for usage in part.object_usages
+                for global_bone in usage.used_global_groups
+                if int(global_bone) >= 0
+            }
+        )
+        available_globals = {int(global_bone) for global_bone in source_palette if int(global_bone) >= 0}
+        missing_globals = [global_bone for global_bone in used_globals if global_bone not in available_globals]
+        if missing_globals:
+            preview = ", ".join(f"G{value}" for value in missing_globals[:16])
+            suffix = "" if len(missing_globals) <= 16 else ", ..."
+            raise ValueError(
+                f"{part.region.key}/{part.part_name}: Simple Override cannot encode global bone(s) in the source IB local palette: "
+                f"{preview}{suffix}"
+            )
+        if len(source_palette) > BI4_MAX_BONE_COUNT:
+            raise ValueError(
+                f"{part.region.key}/{part.part_name}: Simple Override source local palette has {len(source_palette)} slots; "
+                f"BI4 export supports at most {BI4_MAX_BONE_COUNT}"
+            )
+        adjusted_parts.append(replace(part, palette_values=tuple(source_palette)))
+    return replace(export_plan, parts=tuple(adjusted_parts))
+
+
+def _source_local_palette_index(capture_manifest: dict) -> dict[tuple[str, int, int], tuple[int, ...]]:
+    palettes: dict[tuple[str, int, int], tuple[int, ...]] = {}
+    for record in capture_manifest.get("bone_pool_order", []) or []:
+        key = (
+            str(record.get("ib_hash", "") or "").lower(),
+            int(record.get("match_first_index", 0) or 0),
+            int(record.get("match_index_count", 0) or 0),
+        )
+        if not key[0] or key[2] <= 0:
+            continue
+        used_local_indices = [int(value) for value in record.get("used_local_bone_indices", []) or [] if int(value) >= 0]
+        if not used_local_indices:
+            local_bone_count = int(record.get("local_bone_count", 0) or 0)
+            used_local_indices = list(range(max(0, local_bone_count)))
+        source_count = max(
+            int(record.get("source_local_bone_count", 0) or 0),
+            max(used_local_indices) + 1 if used_local_indices else 0,
+        )
+        if source_count <= 0:
+            continue
+        base = int(record.get("global_bone_base", record.get("capture_store_base", 0)) or 0)
+        palette = [-(index + 1) for index in range(source_count)]
+        for compact_index, source_local in enumerate(used_local_indices):
+            if 0 <= int(source_local) < source_count:
+                palette[int(source_local)] = base + int(compact_index)
+        palettes[key] = tuple(palette)
+    return palettes
 
 
 def _collect_used_numeric_vertex_groups(mesh_obj) -> set[int]:

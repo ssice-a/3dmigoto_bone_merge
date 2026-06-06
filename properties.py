@@ -26,6 +26,7 @@ from .core.texture_marks import (
 EXPORT_MODE_ITEMS = (
     ("BUFFER_ONLY", "Buffer Only", "Export all runtime buffer files and export_manifest.json without regenerating BoneStore.ini"),
     ("BUFFER_AND_INI", "Buffer + INI", "Export buffer files, HLSL assets, export_manifest.json, and BoneStore.ini"),
+    ("SIMPLE_OVERRIDE", "Simple Override", "Export layout-faithful buffers and a minimal TextureOverride without Bone Merge runtime"),
 )
 
 _TEXTURE_MARK_PAYLOAD_CACHE: dict[int, tuple[tuple, dict]] = {}
@@ -393,7 +394,7 @@ def register_addon_properties():
         name="Export Mode",
         items=EXPORT_MODE_ITEMS,
         default="BUFFER_ONLY",
-        description="Choose whether this export writes only buffers or also regenerates BoneStore.ini.",
+        description="Choose whether this export writes buffers only, full BoneStore runtime, or a simple layout-faithful override.",
     )
     bpy.types.Scene.bmc_filter_residual = bpy.props.BoolProperty(
         name="过滤残影",

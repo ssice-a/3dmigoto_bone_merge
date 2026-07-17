@@ -7,6 +7,7 @@ from collections import defaultdict
 
 from ..constants import BI4_MAX_BONE_COUNT, BMC_EXPORT_PALETTE_PROP
 from .export_package import build_export_plan
+from .lod_profiles import active_lod_profiles, rebuild_lod_aggregate
 
 _WEIGHT_EPSILON = 1.0e-6
 
@@ -14,17 +15,39 @@ _WEIGHT_EPSILON = 1.0e-6
 def preview_lod_fallbacks_for_export(export_collection, manifest: dict, *, use_export_plan: bool = False) -> dict:
     """Build non-mutating fallback suggestions for unmatched LOD globals used by export meshes."""
 
-    mapping_entries = list(manifest.get("lod_mapping", []) or [])
-    if not mapping_entries:
-        return _empty_preview("no_lod_mapping")
-
     usage = (
         collect_planned_export_global_group_usage(export_collection)
         if use_export_plan
         else collect_export_global_group_usage(export_collection)
     )
+    profiles = active_lod_profiles(manifest)
+    if not profiles:
+        return _empty_preview("no_lod_mapping", usage=usage)
+
+    previews = []
+    for profile in profiles:
+        profile_id = str(profile.get("profile_id", "") or "")
+        result = dict(profile.get("result", {}) or {})
+        mapping_entries = list(result.get("lod_mapping", []) or [])
+        if not mapping_entries:
+            continue
+        preview = _preview_lod_fallbacks_for_usage(usage, mapping_entries)
+        for field in ("fallbacks", "unresolved"):
+            for entry in preview.get(field, []) or []:
+                entry["lod_profile_id"] = profile_id
+                entry["lod_level"] = max(1, int(profile.get("lod_level", 1) or 1))
+        preview["lod_profile_id"] = profile_id
+        preview["lod_level"] = max(1, int(profile.get("lod_level", 1) or 1))
+        previews.append(preview)
+
+    if not previews:
+        return _empty_preview("no_lod_mapping", usage=usage)
+    return _combine_profile_previews(usage, previews)
+
+
+def _preview_lod_fallbacks_for_usage(usage: dict, mapping_entries: list[dict]) -> dict:
     used_globals = set(usage["used_global_bones"])
-    unmatched_required = find_unmatched_required_lod_globals(manifest)
+    unmatched_required = _find_unmatched_globals_in_mapping(mapping_entries)
     unmatched_used = sorted(used_globals & unmatched_required)
     unused_unmatched = sorted(unmatched_required - used_globals)
     if not unmatched_used:
@@ -93,7 +116,57 @@ def apply_lod_fallbacks_to_manifest(manifest: dict, preview: dict) -> dict:
     if not fallbacks:
         return {"applied_count": 0, "capture_record_count": len(manifest.get("lod_capture_records", []) or [])}
 
-    mapping_entries = list(manifest.get("lod_mapping", []) or [])
+    profiles = active_lod_profiles(manifest)
+    if profiles:
+        profiles_by_id = {
+            str(profile.get("profile_id", "") or ""): profile
+            for profile in profiles
+        }
+        fallback_groups: dict[str, list[dict]] = defaultdict(list)
+        for fallback in fallbacks:
+            profile_id = str(fallback.get("lod_profile_id", "") or "")
+            if not profile_id and len(profiles) == 1:
+                profile_id = str(profiles[0].get("profile_id", "") or "")
+            if profile_id in profiles_by_id:
+                fallback_groups[profile_id].append(fallback)
+
+        applied_count = 0
+        for profile_id, profile_fallbacks in fallback_groups.items():
+            profile = profiles_by_id[profile_id]
+            result = dict(profile.get("result", {}) or {})
+            applied_count += _apply_fallbacks_to_result(result, profile_fallbacks)
+            profile["result"] = result
+        rebuild_lod_aggregate(manifest)
+        manifest.setdefault("validation", []).append(
+            {
+                "severity": "warning",
+                "code": "lod_fallback_inherited_missing_bones",
+                "message": f"Applied {applied_count} selected LOD fallback mapping(s). These are inherited donors, not exact native matches.",
+                "draw_indices": [],
+            }
+        )
+        return {
+            "applied_count": applied_count,
+            "capture_record_count": len(manifest.get("lod_capture_records", []) or []),
+        }
+
+    applied_count = _apply_fallbacks_to_result(manifest, fallbacks)
+    manifest.setdefault("validation", []).append(
+        {
+            "severity": "warning",
+            "code": "lod_fallback_inherited_missing_bones",
+            "message": f"Applied {applied_count} LOD fallback mapping(s). These are inherited donors, not exact native matches.",
+            "draw_indices": [],
+        }
+    )
+    return {
+        "applied_count": applied_count,
+        "capture_record_count": len(manifest.get("lod_capture_records", []) or []),
+    }
+
+
+def _apply_fallbacks_to_result(result: dict, fallbacks: list[dict]) -> int:
+    mapping_entries = list(result.get("lod_mapping", []) or [])
     mapping_by_global = _mapping_by_global(mapping_entries)
     for fallback in fallbacks:
         canonical_global = int(fallback.get("canonical_global_bone", -1))
@@ -121,26 +194,32 @@ def apply_lod_fallbacks_to_manifest(manifest: dict, preview: dict) -> dict:
             }
         )
 
-    manifest["lod_mapping"] = sorted(
+    result["lod_mapping"] = sorted(
         mapping_entries,
         key=lambda entry: int(entry.get("canonical_global_bone", 0) or 0),
     )
-    manifest["lod_capture_records"] = _append_fallback_capture_pairs(
-        list(manifest.get("lod_capture_records", []) or []),
+    result["lod_capture_records"] = _append_fallback_capture_pairs(
+        list(result.get("lod_capture_records", []) or []),
         fallbacks,
     )
-    manifest.setdefault("validation", []).append(
-        {
-            "severity": "warning",
-            "code": "lod_fallback_inherited_missing_bones",
-            "message": f"Applied {len(fallbacks)} LOD fallback mapping(s). These are inherited donors, not exact native matches.",
-            "draw_indices": [],
-        }
-    )
-    return {
-        "applied_count": len(fallbacks),
-        "capture_record_count": len(manifest.get("lod_capture_records", []) or []),
-    }
+    return len(fallbacks)
+
+
+def filter_lod_fallback_preview(preview: dict, enabled_keys: set[tuple[str, int]]) -> dict:
+    filtered = dict(preview or {})
+    filtered["fallbacks"] = [
+        dict(fallback)
+        for fallback in preview.get("fallbacks", []) or []
+        if (
+            str(dict(fallback or {}).get("lod_profile_id", "") or ""),
+            int(dict(fallback or {}).get("canonical_global_bone", -1)),
+        )
+        in enabled_keys
+    ]
+    summary = dict(preview.get("summary", {}) or {})
+    summary["fallback_count"] = len(filtered["fallbacks"])
+    filtered["summary"] = summary
+    return filtered
 
 
 def collect_export_global_group_usage(export_collection) -> dict:
@@ -233,7 +312,13 @@ def _iter_weighted_global_assignments(mesh_obj):
 
 def find_unmatched_required_lod_globals(manifest: dict) -> set[int]:
     unmatched: set[int] = set()
-    for entry in manifest.get("lod_mapping", []) or []:
+    profiles = active_lod_profiles(manifest)
+    mapping_entries = [
+        entry
+        for profile in profiles
+        for entry in dict(profile.get("result", {}) or {}).get("lod_mapping", []) or []
+    ] if profiles else list(manifest.get("lod_mapping", []) or [])
+    for entry in mapping_entries:
         status = str(entry.get("status", "") or "")
         if status == "ignored_lod_match_excluded":
             continue
@@ -243,6 +328,66 @@ def find_unmatched_required_lod_globals(manifest: dict) -> set[int]:
         if not _is_lod_mapping_resolved(entry):
             unmatched.add(canonical_global)
     return unmatched
+
+
+def _find_unmatched_globals_in_mapping(mapping_entries: list[dict]) -> set[int]:
+    unmatched: set[int] = set()
+    for entry in mapping_entries:
+        if str(entry.get("status", "") or "") == "ignored_lod_match_excluded":
+            continue
+        canonical_global = int(entry.get("canonical_global_bone", -1))
+        if canonical_global >= 0 and not _is_lod_mapping_resolved(entry):
+            unmatched.add(canonical_global)
+    return unmatched
+
+
+def _combine_profile_previews(usage: dict, previews: list[dict]) -> dict:
+    unmatched_used = sorted(
+        {
+            int(value)
+            for preview in previews
+            for value in preview.get("unmatched_used_global_bones", []) or []
+        }
+    )
+    unused_unmatched = sorted(
+        {
+            int(value)
+            for preview in previews
+            for value in preview.get("unused_unmatched_global_bones", []) or []
+        }
+    )
+    fallbacks = [dict(item) for preview in previews for item in preview.get("fallbacks", []) or []]
+    unresolved = [dict(item) for preview in previews for item in preview.get("unresolved", []) or []]
+    return {
+        **usage,
+        "unmatched_used_global_bones": unmatched_used,
+        "unused_unmatched_global_bones": unused_unmatched,
+        "unmatched_used_by_profile": [
+            {
+                "lod_profile_id": str(preview.get("lod_profile_id", "") or ""),
+                "lod_level": int(preview.get("lod_level", 1) or 1),
+                "canonical_global_bones": list(preview.get("unmatched_used_global_bones", []) or []),
+            }
+            for preview in previews
+            if preview.get("unmatched_used_global_bones")
+        ],
+        "fallbacks": fallbacks,
+        "unresolved": unresolved,
+        "summary": {
+            "used_global_bone_count": len(set(usage.get("used_global_bones", []) or [])),
+            "unmatched_used_count": sum(
+                len(preview.get("unmatched_used_global_bones", []) or [])
+                for preview in previews
+            ),
+            "unused_unmatched_count": sum(
+                len(preview.get("unused_unmatched_global_bones", []) or [])
+                for preview in previews
+            ),
+            "fallback_count": len(fallbacks),
+            "unresolved_count": len(unresolved),
+            "profile_count": len(previews),
+        },
+    }
 
 
 def _build_fallback_for_global(
@@ -513,18 +658,19 @@ def _fallback_note(fallback: dict) -> str:
     )
 
 
-def _empty_preview(reason: str) -> dict:
+def _empty_preview(reason: str, *, usage: dict | None = None) -> dict:
+    usage = dict(usage or {})
     return {
-        "used_global_bones": [],
-        "group_infos": {},
-        "assignments_by_vertex": {},
+        "used_global_bones": list(usage.get("used_global_bones", []) or []),
+        "group_infos": dict(usage.get("group_infos", {}) or {}),
+        "assignments_by_vertex": dict(usage.get("assignments_by_vertex", {}) or {}),
         "unmatched_used_global_bones": [],
         "unused_unmatched_global_bones": [],
         "fallbacks": [],
         "unresolved": [],
         "summary": {
             "reason": reason,
-            "used_global_bone_count": 0,
+            "used_global_bone_count": len(set(usage.get("used_global_bones", []) or [])),
             "unmatched_used_count": 0,
             "unused_unmatched_count": 0,
             "fallback_count": 0,

@@ -15,6 +15,7 @@ from .main_analyze import BufferHeader, HeaderElement, _parse_buffer_header
 from .numpy_buffers import grouped_positive_blend_assignments, read_interleaved_field, read_interleaved_fields
 from .texcoord_attrs import texcoord_color_attr_names
 from .uv_transform import DEFAULT_UV_FLIP_V, game_uv_to_blender
+from .value_utils import int_or_default
 from .vertex_format import format_size as _shared_format_size, unpack_vertex_format
 
 
@@ -808,7 +809,7 @@ def _validate_skin_format(slot: _SlotSlice, skin_format: dict, warnings: list[st
     )
     for semantic, semantic_index, format_key, offset_key in expectations:
         expected_format = str(skin_format.get(format_key, "") or "").upper()
-        expected_offset = int(skin_format.get(offset_key, -1) or -1)
+        expected_offset = int_or_default(skin_format.get(offset_key), -1)
         if not expected_format and expected_offset < 0:
             continue
         element = _find_element(slot, semantic, semantic_index)

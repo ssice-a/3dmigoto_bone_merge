@@ -456,6 +456,8 @@ class ExportPackageTests(unittest.TestCase):
             capture_manifest_path.write_text(
                 json.dumps(
                     {
+                        "global_pool_generation": "test-pool",
+                        "object_remaps": [{"source_key": "640d1c0e-46845-0"}],
                         "bone_pool_order": [
                             {
                                 "ib_hash": "640d1c0e",
@@ -519,6 +521,27 @@ class ExportPackageTests(unittest.TestCase):
                 export_manifest["geometry_buffers"][0]["vertex_buffers"]["vb2"]["stride"],
                 12,
             )
+
+    def test_bonestore_export_requires_confirmed_pool_before_writing_outputs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            capture_manifest_path = Path(tmpdir) / "capture_manifest.json"
+            capture_manifest_path.write_text(
+                json.dumps({"bone_pool_order": [{"ib_hash": "640d1c0e", "local_bone_count": 1}]}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Build Global Bone Pool"):
+                export_prepare.prepare_export_collection(
+                    context=FakeContext(tmpdir),
+                    source_collection=FakeCollection("ExportRoot"),
+                    output_dir=tmpdir,
+                    capture_manifest_path=str(capture_manifest_path),
+                    generate_ini=True,
+                )
+
+            self.assertFalse((Path(tmpdir) / "Buffer").exists())
+            self.assertFalse((Path(tmpdir) / "hlsl").exists())
+            self.assertFalse((Path(tmpdir) / "export_manifest.json").exists())
 
     def test_simple_override_keeps_source_local_blend_indices(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -648,6 +671,8 @@ class ExportPackageTests(unittest.TestCase):
             capture_manifest_path.write_text(
                 json.dumps(
                     {
+                        "global_pool_generation": "test-pool",
+                        "object_remaps": [{"source_key": "640d1c0e-3-0"}],
                         "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
                         "bone_pool_order": [
                             {
@@ -701,6 +726,8 @@ class ExportPackageTests(unittest.TestCase):
             capture_manifest_path.write_text(
                 json.dumps(
                     {
+                        "global_pool_generation": "test-pool",
+                        "object_remaps": [{"source_key": "640d1c0e-3-0"}],
                         "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
                         "bone_pool_order": [
                             {

@@ -21,6 +21,7 @@ from .core.texture_marks import (
     slot_sort_key,
     texture_candidates_for_draw,
 )
+from .core.value_utils import int_or_default
 
 
 EXPORT_MODE_ITEMS = (
@@ -91,7 +92,8 @@ class BMC_CandidateItem(bpy.types.PropertyGroup):
 
 
 class BMC_LodMappingItem(bpy.types.PropertyGroup):
-    enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+    lod_profile_id: bpy.props.StringProperty(name="LOD Profile", default="")
+    lod_level: bpy.props.IntProperty(name="LOD Level", default=1, min=1)
     canonical_global_bone: bpy.props.IntProperty(name="Canonical Global", default=0, min=0)
     mapped_lod_global_bone: bpy.props.IntProperty(name="LOD Global", default=-1, min=-1)
     lod_record_key: bpy.props.StringProperty(name="LOD Source", default="")
@@ -105,6 +107,8 @@ class BMC_LodMappingItem(bpy.types.PropertyGroup):
 
 class BMC_LodFallbackItem(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+    lod_profile_id: bpy.props.StringProperty(name="LOD Profile", default="")
+    lod_level: bpy.props.IntProperty(name="LOD Level", default=1, min=1)
     canonical_global_bone: bpy.props.IntProperty(name="Missing Global", default=0, min=0)
     donor_global_bone: bpy.props.IntProperty(name="Donor Global", default=-1, min=-1)
     lod_record_key: bpy.props.StringProperty(name="LOD Source", default="")
@@ -113,6 +117,18 @@ class BMC_LodFallbackItem(bpy.types.PropertyGroup):
     confidence: bpy.props.FloatProperty(name="Confidence", default=0.0, min=0.0, max=1.0)
     status: bpy.props.StringProperty(name="Status", default="")
     note: bpy.props.StringProperty(name="Note", default="")
+
+
+class BMC_LodProfileItem(bpy.types.PropertyGroup):
+    enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+    profile_id: bpy.props.StringProperty(name="Profile ID", default="")
+    label: bpy.props.StringProperty(name="Label", default="LOD 1")
+    lod_level: bpy.props.IntProperty(name="Level", default=1, min=1)
+    frameanalysis_dir: bpy.props.StringProperty(name="FrameAnalysis Dir", default="", subtype="DIR_PATH")
+    status: bpy.props.StringProperty(name="Status", default="not_analyzed")
+    summary: bpy.props.StringProperty(name="Summary", default="")
+    warning: bpy.props.StringProperty(name="Warning", default="")
+    global_pool_generation: bpy.props.StringProperty(name="Pool Generation", default="")
 
 
 class BMC_TextureMarkItem(bpy.types.PropertyGroup):
@@ -180,6 +196,8 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "bmc_uv_flip_v"),
     (bpy.types.Scene, "bmc_lod_mapping_items"),
     (bpy.types.Scene, "bmc_lod_mapping_index"),
+    (bpy.types.Scene, "bmc_lod_profiles"),
+    (bpy.types.Scene, "bmc_lod_profile_index"),
     (bpy.types.Scene, "bmc_lod_fallback_items"),
     (bpy.types.Scene, "bmc_lod_fallback_index"),
     (bpy.types.Scene, "bmc_texture_marks_json"),
@@ -261,7 +279,7 @@ def _texture_draw_items(self, context):  # pylint: disable=unused-argument
     for draw_key in sorted(region_candidates, key=lambda value: int(value) if str(value).isdigit() else 0):
         meta = draws.get(str(draw_key), {}) if isinstance(draws, dict) else {}
         slot_count = len(region_candidates.get(draw_key, {}) or {})
-        rt_count = int(meta.get("rt_count", -1) or -1) if isinstance(meta, dict) else -1
+        rt_count = int_or_default(meta.get("rt_count"), -1) if isinstance(meta, dict) else -1
         ps_hash = str(meta.get("ps_hash", "") or "") if isinstance(meta, dict) else ""
         label = f"{int(draw_key):06d}  textures={slot_count}  RT={rt_count}"
         if ps_hash:
@@ -286,7 +304,7 @@ def sync_texture_mark_items(scene):
         item.filename = os.path.basename(item.source_path)
         item.draw_index = int(binding.get("draw_index", 0) or 0)
         item.ps_hash = str(binding.get("ps_hash", "") or "")
-        item.rt_count = int(binding.get("rt_count", -1) or -1)
+        item.rt_count = int_or_default(binding.get("rt_count"), -1)
         mark = draw_marks.get(slot, {})
         if isinstance(mark, dict):
             item.semantic = str(mark.get("semantic", "") or "")
@@ -480,6 +498,8 @@ def register_addon_properties():
     )
     bpy.types.Scene.bmc_lod_mapping_items = bpy.props.CollectionProperty(type=BMC_LodMappingItem)
     bpy.types.Scene.bmc_lod_mapping_index = bpy.props.IntProperty(name="LOD Mapping Index", default=0, min=0)
+    bpy.types.Scene.bmc_lod_profiles = bpy.props.CollectionProperty(type=BMC_LodProfileItem)
+    bpy.types.Scene.bmc_lod_profile_index = bpy.props.IntProperty(name="LOD Profile Index", default=0, min=0)
     bpy.types.Scene.bmc_lod_fallback_items = bpy.props.CollectionProperty(type=BMC_LodFallbackItem)
     bpy.types.Scene.bmc_lod_fallback_index = bpy.props.IntProperty(name="LOD Fallback Index", default=0, min=0)
     bpy.types.Scene.bmc_texture_marks_json = bpy.props.StringProperty(

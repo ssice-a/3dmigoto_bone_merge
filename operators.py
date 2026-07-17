@@ -32,7 +32,24 @@ from .core.identity import infer_mesh_identity_from_name
 from .core.io import read_json, write_json
 from .core.import_candidates import import_selected_candidates
 from .core.lod_analyze import analyze_lod_for_manifest, review_lod_global_pool_coverage
-from .core.lod_fallback import apply_lod_fallbacks_to_manifest, preview_lod_fallbacks_for_export
+from .core.lod_fallback import (
+    apply_lod_fallbacks_to_manifest,
+    filter_lod_fallback_preview,
+    preview_lod_fallbacks_for_export,
+)
+from .core.lod_profiles import (
+    assert_lod_profiles_exportable,
+    ensure_lod_profiles,
+    first_lod_profile_issue,
+    invalidate_lod_profiles,
+    lod_profile_is_stale,
+    profile_id_for,
+    rebuild_lod_aggregate,
+    remove_lod_profile,
+    sync_lod_profile_settings,
+    upsert_lod_profile,
+)
+from .core.value_utils import int_or_default
 from .core.main_analyze import build_bone_pool_order, write_main_analysis_manifest
 from .core.numpy_compat import numpy_status
 from .core.seam_matcher import build_and_apply_seam_mapping
@@ -206,11 +223,15 @@ def _replace_lod_mapping_items(scene, mapping_entries: list[dict]) -> None:
     scene.bmc_lod_mapping_items.clear()
     for mapping_entry in mapping_entries:
         item = scene.bmc_lod_mapping_items.add()
-        item.enabled = bool(mapping_entry.get("enabled", True))
+        item.lod_profile_id = str(mapping_entry.get("lod_profile_id", "") or "")
+        item.lod_level = max(1, int(mapping_entry.get("lod_level", 1) or 1))
         item.canonical_global_bone = int(mapping_entry.get("canonical_global_bone", 0))
-        item.mapped_lod_global_bone = int(mapping_entry.get("mapped_lod_global_bone", mapping_entry.get("lod_local_bone", -1)))
+        item.mapped_lod_global_bone = int_or_default(
+            mapping_entry.get("mapped_lod_global_bone", mapping_entry.get("lod_local_bone")),
+            -1,
+        )
         item.lod_record_key = str(mapping_entry.get("lod_record_key", "") or "")
-        item.lod_local_bone = int(mapping_entry.get("lod_local_bone", -1))
+        item.lod_local_bone = int_or_default(mapping_entry.get("lod_local_bone"), -1)
         item.votes = int(mapping_entry.get("votes", 0) or 0)
         item.average_distance = float(mapping_entry.get("average_distance", 0.0) or 0.0)
         item.status = str(mapping_entry.get("status", ""))
@@ -224,15 +245,68 @@ def _replace_lod_fallback_items(scene, fallback_entries: list[dict]) -> None:
     for fallback in fallback_entries:
         item = scene.bmc_lod_fallback_items.add()
         item.enabled = bool(fallback.get("enabled", True))
+        item.lod_profile_id = str(fallback.get("lod_profile_id", "") or "")
+        item.lod_level = max(1, int(fallback.get("lod_level", 1) or 1))
         item.canonical_global_bone = int(fallback.get("canonical_global_bone", 0) or 0)
-        item.donor_global_bone = int(fallback.get("donor_global_bone", -1) or -1)
+        item.donor_global_bone = int_or_default(fallback.get("donor_global_bone"), -1)
         item.lod_record_key = str(fallback.get("lod_record_key", "") or "")
-        item.lod_local_bone = int(fallback.get("lod_local_bone", -1) or -1)
+        item.lod_local_bone = int_or_default(fallback.get("lod_local_bone"), -1)
         item.method = str(fallback.get("method", "") or fallback.get("fallback_method", "") or "")
         item.confidence = float(fallback.get("confidence", fallback.get("fallback_confidence", 0.0)) or 0.0)
         item.status = str(fallback.get("status", "") or "")
         item.note = str(fallback.get("note", "") or "")
     scene.bmc_lod_fallback_index = min(scene.bmc_lod_fallback_index, max(0, len(scene.bmc_lod_fallback_items) - 1))
+
+
+def _replace_lod_profile_items(scene, manifest: dict) -> None:
+    previous_index = int(getattr(scene, "bmc_lod_profile_index", 0) or 0)
+    profiles = ensure_lod_profiles(manifest)
+    scene.bmc_lod_profiles.clear()
+    current_generation = str(manifest.get("global_pool_generation", "") or "")
+    for profile in profiles:
+        item = scene.bmc_lod_profiles.add()
+        item.enabled = bool(profile.get("enabled", True))
+        item.profile_id = str(profile.get("profile_id", "") or "")
+        item.label = str(profile.get("label", "") or f"LOD {int(profile.get('lod_level', 1) or 1)}")
+        item.lod_level = max(1, int(profile.get("lod_level", 1) or 1))
+        item.frameanalysis_dir = str(profile.get("frameanalysis_dir", "") or "")
+        item.global_pool_generation = str(profile.get("global_pool_generation", "") or "")
+        result = dict(profile.get("result", {}) or {})
+        stale = lod_profile_is_stale(profile, current_generation)
+        review = dict(result.get("lod_review", {}) or {})
+        item.status = "stale" if stale else ("ok" if bool(review.get("runtime_safe", False)) else ("blocked" if result else "not_analyzed"))
+        frame_records = list(result.get("lod_frameanalysis", []) or [])
+        frame_record = dict(frame_records[0] or {}) if frame_records else {}
+        matched = int(frame_record.get("matched_global_bone_count", 0) or 0)
+        required = int(frame_record.get("required_global_bone_count", frame_record.get("total_global_bone_count", 0)) or 0)
+        missing = int(review.get("missing_global_bone_count", 0) or 0)
+        item.summary = f"matched {matched}/{required}, missing {missing}" if result else ""
+        item.warning = str(profile.get("stale_reason", "") or "") if stale else first_lod_profile_issue(result)
+    scene.bmc_lod_profile_index = min(previous_index, max(0, len(scene.bmc_lod_profiles) - 1))
+
+
+def _lod_profile_settings_from_scene(scene) -> list[dict]:
+    return [
+        {
+            "profile_id": str(item.profile_id or ""),
+            "label": str(item.label or ""),
+            "lod_level": max(1, int(item.lod_level)),
+            "frameanalysis_dir": bpy.path.abspath(str(item.frameanalysis_dir or "")),
+            "enabled": bool(item.enabled),
+        }
+        for item in scene.bmc_lod_profiles
+    ]
+
+
+def _sync_lod_profiles_from_scene(scene, manifest: dict) -> None:
+    sync_lod_profile_settings(manifest, _lod_profile_settings_from_scene(scene))
+
+
+def _active_lod_profile_item(scene):
+    if not scene.bmc_lod_profiles:
+        return None
+    index = min(max(0, int(scene.bmc_lod_profile_index)), len(scene.bmc_lod_profiles) - 1)
+    return scene.bmc_lod_profiles[index]
 
 
 def _store_lod_fallback_preview_on_scene(scene, preview: dict, *, applied: bool = False) -> None:
@@ -241,17 +315,24 @@ def _store_lod_fallback_preview_on_scene(scene, preview: dict, *, applied: bool 
     unresolved_count = int(summary.get("unresolved_count", 0) or 0)
     unmatched_used_count = int(summary.get("unmatched_used_count", 0) or 0)
     unused_unmatched_count = int(summary.get("unused_unmatched_count", 0) or 0)
-    prefix = "Applied" if applied else "Preview"
+    prefix = "Remaining" if applied and unmatched_used_count else ("Applied" if applied else "Preview")
     scene.bmc_lod_fallback_summary = (
         f"{prefix}: used unmatched {unmatched_used_count}, fallback {fallback_count}, "
         f"unresolved {unresolved_count}, unused unmatched {unused_unmatched_count}"
     )
     scene.bmc_lod_fallback_warning = ""
-    if unresolved_count:
-        scene.bmc_lod_fallback_warning = "Some used unmatched bones still have no donor; export remains blocked for LOD."
+    if unresolved_count or (applied and unmatched_used_count):
+        scene.bmc_lod_fallback_warning = "Some used unmatched bones remain unresolved or unaccepted; export remains blocked for LOD."
     elif fallback_count and not applied:
         scene.bmc_lod_fallback_warning = "Fallbacks are inherited donor bones; inspect before applying."
     _replace_lod_fallback_items(scene, list(preview.get("fallbacks", []) or []) + list(preview.get("unresolved", []) or []))
+
+
+def _clear_lod_fallback_preview(scene) -> None:
+    scene.bmc_lod_fallback_items.clear()
+    scene.bmc_lod_fallback_index = 0
+    scene.bmc_lod_fallback_summary = ""
+    scene.bmc_lod_fallback_warning = ""
 
 
 def _lod_export_blocking_preview(scene, manifest: dict) -> dict:
@@ -445,6 +526,13 @@ def _candidate_payload_from_item(item, manifest: dict | None = None) -> dict:
         }
     candidate["enabled"] = bool(getattr(item, "enabled", True))
     candidate["shadow_capture_ready"] = bool(getattr(item, "shadow_capture_ready", False))
+    candidate["replacement_supported"] = bool(
+        getattr(item, "replacement_supported", candidate.get("replacement_supported", True))
+    )
+    candidate["skinning_mode"] = {
+        **dict(candidate.get("skinning_mode", {}) or {}),
+        "kind": str(getattr(item, "skinning_mode", "") or dict(candidate.get("skinning_mode", {}) or {}).get("kind", "shader_skinned")),
+    }
     candidate["lod_match_excluded"] = bool(getattr(item, "lod_match_excluded", candidate.get("lod_match_excluded", False)))
     candidate["lod_match_excluded_reason"] = str(
         getattr(item, "lod_match_excluded_reason", candidate.get("lod_match_excluded_reason", "")) or ""
@@ -1897,7 +1985,11 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
             simple_override = export_mode == "SIMPLE_OVERRIDE"
             manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
             if manifest_path and os.path.exists(manifest_path) and not simple_override:
-                _raise_if_lod_unmatched_used_by_export(scene, read_json(manifest_path))
+                manifest = read_json(manifest_path)
+                _sync_lod_profiles_from_scene(scene, manifest)
+                assert_lod_profiles_exportable(manifest)
+                write_json(manifest_path, manifest)
+                _raise_if_lod_unmatched_used_by_export(scene, manifest)
             result = prepare_export_collection(
                 context=context,
                 source_collection=source_collection,
@@ -2129,6 +2221,7 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
             return {"CANCELLED"}
         try:
             manifest = read_json(manifest_path)
+            previous_generation = str(manifest.get("global_pool_generation", "") or "")
             candidates = _candidate_payloads_from_ui(scene, manifest)
             bone_pool_order = build_bone_pool_order(candidates)
             if not bone_pool_order:
@@ -2140,6 +2233,9 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
             manifest["bone_pool_order"] = bone_pool_order
             manifest["object_remaps"] = object_remaps
             manifest["global_pool_generation"] = generation_id
+            invalidated_lod_count = 0
+            if previous_generation != generation_id:
+                invalidated_lod_count = invalidate_lod_profiles(manifest, "global_bone_pool_changed")
             manifest.setdefault("buffer_tables", {})["global_bone_count"] = sum(
                 int(item.get("local_bone_count", 0)) for item in bone_pool_order
             )
@@ -2173,6 +2269,10 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
                 ):
                     created_count += 1
             _update_scene_mapping_payload(scene, manifest_path)
+            _replace_lod_profile_items(scene, manifest)
+            _replace_lod_mapping_items(scene, list(manifest.get("lod_mapping", []) or []))
+            if invalidated_lod_count > 0:
+                _clear_lod_fallback_preview(scene)
         except Exception as exc:
             self.report({"ERROR"}, f"Build Global Bone Pool failed: {exc}")
             return {"CANCELLED"}
@@ -2187,6 +2287,8 @@ class BMC_OT_build_global_bone_pool(bpy.types.Operator):
             message += f"; {lod_excluded_count} no-LOD IB(s)"
         if skipped_count > 0:
             message += f"; skipped {skipped_count} invalid IB(s)"
+        if invalidated_lod_count > 0:
+            message += f"; {invalidated_lod_count} LOD profile(s) need re-analysis"
         self.report({"INFO"}, message)
         return {"FINISHED"}
 
@@ -2223,6 +2325,7 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
                 return {"CANCELLED"}
             stage_start = time.perf_counter()
             _update_scene_mapping_payload(scene, manifest_path)
+            _replace_lod_profile_items(scene, manifest)
             timings["scene_payload"] = time.perf_counter() - stage_start
             stage_start = time.perf_counter()
             meshes_and_remaps = _candidate_source_meshes_and_remaps(context, manifest)
@@ -2292,78 +2395,227 @@ class BMC_OT_apply_global_bone_pool(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BMC_OT_lod_profile_add(bpy.types.Operator):
+    bl_idname = "object.bmc_lod_profile_add"
+    bl_label = "Add LOD Profile"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        existing_levels = {int(item.lod_level) for item in scene.bmc_lod_profiles}
+        lod_level = 1
+        while lod_level in existing_levels:
+            lod_level += 1
+        had_profiles = bool(scene.bmc_lod_profiles)
+        used_ids = {str(existing.profile_id or "") for existing in scene.bmc_lod_profiles}
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        try:
+            manifest = read_json(manifest_path) if manifest_path and os.path.exists(manifest_path) else None
+        except Exception as exc:
+            self.report({"ERROR"}, f"Add LOD Profile failed: {exc}")
+            return {"CANCELLED"}
+        if manifest is not None:
+            used_ids.update(
+                str(profile.get("profile_id", "") or "")
+                for profile in ensure_lod_profiles(manifest)
+            )
+        profile_id = f"lod{lod_level}"
+        suffix = 2
+        while profile_id in used_ids:
+            profile_id = f"lod{lod_level}_{suffix}"
+            suffix += 1
+        frameanalysis_dir = ""
+        if not had_profiles and str(getattr(scene, "bmc_lod_frameanalysis_dir", "") or ""):
+            frameanalysis_dir = str(scene.bmc_lod_frameanalysis_dir)
+        if manifest is not None:
+            profiles = ensure_lod_profiles(manifest)
+            profiles.append(
+                {
+                    "profile_id": profile_id,
+                    "label": f"LOD {lod_level}",
+                    "lod_level": lod_level,
+                    "frameanalysis_dir": bpy.path.abspath(frameanalysis_dir) if frameanalysis_dir else "",
+                    "enabled": True,
+                    "stale": False,
+                    "global_pool_generation": str(manifest.get("global_pool_generation", "") or ""),
+                    "result": {},
+                }
+            )
+            rebuild_lod_aggregate(manifest)
+            try:
+                write_json(manifest_path, manifest)
+            except Exception as exc:
+                self.report({"ERROR"}, f"Add LOD Profile failed: {exc}")
+                return {"CANCELLED"}
+        item = scene.bmc_lod_profiles.add()
+        item.enabled = True
+        item.profile_id = profile_id
+        item.label = f"LOD {lod_level}"
+        item.lod_level = lod_level
+        item.frameanalysis_dir = frameanalysis_dir
+        item.status = "not_analyzed"
+        scene.bmc_lod_profile_index = len(scene.bmc_lod_profiles) - 1
+        if manifest is not None:
+            _update_scene_mapping_payload(scene, manifest_path)
+        return {"FINISHED"}
+
+
+class BMC_OT_lod_profile_remove(bpy.types.Operator):
+    bl_idname = "object.bmc_lod_profile_remove"
+    bl_label = "Remove LOD Profile"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and getattr(context.scene, "bmc_lod_profiles", None))
+
+    def execute(self, context):
+        scene = context.scene
+        item = _active_lod_profile_item(scene)
+        if item is None:
+            return {"CANCELLED"}
+        profile_id = str(item.profile_id or "")
+        index = min(max(0, int(scene.bmc_lod_profile_index)), len(scene.bmc_lod_profiles) - 1)
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        manifest = None
+        if profile_id and manifest_path and os.path.exists(manifest_path):
+            try:
+                manifest = read_json(manifest_path)
+                remove_lod_profile(manifest, profile_id)
+                write_json(manifest_path, manifest)
+            except Exception as exc:
+                self.report({"ERROR"}, f"Remove LOD Profile failed: {exc}")
+                return {"CANCELLED"}
+        scene.bmc_lod_profiles.remove(index)
+        scene.bmc_lod_profile_index = min(index, max(0, len(scene.bmc_lod_profiles) - 1))
+        if manifest is not None:
+            _replace_lod_mapping_items(scene, list(manifest.get("lod_mapping", []) or []))
+            _clear_lod_fallback_preview(scene)
+            _update_scene_mapping_payload(scene, manifest_path)
+        return {"FINISHED"}
+
+
+class BMC_OT_sync_lod_profiles(bpy.types.Operator):
+    bl_idname = "object.bmc_sync_lod_profiles"
+    bl_label = "Update LOD Profiles"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and getattr(context.scene, "bmc_manifest_path", ""))
+
+    def execute(self, context):
+        scene = context.scene
+        manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
+        if not manifest_path or not os.path.exists(manifest_path):
+            self.report({"ERROR"}, "Capture manifest does not exist")
+            return {"CANCELLED"}
+        try:
+            manifest = read_json(manifest_path)
+            _sync_lod_profiles_from_scene(scene, manifest)
+            write_json(manifest_path, manifest)
+            _replace_lod_profile_items(scene, manifest)
+            _replace_lod_mapping_items(scene, list(manifest.get("lod_mapping", []) or []))
+            _clear_lod_fallback_preview(scene)
+            _update_scene_mapping_payload(scene, manifest_path)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Update LOD Profiles failed: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Updated enabled LOD profiles")
+        return {"FINISHED"}
+
+
 class BMC_OT_analyze_lod_frameanalysis(bpy.types.Operator):
     bl_idname = "object.bmc_analyze_lod_frameanalysis"
     bl_label = "Analyze LOD"
-    bl_description = "Analyze the LOD FrameAnalysis folder and write canonical global-bone scatter mappings into the manifest"
+    bl_description = "Analyze the active LOD profile and merge its capture mappings into the manifest"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return bool(scene and getattr(scene, "bmc_manifest_path", "") and getattr(scene, "bmc_lod_frameanalysis_dir", ""))
+        profile = _active_lod_profile_item(scene) if scene else None
+        return bool(scene and getattr(scene, "bmc_manifest_path", "") and profile and profile.frameanalysis_dir)
 
     def execute(self, context):
         scene = context.scene
+        profile_item = _active_lod_profile_item(scene)
+        if profile_item is None:
+            self.report({"ERROR"}, "Add an LOD profile first")
+            return {"CANCELLED"}
+        profile_label = str(profile_item.label or f"LOD {int(profile_item.lod_level)}")
+        profile_level = max(1, int(profile_item.lod_level))
+        profile_enabled = bool(profile_item.enabled)
         manifest_path = bpy.path.abspath(str(scene.bmc_manifest_path or ""))
         if not manifest_path or not os.path.exists(manifest_path):
             self.report({"ERROR"}, "Capture manifest does not exist; build the global pool first")
             return {"CANCELLED"}
         try:
             manifest = read_json(manifest_path)
+            _sync_lod_profiles_from_scene(scene, manifest)
+            frameanalysis_dir = bpy.path.abspath(str(profile_item.frameanalysis_dir or ""))
+            profile_id = str(profile_item.profile_id or "") or profile_id_for(
+                profile_level,
+                frameanalysis_dir,
+            )
+            profile_item.profile_id = profile_id
             lod_result = analyze_lod_for_manifest(
                 manifest,
-                bpy.path.abspath(str(scene.bmc_lod_frameanalysis_dir or "")),
-                lod_level=1,
+                frameanalysis_dir,
+                lod_level=profile_level,
             )
-            manifest["lod_frameanalysis"] = list(lod_result.get("lod_frameanalysis", []) or [])
-            manifest["lod_links"] = list(lod_result.get("lod_links", []) or [])
-            manifest["lod_capture_records"] = list(lod_result.get("lod_capture_records", []) or [])
-            manifest["lod_mapping"] = list(lod_result.get("lod_mapping", []) or [])
-            manifest["lod_review"] = dict(lod_result.get("lod_review", {}) or {})
-            manifest["lod_validation"] = list(lod_result.get("validation", []) or [])
-            manifest["lod_manifest_snapshot"] = dict(lod_result.get("lod_manifest_snapshot", {}) or {})
+            profile = upsert_lod_profile(
+                manifest,
+                profile_id=profile_id,
+                label=profile_label,
+                lod_level=profile_level,
+                frameanalysis_dir=frameanalysis_dir,
+                enabled=profile_enabled,
+                result=lod_result,
+            )
             manifest.setdefault("validation", []).append(
                 {
                     "severity": "info",
-                    "code": "lod_analysis_built",
-                    "message": f"Built LOD scatter mapping with {len(manifest['lod_capture_records'])} capture record(s).",
+                    "code": "lod_profile_analysis_built",
+                    "message": f"Built {profile_label} with {len(lod_result.get('lod_capture_records', []) or [])} capture record(s).",
                     "draw_indices": [],
                 }
             )
             write_json(manifest_path, manifest)
             _update_scene_mapping_payload(scene, manifest_path)
-            _replace_lod_mapping_items(scene, manifest["lod_mapping"])
+            _replace_lod_mapping_items(scene, list(manifest.get("lod_mapping", []) or []))
+            _replace_lod_profile_items(scene, manifest)
+            _clear_lod_fallback_preview(scene)
         except Exception as exc:
             self.report({"ERROR"}, f"Analyze LOD failed: {exc}")
             return {"CANCELLED"}
 
         scene.bmc_lod_manifest_path = manifest_path
+        scene.bmc_lod_frameanalysis_dir = frameanalysis_dir
         frame_records = list(lod_result.get("lod_frameanalysis", []) or [])
         frame_record = frame_records[0] if frame_records else {}
         shadow_stage = dict(frame_record.get("shadow_stage", {}) or {})
         scene.bmc_lod_shadow_host_hash = str(shadow_stage.get("host_ib_hash", "") or "")
-        scene.bmc_lod_shadow_host_match_index_count = int(shadow_stage.get("host_match_index_count", -1) or -1)
+        scene.bmc_lod_shadow_host_match_index_count = int_or_default(shadow_stage.get("host_match_index_count"), -1)
         scene.bmc_lod_shadow_host_vs_hash = str(shadow_stage.get("transparent_vs_hash", "") or shadow_stage.get("normal_vs_hash", "") or "")
         matched_count = int(frame_record.get("matched_global_bone_count", 0) or 0)
         total_count = int(frame_record.get("total_global_bone_count", 0) or 0)
         required_count = int(frame_record.get("required_global_bone_count", total_count) or 0)
         ignored_count = int(frame_record.get("ignored_lod_global_bone_count", 0) or 0)
-        capture_count = len(manifest.get("lod_capture_records", []) or [])
-        review = dict(manifest.get("lod_review", {}) or {})
+        capture_count = len(lod_result.get("lod_capture_records", []) or [])
+        review = dict(dict(profile.get("result", {}) or {}).get("lod_review", {}) or {})
         runtime_safe = bool(review.get("runtime_safe", False))
         missing_count = int(review.get("missing_global_bone_count", 0) or 0)
         coverage = (matched_count / required_count * 100.0) if required_count > 0 else 0.0
         scene.bmc_lod_match_summary = (
-            f"LOD {'OK' if runtime_safe else 'BLOCKED'}: matched {matched_count}/{required_count} "
-            f"required bones ({coverage:.1f}%), ignored {ignored_count}, missing {missing_count}, "
-            f"{capture_count} capture records"
+            f"{profile_label} {'OK' if runtime_safe else 'BLOCKED'}: matched {matched_count}/{required_count} "
+            f"({coverage:.1f}%), ignored {ignored_count}, missing {missing_count}, {capture_count} capture records"
         )
         self.report(
             {"INFO"},
-            f"Analyzed LOD: matched {matched_count}/{required_count} required global bone(s); ignored {ignored_count}; capture records {capture_count}",
+            f"Analyzed {profile_label}: matched {matched_count}/{required_count}; ignored {ignored_count}; capture records {capture_count}",
         )
-        lod_warnings = list(manifest.get("lod_validation", []) or [])
+        lod_warnings = list(dict(profile.get("result", {}) or {}).get("validation", []) or [])
         warning_messages = [
             str(item.get("message", ""))
             for item in lod_warnings
@@ -2394,6 +2646,9 @@ class BMC_OT_preview_lod_fallbacks(bpy.types.Operator):
             return {"CANCELLED"}
         try:
             manifest = read_json(manifest_path)
+            _sync_lod_profiles_from_scene(scene, manifest)
+            assert_lod_profiles_exportable(manifest)
+            write_json(manifest_path, manifest)
             preview = _lod_export_blocking_preview(scene, manifest)
         except Exception as exc:
             self.report({"ERROR"}, f"Preview LOD fallbacks failed: {exc}")
@@ -2428,29 +2683,52 @@ class BMC_OT_apply_lod_fallbacks(bpy.types.Operator):
         if not manifest_path or not os.path.exists(manifest_path):
             self.report({"ERROR"}, "Capture manifest does not exist")
             return {"CANCELLED"}
+        enabled_keys = {
+            (str(item.lod_profile_id or ""), int(item.canonical_global_bone))
+            for item in scene.bmc_lod_fallback_items
+            if bool(item.enabled) and str(item.status or "") != "unresolved"
+        }
+        if not scene.bmc_lod_fallback_items:
+            self.report({"WARNING"}, "Preview LOD fallbacks before applying")
+            return {"CANCELLED"}
         try:
             manifest = read_json(manifest_path)
+            _sync_lod_profiles_from_scene(scene, manifest)
+            assert_lod_profiles_exportable(manifest)
             preview = preview_lod_fallbacks_for_export(scene.bmc_export_collection, manifest, use_export_plan=True)
+            preview = filter_lod_fallback_preview(preview, enabled_keys)
             fallbacks = list(preview.get("fallbacks", []) or [])
             if not fallbacks:
                 _store_lod_fallback_preview_on_scene(scene, preview, applied=False)
                 self.report({"WARNING"}, "No LOD fallback donor could be applied")
                 return {"CANCELLED"}
             apply_result = apply_lod_fallbacks_to_manifest(manifest, preview)
-            manifest["lod_review"] = review_lod_global_pool_coverage(
-                manifest,
-                list(manifest.get("lod_capture_records", []) or []),
-            )
+            for profile in ensure_lod_profiles(manifest):
+                result = dict(profile.get("result", {}) or {})
+                if not result:
+                    continue
+                result["lod_review"] = review_lod_global_pool_coverage(
+                    manifest,
+                    list(result.get("lod_capture_records", []) or []),
+                )
+                profile["result"] = result
+            rebuild_lod_aggregate(manifest)
             write_json(manifest_path, manifest)
             _replace_lod_mapping_items(scene, list(manifest.get("lod_mapping", []) or []))
-            _store_lod_fallback_preview_on_scene(scene, preview, applied=True)
+            _replace_lod_profile_items(scene, manifest)
+            post_preview = preview_lod_fallbacks_for_export(
+                scene.bmc_export_collection,
+                manifest,
+                use_export_plan=True,
+            )
+            _store_lod_fallback_preview_on_scene(scene, post_preview, applied=True)
             _update_scene_mapping_payload(scene, manifest_path)
         except Exception as exc:
             self.report({"ERROR"}, f"Apply LOD fallbacks failed: {exc}")
             return {"CANCELLED"}
 
         applied_count = int(apply_result.get("applied_count", 0) or 0)
-        unresolved_count = len(preview.get("unresolved", []) or [])
+        unresolved_count = int(dict(post_preview.get("summary", {}) or {}).get("unmatched_used_count", 0) or 0)
         message = f"Applied {applied_count} LOD fallback mapping(s)"
         if unresolved_count:
             message += f"; {unresolved_count} unresolved"
@@ -2483,12 +2761,31 @@ class BMC_OT_analyze_main_frameanalysis(bpy.types.Operator):
             return {"CANCELLED"}
 
         scene.bmc_manifest_path = manifest_path
+        if scene.bmc_lod_profiles:
+            payload["lod_profiles"] = [
+                {
+                    "profile_id": str(item.profile_id or ""),
+                    "label": str(item.label or f"LOD {int(item.lod_level)}"),
+                    "lod_level": max(1, int(item.lod_level)),
+                    "frameanalysis_dir": bpy.path.abspath(str(item.frameanalysis_dir or "")) if item.frameanalysis_dir else "",
+                    "enabled": bool(item.enabled),
+                    "stale": False,
+                    "global_pool_generation": "",
+                    "result": {},
+                }
+                for item in scene.bmc_lod_profiles
+            ]
+            rebuild_lod_aggregate(payload)
+            write_json(manifest_path, payload)
         shadow_stage = payload.get("shadow_stage", {})
         scene.bmc_shadow_host_hash = str(shadow_stage.get("host_ib_hash", "") or "")
-        scene.bmc_shadow_host_match_index_count = int(shadow_stage.get("host_match_index_count", -1))
+        scene.bmc_shadow_host_match_index_count = int_or_default(shadow_stage.get("host_match_index_count"), -1)
         shadow_vs_hashes = list(shadow_stage.get("shadow_vs_hashes", []) or [])
         scene.bmc_shadow_host_vs_hash = shadow_vs_hashes[-1] if shadow_vs_hashes else ""
         _replace_candidate_items_from_manifest(scene, payload)
+        _replace_lod_profile_items(scene, payload)
+        _replace_lod_mapping_items(scene, [])
+        _clear_lod_fallback_preview(scene)
         _refresh_texture_payload_after_analyze(scene)
 
         warning_count = sum(1 for item in payload.get("validation", []) if item.get("severity") == "warning")

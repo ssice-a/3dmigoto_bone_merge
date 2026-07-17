@@ -42,12 +42,14 @@ def build_mapping_payload(scene, manifest_payload: dict | None = None, base_payl
         or dict(base_payload.get("capture_manifest", {}) or {}),
         "object_remaps": object_remaps,
         "lod_mapping": list(manifest_payload.get("lod_mapping", base_payload.get("lod_mapping", [])) or []),
+        "lod_profiles": list(manifest_payload.get("lod_profiles", base_payload.get("lod_profiles", [])) or []),
         "lod_chains": list(manifest_payload.get("lod_chains", base_payload.get("lod_chains", [])) or []),
         "lod_capture_records": list(manifest_payload.get("lod_capture_records", base_payload.get("lod_capture_records", [])) or []),
         "lod_links": list(manifest_payload.get("lod_links", base_payload.get("lod_links", [])) or []),
         "lod_review": dict(manifest_payload.get("lod_review", base_payload.get("lod_review", {})) or {}),
         "shadow_stage": dict(manifest_payload.get("shadow_stage", base_payload.get("shadow_stage", {})) or {}),
         "lod_manifest_snapshot": dict(manifest_payload.get("lod_manifest_snapshot", base_payload.get("lod_manifest_snapshot", {})) or {}),
+        "lod_manifest_snapshots": list(manifest_payload.get("lod_manifest_snapshots", base_payload.get("lod_manifest_snapshots", [])) or []),
     }
 
 

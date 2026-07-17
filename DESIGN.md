@@ -1255,7 +1255,7 @@ The inline `pairs` array is for diagnostics and project portability. The generat
 }
 ```
 
-The first implementation writes these LOD fields into the main capture manifest only. INI/HLSL generation should consume the same fields later, but Analyze LOD itself must not emit runtime files yet.
+Each analyzed LOD Profile owns these fields inside `lod_profiles[].result`. The manifest also materializes an enabled, non-stale aggregate for INI/HLSL generation. Rebuilding a changed global pool invalidates profile results, and conflicting mappings for an indistinguishable override key block export.
 
 For performance, Analyze LOD must use a lightweight point-cloud reader that loads only IB, POSITION, BLENDWEIGHTS, and BLENDINDICES. It must not run the full Blender import decode path for UVs, normals, or custom attributes. Before nearest-neighbor voting, weighted point clouds are compressed with semantic-preserving spatial buckets so runtime-scale meshes do not require every source vertex to participate in matching.
 

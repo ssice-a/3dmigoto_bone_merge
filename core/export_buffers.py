@@ -12,6 +12,7 @@ from .texcoord_attrs import texcoord_color_attr_names, texcoord_component_attr_n
 from .export_package import ExportPartPlan, write_r32_index_buffer
 from .numpy_buffers import assign_bytes, foreach_get_array, object_attribute_array
 from .uv_transform import DEFAULT_UV_FLIP_V
+from .value_utils import int_or_default
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,7 +359,7 @@ def _normalize_vertex_layout(layout: dict) -> dict[str, dict]:
     for raw_slot_name, raw_slot in raw_buffers.items():
         slot_name = str(raw_slot.get("slot", raw_slot_name) or raw_slot_name).lower()
         if not slot_name.startswith("vb"):
-            slot_index = int(raw_slot.get("slot_index", raw_slot.get("input_slot", -1)) or -1)
+            slot_index = int_or_default(raw_slot.get("slot_index", raw_slot.get("input_slot")), -1)
             if slot_index >= 0:
                 slot_name = f"vb{slot_index}"
         stride = int(raw_slot.get("stride", 0) or 0)

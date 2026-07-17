@@ -20,6 +20,7 @@ from .numpy_buffers import (
     max_interleaved_uint4,
     read_interleaved_fields_from_file,
 )
+from .value_utils import int_or_default
 
 
 _HASH_RE = re.compile(r"^[0-9a-fA-F]{8}$")
@@ -279,10 +280,17 @@ def analyze_main_frameanalysis(frameanalysis_dir: str, target_ib_hashes: Iterabl
         "texture_candidates": texture_candidates,
         "producer_dispatches": [],
         "bone_pool_order": bone_pool_order,
+        "lod_profile_schema_version": 1,
+        "lod_profiles": [],
         "lod_frameanalysis": [],
         "lod_chains": [],
         "lod_links": [],
         "lod_capture_records": [],
+        "lod_mapping": [],
+        "lod_review": {},
+        "lod_validation": [],
+        "lod_manifest_snapshot": {},
+        "lod_manifest_snapshots": [],
         "validation": warnings,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -793,7 +801,7 @@ def _read_cb_uint32(
 def _classify_skinning_mode(position_stream: dict) -> dict:
     dynamic_vb0 = _is_dynamic_vb0_position_stream(position_stream)
     vb3_distinct = bool(position_stream.get("vb3_distinct", False))
-    texcoord4_slot = int(position_stream.get("texcoord4_input_slot", -1) or -1)
+    texcoord4_slot = int_or_default(position_stream.get("texcoord4_input_slot"), -1)
     texcoord4_format = str(position_stream.get("texcoord4_format", "") or "").upper()
     raw_flags = position_stream.get("cb2_skinning_flags")
     flags = int(raw_flags) if raw_flags is not None else None
@@ -1685,7 +1693,7 @@ def _infer_candidate_used_local_bone_indices(
                     f"Could not compact local bone palette for "
                     f"{candidate.get('display_name') or candidate.get('ib_hash')}: {exc}"
                 ),
-                "draw_indices": [int(candidate.get("import_draw_index", -1) or -1)],
+                "draw_indices": [int_or_default(candidate.get("import_draw_index"), -1)],
             }
         )
         return []
@@ -2051,6 +2059,7 @@ def build_bone_pool_order(candidates: list[dict]) -> list[dict]:
             candidate
             for candidate in candidates
             if bool(candidate.get("enabled", True))
+            and bool(candidate.get("replacement_supported", True))
             and int(candidate.get("local_bone_count", 0)) > 0
         ],
         key=lambda item: (

@@ -142,6 +142,24 @@ class SyntheticCandidateImportTests(unittest.TestCase):
         self.assertEqual(order[0]["lod_match_excluded_reason"], "dynamic_vb0_backing_hash_mismatch")
         self.assertEqual(order[0]["status"], "capture_ready_dynamic_vb0_lod_excluded")
 
+    def test_bone_pool_order_excludes_cpu_pre_skinned_reference_geometry(self):
+        order = main_analyze.build_bone_pool_order(
+            [
+                {
+                    "ib_hash": "945c08a9",
+                    "match_first_index": 0,
+                    "match_index_count": 1698,
+                    "local_bone_count": 12,
+                    "used_local_bone_indices": [0, 1, 2],
+                    "enabled": True,
+                    "replacement_supported": False,
+                    "skinning_mode": {"kind": "cpu_pre_skinned"},
+                }
+            ]
+        )
+
+        self.assertEqual([], order)
+
     def test_analyzer_reads_r32_uint_blend_indices(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             buf_path = Path(temp_dir) / "blend.buf"

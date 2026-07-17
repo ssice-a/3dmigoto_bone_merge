@@ -25,6 +25,7 @@ from .ini_export import (
 )
 from .simple_override_adapter import materialize_simple_override_runtime, write_simple_override_ini_from_runtime
 from .io import ensure_directory, read_json, write_json
+from .lod_profiles import assert_lod_profiles_exportable
 from .models import LocalPaletteRecord
 from .export_buffers import write_part_geometry_buffers
 from .export_package import ExportPartPlan, ExportPlan, build_export_plan, write_part_palette_files
@@ -51,7 +52,14 @@ def prepare_export_collection(
 
     stage_start = time.perf_counter()
 
-    normalized_output_dir = ensure_directory(output_dir or context.scene.bmc_output_dir or context.scene.bmc_frameanalysis_dir)
+    normalized_output_dir = os.path.abspath(output_dir or context.scene.bmc_output_dir or context.scene.bmc_frameanalysis_dir)
+    capture_manifest = _read_capture_manifest_for_export(normalized_output_dir, capture_manifest_path)
+    if not simple_override:
+        _validate_bonestore_capture_manifest(capture_manifest)
+    timings["capture_manifest"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    normalized_output_dir = ensure_directory(normalized_output_dir)
     buffer_dir = ensure_directory(os.path.join(normalized_output_dir, BUFFER_EXPORT_DIR_NAME))
     hlsl_dir = export_required_hlsl(normalized_output_dir) if generate_ini and not simple_override else ""
     timings["setup"] = time.perf_counter() - stage_start
@@ -63,10 +71,6 @@ def prepare_export_collection(
         max_bones_per_part=BI4_MAX_BONE_COUNT,
     )
     timings["plan"] = time.perf_counter() - stage_start
-
-    stage_start = time.perf_counter()
-    capture_manifest = _read_capture_manifest_for_export(normalized_output_dir, capture_manifest_path)
-    timings["capture_manifest"] = time.perf_counter() - stage_start
 
     if simple_override:
         export_plan = _source_local_override_export_plan(export_plan, capture_manifest)
@@ -182,6 +186,14 @@ def prepare_export_collection(
             "geometry": _geometry_performance_summary(geometry_records),
         },
     }
+
+
+def _validate_bonestore_capture_manifest(capture_manifest: dict) -> None:
+    if not str(capture_manifest.get("global_pool_generation", "") or ""):
+        raise ValueError("Build Global Bone Pool before BoneStore export")
+    if not capture_manifest.get("object_remaps"):
+        raise ValueError("Global bone pool remaps are missing; run Build Pool again")
+    assert_lod_profiles_exportable(capture_manifest)
 
 
 def _simple_runtime_manifest(runtime_plan: dict) -> dict:
@@ -349,8 +361,7 @@ def regenerate_bonestore_runtime_files(
         return os.path.join(output_dir, BONESTORE_INI_FILE_NAME) if write_ini else ""
 
     manifest = read_json(manifest_path)
-    if not manifest.get("bone_pool_order"):
-        return os.path.join(output_dir, BONESTORE_INI_FILE_NAME) if write_ini else ""
+    _validate_bonestore_capture_manifest(manifest)
     palette_records = list(local_palette_records or [])
     normalized_export_manifest_path = os.path.abspath(export_manifest_path or "") if export_manifest_path else ""
     export_manifest = {}

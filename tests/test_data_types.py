@@ -15,6 +15,15 @@ data_types = importlib.import_module(f"{PACKAGE_DIR.name}.core.data_types")
 
 
 class DataTypeAnnotationTests(unittest.TestCase):
+    def test_zero_byte_offset_remains_a_real_layout_offset(self):
+        field = {
+            "semantic": "POSITION0",
+            "format": "R32G32B32_FLOAT",
+            "aligned_byte_offset": 0,
+        }
+
+        self.assertEqual(0, data_types._field_signature(field)[2])
+
     def test_d5_contract_marks_texcoord2_and_texcoord4_as_vs_inputs(self):
         layout = {
             "import_vs_hash": "d5d284900d7d0543",

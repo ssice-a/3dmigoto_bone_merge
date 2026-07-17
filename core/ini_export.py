@@ -10,6 +10,7 @@ from pathlib import Path
 from ..constants import BONESTORE_INI_FILE_NAME, BUFFER_EXPORT_DIR_NAME
 from .export_names import ini_filename_from_collection_name
 from .io import ensure_directory, write_counted_uint32_buffer, write_uint32_buffer
+from .lod_profiles import assert_lod_profiles_exportable
 from .models import LocalPaletteRecord
 from .texture_converter import write_game_texture
 from .texture_marks import marked_texture_bindings, validate_texture_hash
@@ -49,6 +50,7 @@ def materialize_bonestore_runtime(
 ) -> dict:
     """Write static runtime buffers and return the normalized runtime plan."""
 
+    assert_lod_profiles_exportable(capture_manifest)
     normalized_output_dir = ensure_directory(output_directory)
     buffer_dir = ensure_directory(os.path.join(normalized_output_dir, BUFFER_EXPORT_DIR_NAME))
     _remove_legacy_capture_bone_maps(buffer_dir)
@@ -321,12 +323,14 @@ def _build_lod_capture_records(
         records.append(
             {
                 "record_index": record_index,
+                "lod_profile_id": str(lod_record.get("lod_profile_id", "") or ""),
+                "lod_level": int(lod_record.get("lod_level", 1) or 1),
                 "lod_record_key": str(lod_record.get("lod_record_key", "") or ""),
                 "ib_hash": str(lod_record.get("lod_ib_hash", "") or "").lower(),
                 "match_first_index": int(lod_record.get("lod_match_first_index", 0) or 0),
                 "match_index_count": int(lod_record.get("lod_match_index_count", 0) or 0),
                 "capture_draw_indices": _int_list(lod_record.get("lod_capture_draw_indices", lod_record.get("capture_draw_indices", []))),
-                "import_draw_index": int(lod_record.get("lod_import_draw_index", lod_record.get("import_draw_index", -1)) or -1),
+                "import_draw_index": _int_default(lod_record.get("lod_import_draw_index", lod_record.get("import_draw_index", -1)), -1),
                 "canonical_global_bones": sorted({int(canonical_global_bone) for _lod_local_bone, canonical_global_bone in pairs}),
                 "pair_count": len(pairs),
                 "dispatch_rows": len(pairs) * 3,
@@ -350,10 +354,7 @@ def _augment_lod_capture_records_for_shadow_chains(
     if not lod_capture_records or not lod_replay_links or not geometry_records:
         return lod_capture_records
 
-    lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
-    stage = _normalize_shadow_stage(lod_snapshot)
-    raw_records = _raw_lod_shadow_records(capture_manifest, lod_capture_records)
-    chains = _lod_shadow_capture_chains(raw_records, stage)
+    chains = _build_lod_profile_chains(capture_manifest, lod_capture_records)
     if not chains:
         return lod_capture_records
 
@@ -362,6 +363,10 @@ def _augment_lod_capture_records_for_shadow_chains(
     records = [dict(record) for record in lod_capture_records]
 
     for chain in chains:
+        stage = {
+            "stage_draw_start": _int_default(chain.get("draw_start"), -1),
+            "stage_draw_end": _int_default(chain.get("draw_end"), -1),
+        }
         _augment_lod_capture_records_for_shadow_chain(
             records,
             chain,
@@ -394,6 +399,7 @@ def _augment_lod_capture_records_for_shadow_chain(
     }
     donor_index = _lod_shadow_chain_donor_index(
         lod_capture_records,
+        lod_profile_id=str(chain.get("lod_profile_id", "") or ""),
         host_draw_index=host_draw_index,
         stage_draw_start=_int_default(stage.get("stage_draw_start"), -1),
         stage_draw_end=_int_default(stage.get("stage_draw_end"), -1),
@@ -442,12 +448,16 @@ def _augment_lod_capture_records_for_shadow_chain(
 def _lod_shadow_chain_donor_index(
     lod_capture_records: list[dict],
     *,
+    lod_profile_id: str,
     host_draw_index: int,
     stage_draw_start: int,
     stage_draw_end: int,
 ) -> dict[int, dict]:
     donors: dict[int, dict] = {}
     for record in lod_capture_records or []:
+        record_profile = str(record.get("lod_profile_id", "") or "")
+        if lod_profile_id and record_profile and record_profile != lod_profile_id:
+            continue
         draw_indices = [
             int(value)
             for value in record.get("capture_draw_indices", []) or []
@@ -926,7 +936,12 @@ def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]
     if not geometry_by_key:
         return []
 
-    links_by_lod_chain: dict[tuple[tuple[str, int, int], int], dict] = {}
+    profile_ids = {
+        str(dict(link or {}).get("lod_profile_id", "") or "")
+        for link in capture_manifest.get("lod_links", []) or []
+    }
+    include_profile_id = len(profile_ids) > 1
+    links_by_lod_chain: dict[tuple[str, tuple[str, int, int], int], dict] = {}
     for link in capture_manifest.get("lod_links", []) or []:
         main_key = _main_key_from_lod_link(dict(link or {}))
         main_geometry = geometry_by_key.get(main_key, [])
@@ -936,15 +951,19 @@ def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]
         if not _is_valid_override_key(lod_key):
             continue
         chain_index = _lod_replay_chain_index_from_link(dict(link or {}))
+        profile_id = str(link.get("lod_profile_id", "") or "")
 
+        default_bucket = {
+            "lod_key": _key_payload(lod_key),
+            "main_keys": [],
+            "geometry": [],
+            "geometry_suffixes": [],
+        }
+        if include_profile_id:
+            default_bucket["lod_profile_id"] = profile_id
         bucket = links_by_lod_chain.setdefault(
-            (lod_key, chain_index),
-            {
-                "lod_key": _key_payload(lod_key),
-                "main_keys": [],
-                "geometry": [],
-                "geometry_suffixes": [],
-            },
+            (profile_id, lod_key, chain_index),
+            default_bucket,
         )
         if chain_index >= 0:
             bucket["lod_chain_index"] = int(chain_index)
@@ -967,7 +986,10 @@ def _build_lod_replay_links(capture_manifest: dict, geometry_records: list[dict]
 
     return [
         links_by_lod_chain[key]
-        for key in sorted(links_by_lod_chain, key=lambda item: (item[0][0], int(item[0][1]), int(item[0][2]), int(item[1])))
+        for key in sorted(
+            links_by_lod_chain,
+            key=lambda item: (item[0], item[1][0], int(item[1][1]), int(item[1][2]), int(item[2])),
+        )
         if links_by_lod_chain[key].get("geometry_suffixes")
     ]
 
@@ -1059,27 +1081,29 @@ def _build_lod_shadow_replay_plans(
     lod_replay_links: list[dict],
     lod_capture_records: list[dict],
 ) -> list[dict]:
-    lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
-    stage = _normalize_shadow_stage(lod_snapshot)
-    raw_lod_records = _raw_lod_shadow_records(capture_manifest, lod_capture_records)
     if not geometry_records or not lod_replay_links:
         return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
 
-    chains = _lod_shadow_capture_chains(raw_lod_records, stage)
+    chains = _build_lod_profile_chains(capture_manifest, lod_capture_records)
     if not chains:
         return [{"enabled": False, "reason": "missing_lod_host_or_geometry"}]
 
-    plans = [
-        _build_lod_shadow_replay_plan_for_chain(
-            capture_manifest,
-            geometry_records,
-            lod_replay_links,
-            lod_capture_records,
-            chain,
-            stage,
+    plans = []
+    for chain in chains:
+        stage = {
+            "stage_draw_start": _int_default(chain.get("draw_start"), -1),
+            "stage_draw_end": _int_default(chain.get("draw_end"), -1),
+        }
+        plans.append(
+            _build_lod_shadow_replay_plan_for_chain(
+                capture_manifest,
+                geometry_records,
+                lod_replay_links,
+                lod_capture_records,
+                chain,
+                stage,
+            )
         )
-        for chain in chains
-    ]
     enabled_plans = [plan for plan in plans if bool(plan.get("enabled", False))]
     if enabled_plans:
         return [*_merge_lod_shadow_plans_by_host(enabled_plans), *[plan for plan in plans if not bool(plan.get("enabled", False))]]
@@ -1088,7 +1112,34 @@ def _build_lod_shadow_replay_plans(
 
 def _build_lod_profile_chains(capture_manifest: dict, lod_capture_records: list[dict]) -> list[dict]:
     raw_lod_records = _raw_lod_shadow_records(capture_manifest, lod_capture_records)
-    return _lod_shadow_capture_chains(raw_lod_records, {})
+    stored_chains = list(capture_manifest.get("lod_chains", []) or [])
+    if stored_chains:
+        key_by_record = _lod_override_keys_by_record(capture_manifest, lod_capture_records)
+        chains = []
+        for stored in stored_chains:
+            chain = dict(stored or {})
+            profile_id = str(chain.get("lod_profile_id", "") or "")
+            keys = []
+            for record_key in chain.get("lod_record_keys", []) or []:
+                key = key_by_record.get((profile_id, str(record_key or "")))
+                if key is not None:
+                    _append_unique_payload(keys, _key_payload(key))
+            if not keys:
+                keys = [dict(payload or {}) for payload in chain.get("keys", []) or []]
+            chain["keys"] = keys
+            chain["lod_profile_id"] = profile_id
+            chains.append(chain)
+        return chains
+
+    grouped: dict[str, list[dict]] = {}
+    for record in raw_lod_records:
+        grouped.setdefault(str(record.get("lod_profile_id", "") or ""), []).append(record)
+    chains = []
+    for profile_id, records in sorted(grouped.items()):
+        for chain in _lod_shadow_capture_chains(records, {}):
+            chain["lod_profile_id"] = profile_id
+            chains.append(chain)
+    return chains
 
 
 def _build_lod_shadow_replay_plan_for_chain(
@@ -1111,6 +1162,7 @@ def _build_lod_shadow_replay_plan_for_chain(
     }
     available_globals, coverage_records = _lod_shadow_available_globals_for_chain(
         lod_capture_records,
+        lod_profile_id=str(chain.get("lod_profile_id", "") or ""),
         host_draw_index=host_draw_index,
         stage_draw_start=_int_default(stage.get("stage_draw_start"), -1),
         stage_draw_end=_int_default(stage.get("stage_draw_end"), -1),
@@ -1182,6 +1234,7 @@ def _build_lod_shadow_replay_plan_for_chain(
             "host_key": _key_payload(host_key),
             "host_draw_index": int(host_draw_index),
             "host_source": "lod_shadow_chain_host",
+            "lod_profile_id": str(chain.get("lod_profile_id", "") or ""),
             "chain_index": _int_default(chain.get("chain_index"), -1),
             "chain_draw_start": _int_default(chain.get("draw_start"), -1),
             "chain_draw_end": _int_default(chain.get("draw_end"), -1),
@@ -1195,6 +1248,7 @@ def _build_lod_shadow_replay_plan_for_chain(
         "host_key": _key_payload(host_key),
         "host_draw_index": int(host_draw_index),
         "host_source": "lod_shadow_chain_host",
+        "lod_profile_id": str(chain.get("lod_profile_id", "") or ""),
         "chain_index": _int_default(chain.get("chain_index"), -1),
         "chain_draw_start": _int_default(chain.get("draw_start"), -1),
         "chain_draw_end": _int_default(chain.get("draw_end"), -1),
@@ -1210,6 +1264,10 @@ def _build_lod_shadow_replay_plan_for_chain(
 
 
 def _lod_replay_link_matches_chain(link: dict, chain: dict) -> bool:
+    link_profile = str(link.get("lod_profile_id", "") or "")
+    chain_profile = str(chain.get("lod_profile_id", "") or "")
+    if link_profile and chain_profile and link_profile != chain_profile:
+        return False
     link_chain_index = _int_default(link.get("lod_chain_index"), -1)
     chain_index = _int_default(chain.get("chain_index"), -1)
     if link_chain_index < 0 or chain_index < 0:
@@ -1218,41 +1276,46 @@ def _lod_replay_link_matches_chain(link: dict, chain: dict) -> bool:
 
 
 def _raw_lod_shadow_records(capture_manifest: dict, lod_capture_records: list[dict]) -> list[dict]:
-    records_by_key: dict[tuple[str, int, int], set[int]] = {}
+    records_by_key: dict[tuple[str, tuple[str, int, int]], set[int]] = {}
 
-    def add_record(key: tuple[str, int, int], draw_indices: list[int]) -> None:
+    def add_record(profile_id: str, key: tuple[str, int, int], draw_indices: list[int]) -> None:
         if not _is_valid_override_key(key):
             return
         clean_draws = {int(value) for value in draw_indices if int(value) >= 0}
         if clean_draws:
-            records_by_key.setdefault(key, set()).update(clean_draws)
+            records_by_key.setdefault((str(profile_id or ""), key), set()).update(clean_draws)
 
     source_records = [*list(capture_manifest.get("lod_capture_records", []) or []), *list(lod_capture_records or [])]
     for record in source_records:
         raw = dict(record or {})
         key = _lod_capture_record_key(raw)
         draw_indices = _int_list(raw.get("lod_capture_draw_indices", raw.get("capture_draw_indices", [])))
-        add_record(key, draw_indices)
+        add_record(str(raw.get("lod_profile_id", "") or ""), key, draw_indices)
 
-    lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
-    for candidate in lod_snapshot.get("candidate_ibs", []) or []:
-        raw = dict(candidate or {})
-        key = (
-            str(raw.get("ib_hash", "") or "").lower(),
-            int(raw.get("match_first_index", raw.get("first_index", 0)) or 0),
-            int(raw.get("match_index_count", raw.get("index_count", 0)) or 0),
-        )
-        shadow_draw_indices = _int_list(raw.get("shadow_draw_indices", []))
-        if not shadow_draw_indices:
-            continue
-        add_record(key, shadow_draw_indices)
+    snapshots = list(capture_manifest.get("lod_manifest_snapshots", []) or [])
+    if not snapshots:
+        snapshots = [dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})]
+    for lod_snapshot in snapshots:
+        snapshot_profile = str(dict(lod_snapshot or {}).get("lod_profile_id", "") or "")
+        for candidate in dict(lod_snapshot or {}).get("candidate_ibs", []) or []:
+            raw = dict(candidate or {})
+            key = (
+                str(raw.get("ib_hash", "") or "").lower(),
+                int(raw.get("match_first_index", raw.get("first_index", 0)) or 0),
+                int(raw.get("match_index_count", raw.get("index_count", 0)) or 0),
+            )
+            shadow_draw_indices = _int_list(raw.get("shadow_draw_indices", []))
+            if not shadow_draw_indices:
+                continue
+            add_record(str(raw.get("lod_profile_id", snapshot_profile) or ""), key, shadow_draw_indices)
 
     return [
         {
-            "key": _key_payload(key),
+            "lod_profile_id": profile_key[0],
+            "key": _key_payload(profile_key[1]),
             "draw_indices": sorted(draw_indices),
         }
-        for key, draw_indices in sorted(records_by_key.items())
+        for profile_key, draw_indices in sorted(records_by_key.items())
     ]
 
 
@@ -1262,6 +1325,36 @@ def _lod_capture_record_key(record: dict) -> tuple[str, int, int]:
         int(record.get("match_first_index", record.get("lod_match_first_index", 0)) or 0),
         int(record.get("match_index_count", record.get("lod_match_index_count", 0)) or 0),
     )
+
+
+def _lod_override_keys_by_record(
+    capture_manifest: dict,
+    lod_capture_records: list[dict],
+) -> dict[tuple[str, str], tuple[str, int, int]]:
+    result: dict[tuple[str, str], tuple[str, int, int]] = {}
+    for record in [*list(capture_manifest.get("lod_capture_records", []) or []), *list(lod_capture_records or [])]:
+        raw = dict(record or {})
+        record_key = str(raw.get("lod_record_key", "") or "")
+        if record_key:
+            result[(str(raw.get("lod_profile_id", "") or ""), record_key)] = _lod_capture_record_key(raw)
+    snapshots = list(capture_manifest.get("lod_manifest_snapshots", []) or [])
+    if not snapshots:
+        snapshots = [dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})]
+    for snapshot in snapshots:
+        profile_id = str(dict(snapshot or {}).get("lod_profile_id", "") or "")
+        for candidate in dict(snapshot or {}).get("candidate_ibs", []) or []:
+            raw = dict(candidate or {})
+            record_key = (
+                f"{str(raw.get('ib_hash', '') or '').lower()}-"
+                f"{int(raw.get('match_index_count', raw.get('index_count', 0)) or 0)}-"
+                f"{int(raw.get('match_first_index', raw.get('first_index', 0)) or 0)}"
+            )
+            result[(str(raw.get("lod_profile_id", profile_id) or ""), record_key)] = (
+                str(raw.get("ib_hash", "") or "").lower(),
+                int(raw.get("match_first_index", raw.get("first_index", 0)) or 0),
+                int(raw.get("match_index_count", raw.get("index_count", 0)) or 0),
+            )
+    return result
 
 
 def _lod_shadow_capture_chains(raw_records: list[dict], stage: dict) -> list[dict]:
@@ -1355,6 +1448,7 @@ def _merge_lod_shadow_plans_by_host(plans: list[dict]) -> list[dict]:
 def _lod_shadow_available_globals_for_chain(
     lod_capture_records: list[dict],
     *,
+    lod_profile_id: str,
     host_draw_index: int,
     stage_draw_start: int,
     stage_draw_end: int,
@@ -1366,6 +1460,9 @@ def _lod_shadow_available_globals_for_chain(
     coverage_records: list[dict] = []
 
     for record in lod_capture_records or []:
+        record_profile = str(record.get("lod_profile_id", "") or "")
+        if lod_profile_id and record_profile and record_profile != lod_profile_id:
+            continue
         key = _override_key(record)
         draw_indices = [
             int(value)
@@ -1388,7 +1485,7 @@ def _lod_shadow_available_globals_for_chain(
         available_globals.update(globals_for_record)
         coverage_records.append(
             {
-                "record_index": int(record.get("record_index", -1) or -1),
+                "record_index": _int_default(record.get("record_index", -1), -1),
                 "draw_index": max(draw_indices),
                 "key": _key_payload(key),
                 "global_count": len(globals_for_record),
@@ -2362,8 +2459,8 @@ def _merge_shadow_host_plans_for_output(plans: list[dict], *, force_preserve_hos
                 bucket.setdefault("skip_keys", []).append(dict(payload))
                 existing_skip.add(skip_key)
         bucket["preserve_host_draw"] = bool(force_preserve_host_draw)
-        if int(plan.get("host_draw_index", -1) or -1) > int(bucket.get("host_draw_index", -1) or -1):
-            bucket["host_draw_index"] = int(plan.get("host_draw_index", -1) or -1)
+        if _int_default(plan.get("host_draw_index", -1), -1) > _int_default(bucket.get("host_draw_index", -1), -1):
+            bucket["host_draw_index"] = _int_default(plan.get("host_draw_index", -1), -1)
             bucket["host_source"] = str(plan.get("host_source", bucket.get("host_source", "")) or "")
     return [merged_by_key[key] for key in order]
 
@@ -2908,10 +3005,13 @@ def _runtime_shadow_vs_hashes(capture_manifest: dict) -> list[str]:
     add_many(shadow_stage.get("shadow_vs_hashes", []))
     add_many([shadow_stage.get("normal_vs_hash", ""), shadow_stage.get("transparent_vs_hash", "")])
 
-    lod_snapshot = dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})
-    lod_shadow_stage = dict(lod_snapshot.get("shadow_stage", {}) or {})
-    add_many(lod_shadow_stage.get("shadow_vs_hashes", []))
-    add_many([lod_shadow_stage.get("normal_vs_hash", ""), lod_shadow_stage.get("transparent_vs_hash", "")])
+    lod_snapshots = list(capture_manifest.get("lod_manifest_snapshots", []) or [])
+    if not lod_snapshots:
+        lod_snapshots = [dict(capture_manifest.get("lod_manifest_snapshot", {}) or {})]
+    for lod_snapshot in lod_snapshots:
+        lod_shadow_stage = dict(dict(lod_snapshot or {}).get("shadow_stage", {}) or {})
+        add_many(lod_shadow_stage.get("shadow_vs_hashes", []))
+        add_many([lod_shadow_stage.get("normal_vs_hash", ""), lod_shadow_stage.get("transparent_vs_hash", "")])
     return hashes
 
 

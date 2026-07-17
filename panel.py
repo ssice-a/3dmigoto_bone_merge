@@ -102,15 +102,26 @@ class BMC_UL_candidate_items(bpy.types.UIList):
             layout.label(text=item.ib_hash or "?")
 
 
-class BMC_UL_lod_mapping_items(bpy.types.UIList):
+class BMC_UL_lod_profiles(bpy.types.UIList):
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
         if self.layout_type in {"DEFAULT", "COMPACT"}:
             row = layout.row(align=True)
             row.prop(item, "enabled", text="")
+            row.label(text=item.label or f"LOD {int(item.lod_level)}")
+            row.label(text=item.status or "not_analyzed")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=f"L{int(item.lod_level)}")
+
+
+class BMC_UL_lod_mapping_items(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
             if item.lod_record_key:
-                row.label(text=f"G{item.canonical_global_bone} -> {item.lod_record_key}:{item.lod_local_bone}")
+                row.label(text=f"L{int(item.lod_level)} G{item.canonical_global_bone} -> {item.lod_record_key}:{item.lod_local_bone}")
             else:
-                row.label(text=f"G{item.canonical_global_bone} -> unmatched")
+                row.label(text=f"L{int(item.lod_level)} G{item.canonical_global_bone} -> unmatched")
             row.label(text=item.status or "unmatched")
             row.label(text=f"v{int(item.votes)}")
         elif self.layout_type == "GRID":
@@ -122,8 +133,11 @@ class BMC_UL_lod_fallback_items(bpy.types.UIList):
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
         if self.layout_type in {"DEFAULT", "COMPACT"}:
             row = layout.row(align=True)
-            row.prop(item, "enabled", text="")
-            row.label(text=f"G{item.canonical_global_bone} <- G{item.donor_global_bone}")
+            if item.status == "unresolved":
+                row.label(text="", icon="ERROR")
+            else:
+                row.prop(item, "enabled", text="")
+            row.label(text=f"L{int(item.lod_level)} G{item.canonical_global_bone} <- G{item.donor_global_bone}")
             row.label(text=item.method or item.status or "fallback")
             row.label(text=f"{float(item.confidence):.2f}")
         elif self.layout_type == "GRID":
@@ -178,6 +192,8 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
             "bmc_uv_flip_v",
             "bmc_candidate_items",
             "bmc_candidate_index",
+            "bmc_lod_profiles",
+            "bmc_lod_profile_index",
             "bmc_export_collection",
             "bmc_export_mode",
             "bmc_output_dir",
@@ -196,16 +212,34 @@ class VIEW3D_PT_bone_merge_capture(bpy.types.Panel):
         pool_actions = scan_box.row(align=True)
         pool_actions.operator("object.bmc_build_global_bone_pool", icon="MOD_ARMATURE", text="Build Pool")
         pool_actions.operator("object.bmc_apply_global_bone_pool", icon="GROUP_VERTEX", text="Apply Pool")
-        lod_row = scan_box.row(align=True)
-        lod_row.prop(scene, "bmc_lod_frameanalysis_dir", text="LOD")
-        lod_row.operator("object.bmc_analyze_lod_frameanalysis", icon="MESH_GRID", text="Analyze LOD")
-        lod_match_summary = getattr(scene, "bmc_lod_match_summary", "")
-        lod_match_warning = getattr(scene, "bmc_lod_match_warning", "")
-        if lod_match_summary:
-            icon = "CHECKMARK" if not lod_match_warning else "ERROR"
-            scan_box.label(text=lod_match_summary, icon=icon)
-        if lod_match_warning:
-            scan_box.label(text=lod_match_warning, icon="ERROR")
+        scan_box.label(text="LOD Profiles", icon="MESH_GRID")
+        lod_profiles = scan_box.row()
+        lod_profiles.template_list(
+            "BMC_UL_lod_profiles",
+            "",
+            scene,
+            "bmc_lod_profiles",
+            scene,
+            "bmc_lod_profile_index",
+            rows=3,
+        )
+        lod_profile_buttons = lod_profiles.column(align=True)
+        lod_profile_buttons.operator("object.bmc_lod_profile_add", icon="ADD", text="")
+        lod_profile_buttons.operator("object.bmc_lod_profile_remove", icon="REMOVE", text="")
+        lod_profile_buttons.operator("object.bmc_sync_lod_profiles", icon="FILE_REFRESH", text="")
+        if scene.bmc_lod_profiles:
+            profile_index = min(int(scene.bmc_lod_profile_index), len(scene.bmc_lod_profiles) - 1)
+            lod_profile = scene.bmc_lod_profiles[profile_index]
+            lod_detail = scan_box.column(align=True)
+            lod_detail.prop(lod_profile, "label")
+            lod_detail.prop(lod_profile, "lod_level")
+            lod_detail.prop(lod_profile, "frameanalysis_dir")
+            lod_actions = scan_box.row(align=True)
+            lod_actions.operator("object.bmc_analyze_lod_frameanalysis", icon="MESH_GRID", text="Analyze Active")
+            if lod_profile.summary:
+                lod_detail.label(text=lod_profile.summary, icon="INFO")
+            if lod_profile.warning:
+                lod_detail.label(text=lod_profile.warning, icon="ERROR")
         if getattr(scene, "bmc_lod_mapping_items", None):
             row = scan_box.row()
             row.template_list(

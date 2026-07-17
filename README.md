@@ -11,7 +11,7 @@ The current workflow is manifest-driven. Presets, legacy target scans, and INI r
 3. Import enabled candidates when native meshes are needed in Blender.
 4. Run `Build Pool` to create the compact global bone pool and IB region collections.
 5. Run `Apply Pool` to rename candidate vertex groups and merge seam groups.
-6. Optionally set `LOD FrameAnalysis Dir`, then run `Analyze LOD`.
+6. Optionally add one or more LOD Profiles, set each level and FrameAnalysis directory, then run `Analyze Active` for every enabled profile.
 7. Set `Output Dir`, choose `Buffer Only` or `Buffer + INI`, then run `Export`.
 
 The export root is the single source of truth. Child collections under the export root represent final runtime IB regions. Direct meshes in a region become implicit `part00` sharing one buffer/palette, but each mesh keeps its own draw range. Optional `partNN` children define explicit exported parts and are required for nested mesh collections.
@@ -26,7 +26,7 @@ The generated runtime does two jobs:
 
 Main and LOD capture use the same semantic contract. LOD has its own capture map file because its IB hashes and local bone palettes can differ from the main model.
 
-`vb0` is Position, `vb1` is Texcoord, `vb2` is Blend, and runtime binds `vb3` to the same Position resource.
+`vb0` is normally Position, `vb1` is Texcoord, and `vb2` is Blend. Runtime aliases `vb3` to `vb0` only when the source layout does not contain an independent `vb3` stream.
 
 ## Safety Notes
 
@@ -34,9 +34,12 @@ Main and LOD capture use the same semantic contract. LOD has its own capture map
 - `vs == 200` shadow draws for exported regions are delayed to the final compatible shadow host.
 - Visible replay is allowlisted under `if vs == 201 || vs == 202 || vs == 203`; unknown effect shaders keep their native draw.
 - Missing instance mappings and draws beyond the eight-slot runtime capacity keep their native draw.
-- CPU pre-skinned imports are named `[CPU_SKINNED_UNSUPPORTED]` and cannot enter replacement export.
+- CPU pre-skinned imports are named `[CPU_SKINNED_UNSUPPORTED]`; they remain reference-only and do not enter the global bone pool or replacement export.
 - LOD replay uses LOD texture overrides but replays the canonical exported geometry and part maps.
 - Export blocks if an actually used palette bone is unmatched by LOD until the user applies or accepts LOD fallback repair.
+- Rebuilding a changed global pool invalidates every analyzed LOD Profile because canonical `Gxx` positions may have moved.
+- LOD Mapping rows are diagnostics. LOD Repair checkboxes control which previewed fallback suggestions are applied.
+- Two enabled profiles that reuse one override key but map the same canonical bone from different source-local bones are rejected because runtime cannot distinguish them.
 
 ## Git Notes
 

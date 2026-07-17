@@ -90,6 +90,31 @@ If a visible instance has no captured UID, the native draw is preserved.
 Runtime export may emit multiple LOD shadow replay plans. A global singleton
 host is invalid when a frame contains multiple character chains.
 
+## Blender Profile Ownership
+
+Blender stores each analyzed directory as one LOD Profile with its own level,
+FrameAnalysis path, chains, links, capture records, mapping, review, and
+snapshot. Enabled profiles are aggregated only when their recorded global-pool
+generation matches the current pool.
+
+Changing a profile level or directory, or rebuilding a different global pool,
+marks that analysis stale. Stale enabled profiles block export until they are
+reanalyzed. Disabling a profile removes it from the generated aggregate without
+deleting its stored analysis.
+
+Draw indices are local to a FrameAnalysis directory. Chain detection, automatic
+donor completion, and coverage review must therefore stay scoped by
+`lod_profile_id`; equal draw indices in two profiles are unrelated.
+
+The Mapping list is diagnostic. Fallback suggestions are applied only when the
+corresponding `(lod_profile_id, canonical_global_bone)` row remains enabled in
+the Blender repair list. Unselected or unresolved used bones continue to block
+export.
+
+If two enabled profiles use the same override key and map one canonical target
+from different source-local bones, export must stop. INI runtime identity cannot
+distinguish those profile states safely.
+
 ## Chain Detection
 
 Chain detection uses compatible capture draws, ordering, and local continuity.

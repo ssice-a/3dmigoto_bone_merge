@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Bone Merge Capture",
     "author": "OpenAI Codex",
-    "version": (0, 3, 2),
+    "version": (0, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Bone Merge Capture",
     "description": "Analyze FrameAnalysis captures, import candidate IBs, and build global bone pools for Bone Merge workflows.",
@@ -31,6 +31,7 @@ def register():
     global REGISTERED_CLASSES, PROPERTY_GROUP_CLASSES, RUNTIME_CLASSES, _PROPERTIES_MODULE
     PROPERTY_GROUP_CLASSES = (
         properties.BMC_CandidateItem,
+        properties.BMC_LodProfileItem,
         properties.BMC_LodMappingItem,
         properties.BMC_LodFallbackItem,
         properties.BMC_TextureMarkItem,
@@ -40,6 +41,7 @@ def register():
     )
     RUNTIME_CLASSES = (
         panel.BMC_UL_candidate_items,
+        panel.BMC_UL_lod_profiles,
         panel.BMC_UL_lod_mapping_items,
         panel.BMC_UL_lod_fallback_items,
         panel.BMC_UL_texture_mark_items,
@@ -68,6 +70,9 @@ def register():
         operators.BMC_OT_import_selected_candidates,
         operators.BMC_OT_build_global_bone_pool,
         operators.BMC_OT_apply_global_bone_pool,
+        operators.BMC_OT_lod_profile_add,
+        operators.BMC_OT_lod_profile_remove,
+        operators.BMC_OT_sync_lod_profiles,
         operators.BMC_OT_analyze_lod_frameanalysis,
         operators.BMC_OT_preview_lod_fallbacks,
         operators.BMC_OT_apply_lod_fallbacks,

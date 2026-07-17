@@ -6,6 +6,8 @@ import json
 import re
 from pathlib import Path
 
+from .value_utils import int_or_default
+
 _PS_SLOT_RE = re.compile(r"^ps-t(?P<index>\d+)$")
 _HASH8_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 
@@ -66,7 +68,7 @@ def build_texture_mark_payload(manifest: dict, existing_payload: dict | None = N
             "extension": extension,
             "draw_index": int(raw_candidate.get("draw_index", 0) or 0),
             "ps_hash": str(raw_candidate.get("ps_hash", "") or "").strip().lower(),
-            "rt_count": int(raw_candidate.get("rt_count", -1) or -1),
+            "rt_count": int_or_default(raw_candidate.get("rt_count"), -1),
             "semantic_hint": str(raw_candidate.get("semantic_hint", "") or ""),
         }
         candidates.setdefault(region_key, {}).setdefault(draw_key, {})[slot] = binding
@@ -75,7 +77,7 @@ def build_texture_mark_payload(manifest: dict, existing_payload: dict | None = N
             {
                 "draw_index": int(raw_candidate.get("draw_index", 0) or 0),
                 "ps_hash": str(raw_candidate.get("ps_hash", "") or "").strip().lower(),
-                "rt_count": int(raw_candidate.get("rt_count", -1) or -1),
+                "rt_count": int_or_default(raw_candidate.get("rt_count"), -1),
             },
         )
 
@@ -85,7 +87,7 @@ def build_texture_mark_payload(manifest: dict, existing_payload: dict | None = N
             draw_candidates,
             key=lambda draw_key: (
                 len(draw_candidates.get(draw_key, {})),
-                int(draw_meta.get(region_key, {}).get(draw_key, {}).get("rt_count", -1) or -1),
+                int_or_default(draw_meta.get(region_key, {}).get(draw_key, {}).get("rt_count"), -1),
                 int(draw_key),
             ),
         )

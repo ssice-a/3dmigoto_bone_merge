@@ -13,6 +13,8 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+from ..value_utils import int_or_default
+
 
 _DATA_DIR = Path(__file__).resolve().parent
 _SEMANTIC_RE = re.compile(r"^(?P<name>[A-Za-z_]+)(?P<index>\d*)$")
@@ -123,7 +125,7 @@ def _field_signature(field: dict) -> tuple[str, str, int]:
     return (
         _field_semantic_key(field),
         str(field.get("format", "") or "").upper(),
-        int(field.get("aligned_byte_offset", field.get("offset", -1)) or -1),
+        int_or_default(field.get("aligned_byte_offset", field.get("offset")), -1),
     )
 
 
@@ -131,7 +133,7 @@ def _profile_field_signature(field: dict) -> tuple[str, str, int]:
     return (
         _normalize_semantic(str(field.get("semantic", "") or "")),
         str(field.get("format", "") or "").upper(),
-        int(field.get("offset", -1) or -1),
+        int_or_default(field.get("offset"), -1),
     )
 
 

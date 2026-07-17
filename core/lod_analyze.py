@@ -94,7 +94,7 @@ def analyze_lod_for_manifest(
     normalized_lod_dir = os.path.abspath(lod_frameanalysis_dir)
     if not os.path.exists(os.path.join(normalized_lod_dir, "log.txt")):
         raise ValueError(f"log.txt not found in {normalized_lod_dir}")
-    if not canonical_manifest.get("bone_pool_order"):
+    if not canonical_manifest.get("bone_pool_order") or not canonical_manifest.get("global_pool_generation"):
         raise ValueError("Build Global Bone Pool before Analyze LOD")
 
     lod_manifest = _analyze_main_frameanalysis_cached(normalized_lod_dir)
@@ -1471,8 +1471,8 @@ def _candidate_file_cache_key(candidate: dict, frameanalysis_dir: str) -> tuple:
         int(skin_slot_index),
         str(skin_format.get("blend_indices_format", "") or "").upper(),
         str(skin_format.get("blend_weights_format", "") or "").upper(),
-        int(skin_format.get("blend_indices_offset", -1) or -1),
-        int(skin_format.get("blend_weights_offset", -1) or -1),
+        _int_default(skin_format.get("blend_indices_offset", -1), -1),
+        _int_default(skin_format.get("blend_weights_offset", -1), -1),
         tuple(_file_fingerprint(path) for path in paths if path),
     )
 
@@ -1551,8 +1551,8 @@ def _point_geometry_cache_key(candidate: dict, frameanalysis_dir: str, ib_txt_pa
         int(skin_slot_index),
         str(skin_format.get("blend_indices_format", "") or "").upper(),
         str(skin_format.get("blend_weights_format", "") or "").upper(),
-        int(skin_format.get("blend_indices_offset", -1) or -1),
-        int(skin_format.get("blend_weights_offset", -1) or -1),
+        _int_default(skin_format.get("blend_indices_offset", -1), -1),
+        _int_default(skin_format.get("blend_weights_offset", -1), -1),
         tuple(_file_fingerprint(path) for path in paths if path),
     )
 
@@ -2255,7 +2255,7 @@ def _lod_record_payload(candidate: dict, source_key: str, *, vb2_signature: dict
         "lod_ib_hash": str(candidate.get("ib_hash", "") or "").lower(),
         "lod_match_first_index": int(candidate.get("match_first_index", 0) or 0),
         "lod_match_index_count": int(candidate.get("match_index_count", 0) or 0),
-        "lod_import_draw_index": int(candidate.get("import_draw_index", -1) or -1),
+        "lod_import_draw_index": _int_default(candidate.get("import_draw_index", -1), -1),
         "lod_capture_draw_indices": [int(value) for value in candidate.get("shadow_draw_indices", []) or []],
         "lod_local_bone_count": int(candidate.get("local_bone_count", 0) or 0),
         "lod_source_local_bone_count": int(candidate.get("source_local_bone_count", candidate.get("local_bone_count", 0)) or 0),

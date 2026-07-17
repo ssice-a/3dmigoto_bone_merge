@@ -12,11 +12,100 @@ if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
 ini_export = importlib.import_module(f"{PACKAGE_DIR.name}.core.ini_export")
+hlsl_assets = importlib.import_module(f"{PACKAGE_DIR.name}.core.hlsl_assets")
 models = importlib.import_module(f"{PACKAGE_DIR.name}.core.models")
 LocalPaletteRecord = models.LocalPaletteRecord
 
 
 class RuntimeIniTests(unittest.TestCase):
+    def test_current_game_uses_b1_for_capture_and_shadow_but_b2_for_visible_replay(self):
+        manifest = {
+            "shadow_stage": {
+                "shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"],
+                "normal_vs_hash": "aaaaaaaaaaaaaaaa",
+                "host_ib_hash": "12345678",
+                "host_match_first_index": 0,
+                "host_match_index_count": 42,
+                "host_draw_index": 10,
+            },
+            "bone_pool_order": [
+                {
+                    "ib_hash": "12345678",
+                    "match_first_index": 0,
+                    "match_index_count": 42,
+                    "global_bone_base": 0,
+                    "local_bone_count": 1,
+                    "used_local_bone_indices": [0],
+                    "bone_capture_available": True,
+                }
+            ],
+            "draw_hits": [
+                {
+                    "draw_index": 10,
+                    "ib_hash": "12345678",
+                    "first_index": 0,
+                    "index_count": 42,
+                    "pass_role": "normal_shadow",
+                }
+            ],
+        }
+        palette = LocalPaletteRecord(
+            object_name="body",
+            ib_hash="12345678",
+            match_index_count=42,
+            chunk_index=0,
+            local_bone_count=1,
+            palette_values=(0,),
+            file_name="12345678-42-0_part00-PartLocalToGlobalBoneMap.buf",
+            file_path="",
+            resource_suffix="12345678_42_0_part00",
+            match_first_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(
+                tmpdir,
+                manifest,
+                [palette],
+                [_geometry_record("12345678", 42, 0, 3)],
+            )
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+            hlsl_dir = Path(hlsl_assets.export_required_hlsl(tmpdir))
+            record_shader = (hlsl_dir / "record_bones_cs.hlsl").read_text(encoding="utf-8")
+            redirect_shader = (hlsl_dir / "redirect_cb_cs.hlsl").read_text(encoding="utf-8")
+
+        self.assertNotIn("CustomShader_Extract", ini_text)
+        self.assertIn("if vs == 200", ini_text)
+        self.assertIn("PoolBMCInstanceRegistry[$bmc_instance_uid] = copy vs-cb1", ini_text)
+        self.assertIn("ResourceCapturedCB = ref PoolBMCInstanceRegistry[$bmc_instance_uid]", ini_text)
+        self.assertIn("vs-cb1->HashRegion($bmc_hash_offset, 64)", ini_text)
+        self.assertIn("; delayed normal shadow replay", ini_text)
+        self.assertIn("vs-cb1 = ResourceFakeCB", ini_text)
+        self.assertIn("(vs == 201 || vs == 202 || vs == 203)", ini_text)
+        self.assertIn("ResourceCapturedCB = copy vs-cb2", ini_text)
+        self.assertIn("vs-cb2->HashRegion($bmc_hash_offset, 64)", ini_text)
+        self.assertIn("vs-cb2 = ResourceFakeCB", ini_text)
+        self.assertIn("$bmc_instance_uid == $bmc_slot_uid_0", ini_text)
+        self.assertIn("drawindexedinstanced = 3,1,0,0,$bmc_slot_native_0", ini_text)
+        self.assertIn("drawindexedinstanced = 3,1,0,0,$bmc_slot_native_1", ini_text)
+        visible_section = ini_text[ini_text.index("if (vs == 201 || vs == 202 || vs == 203)") :]
+        self.assertNotIn("#PoolBMCInstanceRegistry", visible_section)
+        self.assertIn("if $bmc_mapping_valid == 1\n    handling = skip", visible_section)
+        self.assertIn("StructuredBuffer<uint4> CapturedCB", record_shader)
+        self.assertIn("StructuredBuffer<uint4> CapturedCB", redirect_shader)
+
+    def test_current_game_shader_filters_are_owned_by_core_shaderregex(self):
+        manifest = {"shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]}, "bone_pool_order": []}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [])
+            ini_text = ini_export.build_bonestore_ini_content(runtime)
+
+        self.assertNotIn("[ShaderOverride", ini_text)
+        self.assertNotIn("filter_index =", ini_text)
+        self.assertIn("[PoolBMCInstanceRegistry]", ini_text)
+        self.assertIn("pool_index_type = fifo", ini_text)
+
     def test_main_capture_uses_one_static_bone_map(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
@@ -116,7 +205,7 @@ class RuntimeIniTests(unittest.TestCase):
             self.assertIn("run = CustomShader_RecordBones", ini_text)
             self.assertNotIn("CustomShader_RecordBonesScatter", ini_text)
             self.assertIn("ResourceCaptureBoneMap_87654321_77_5_LOD", ini_text)
-            self.assertIn("hash = bbbbbbbbbbbbbbbb", ini_text)
+            self.assertNotIn("hash = bbbbbbbbbbbbbbbb", ini_text)
 
     def test_same_override_key_records_all_capture_maps(self):
         manifest = {
@@ -519,7 +608,8 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("cs-t2 = ResourceCaptureBoneMap_bbbbbbbb_20_0_MAIN", main_only_section)
         self.assertNotIn("ResourceLodCaptureBoneMap", main_only_section)
         self.assertNotIn("$bmc_profile_lod", ini_text)
-        self.assertIn("if vs == 200\n  draw = from_caller", ini_text)
+        self.assertIn("if first_instance + instance_count <= 8", ini_text)
+        self.assertIn("draw = from_caller", ini_text)
 
     def test_lod_capture_records_only_exported_lod_replay_globals(self):
         manifest = {
@@ -836,12 +926,13 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertNotIn("LOD maps to main", lod_section)
         self.assertNotIn("LOD replay exported", lod_section)
         self.assertIn("cs-t2 = ResourceCaptureBoneMap_bbbbbbbb_20_5_LOD", lod_section)
-        self.assertIn("if vs != 200", lod_section)
+        self.assertIn("(vs == 201 || vs == 202 || vs == 203)", lod_section)
+        self.assertIn("ResourceCapturedCB = copy vs-cb2", lod_section)
         self.assertIn("; replay aaaaaaaa_10_0_part00", lod_section)
         self.assertIn("ResourcePart_aaaaaaaa_10_0_part00_Index", lod_section)
         self.assertIn("ResourcePartLocalToGlobalBoneMap_aaaaaaaa_10_0_part00", lod_section)
         self.assertNotIn("ResourcePart_bbbbbbbb_20_5_part00_Index", lod_section)
-        self.assertIn("; Blender objects: body_mesh\n  drawindexedinstanced", lod_section)
+        self.assertIn("; Blender objects: body_mesh\n    drawindexedinstanced", lod_section)
 
     def test_lod_shadow_replay_skips_lod_hash_and_draws_main_geometry(self):
         manifest = {
@@ -1527,9 +1618,12 @@ class RuntimeIniTests(unittest.TestCase):
 
         self.assertIn("[ResourcePart_12345678_42_0_part00_Position]", ini_text)
         self.assertIn("[ResourcePart_12345678_42_0_part00_Index]", ini_text)
-        self.assertIn("if vs != 200", ini_text)
+        self.assertIn("(vs == 201 || vs == 202 || vs == 203)", ini_text)
         self.assertIn("  handling = skip", ini_text)
-        self.assertIn("if vs == 200\n  run = CustomShader_ExtractCB1\n  cs-t2 = ResourceCaptureBoneMap_12345678_42_0_MAIN\n  run = CustomShader_RecordBones\nendif", ini_text)
+        self.assertIn("if vs == 200", ini_text)
+        self.assertIn("PoolBMCInstanceRegistry[$bmc_instance_uid] = copy vs-cb1", ini_text)
+        self.assertIn("cs-t2 = ResourceCaptureBoneMap_12345678_42_0_MAIN", ini_text)
+        self.assertIn("run = CustomShader_RecordBones", ini_text)
         self.assertNotIn("x100 =", ini_text)
         self.assertNotIn("visible fallback main bone capture", ini_text)
         self.assertNotIn("x101 =", ini_text)
@@ -1560,14 +1654,17 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
         section = ini_text[ini_text.index("[TextureOverride_BMC_12345678_42_0]") :]
-        self.assertIn("if vs == 200\n  run = CustomShader_ExtractCB1\n  cs-t2 = ResourceCaptureBoneMap_12345678_42_0_MAIN\n  run = CustomShader_RecordBones\nendif", section)
+        self.assertIn("if vs == 200", section)
+        self.assertIn("PoolBMCInstanceRegistry[$bmc_instance_uid] = copy vs-cb1", section)
+        self.assertIn("cs-t2 = ResourceCaptureBoneMap_12345678_42_0_MAIN", section)
+        self.assertIn("run = CustomShader_RecordBones", section)
         self.assertNotIn("x100 =", section)
-        self.assertNotIn("if vs != 200", section)
+        self.assertNotIn("(vs == 201 || vs == 202 || vs == 203)", section)
         self.assertNotIn("visible fallback main bone capture", section)
         self.assertNotIn("  handling = skip", section)
         self.assertNotIn("  drawindexedinstanced", section)
 
-    def test_residual_filter_rules_can_exclude_visible_replay(self):
+    def test_visible_replay_uses_fixed_stage_allowlist(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
             "bone_pool_order": [
@@ -1600,25 +1697,11 @@ class RuntimeIniTests(unittest.TestCase):
             runtime = ini_export.materialize_bonestore_runtime(tmpdir, manifest, [palette], geometry)
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
-        self.assertIn("[ShaderOverrideBMCResidualVS_0ba16985f9f74f8d]", ini_text)
-        self.assertIn("filter_index = 204", ini_text)
-        self.assertIn("if vs != 200 && vs != 204", ini_text)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            runtime = ini_export.materialize_bonestore_runtime(
-                tmpdir,
-                manifest,
-                [palette],
-                geometry,
-                filter_residual=False,
-            )
-            ini_text = ini_export.build_bonestore_ini_content(runtime)
-
         self.assertNotIn("ShaderOverrideBMCResidualVS", ini_text)
-        self.assertIn("if vs != 200", ini_text)
-        self.assertNotIn("vs != 204", ini_text)
+        self.assertNotIn("filter_index = 204", ini_text)
+        self.assertIn("(vs == 201 || vs == 202 || vs == 203)", ini_text)
 
-    def test_manifest_shader_filter_rules_are_kept_with_filter_index(self):
+    def test_manifest_shader_filter_rules_do_not_reintroduce_per_mod_hash_lists(self):
         manifest = {
             "shadow_stage": {"shadow_vs_hashes": ["aaaaaaaaaaaaaaaa"]},
             "shader_filter_overrides": [
@@ -1663,10 +1746,11 @@ class RuntimeIniTests(unittest.TestCase):
             )
             ini_text = ini_export.build_bonestore_ini_content(runtime)
 
-        self.assertIn("[ShaderOverrideAutoVS_bbbbbbbbbbbbbbbb]", ini_text)
-        self.assertIn("hash = bbbbbbbbbbbbbbbb", ini_text)
-        self.assertIn("filter_index = 205", ini_text)
-        self.assertIn("if vs != 200 && vs != 205 && vs != 204", ini_text)
+        self.assertNotIn("[ShaderOverrideAutoVS_bbbbbbbbbbbbbbbb]", ini_text)
+        self.assertNotIn("hash = bbbbbbbbbbbbbbbb", ini_text)
+        self.assertNotIn("filter_index = 205", ini_text)
+        self.assertIn("(vs == 201 || vs == 202 || vs == 203)", ini_text)
+        self.assertNotIn("vs != 205", ini_text)
 
     def test_shadow_replay_uses_late_host_and_white_resource_for_normal_parts(self):
         manifest = {
@@ -1900,7 +1984,8 @@ class RuntimeIniTests(unittest.TestCase):
 
         self.assertEqual(["aaaaaaaa_10_0_part00"], runtime["shadow_replay_plan"]["transparent_parts"])
         self.assertEqual(["aaaaaaaa_10_0_part00"], runtime["shadow_replay_plan"]["normal_parts"])
-        self.assertEqual(ini_text.count("; replay aaaaaaaa_10_0_part00"), 3)
+        expected_replays = 1 + 2 * int(runtime["instance_pool_size"])
+        self.assertEqual(ini_text.count("; replay aaaaaaaa_10_0_part00"), expected_replays)
 
     def test_export_rejects_capture_unavailable_global_groups(self):
         manifest = {
@@ -2191,7 +2276,8 @@ class RuntimeIniTests(unittest.TestCase):
             ini_text.index("[Present]")
         ]
         self.assertNotIn("  draw = from_caller", host_section)
-        self.assertIn("if vs == 200\n  handling = skip", host_section)
+        self.assertIn("if vs == 200", host_section)
+        self.assertIn("if first_instance + instance_count <= 8\n    handling = skip", host_section)
         self.assertIn("if $bmc_toggle_hair == 1", host_section)
 
 

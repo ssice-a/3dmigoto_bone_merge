@@ -21,10 +21,9 @@ from .export_names import ini_filename_from_collection_name
 from .hlsl_assets import export_required_hlsl
 from .ini_export import (
     materialize_bonestore_runtime,
-    materialize_simple_override_runtime,
     write_bonestore_ini,
-    write_simple_override_ini_from_runtime,
 )
+from .simple_override_adapter import materialize_simple_override_runtime, write_simple_override_ini_from_runtime
 from .io import ensure_directory, read_json, write_json
 from .models import LocalPaletteRecord
 from .export_buffers import write_part_geometry_buffers
@@ -43,7 +42,6 @@ def prepare_export_collection(
     capture_manifest_path: str | None = None,
     generate_ini: bool = True,
     simple_override: bool = False,
-    filter_residual: bool = True,
 ):
     if source_collection is None:
         raise ValueError("Export source collection is not set")
@@ -124,7 +122,6 @@ def prepare_export_collection(
         "export_options": {
             "mirror_flip": bool(getattr(context.scene, "bmc_mirror_flip", True)),
             "uv_flip_v": bool(getattr(context.scene, "bmc_uv_flip_v", True)),
-            "filter_residual": bool(filter_residual),
         },
         "objects": object_records,
         "warnings": warnings,
@@ -166,7 +163,6 @@ def prepare_export_collection(
             export_manifest_path=manifest_path,
             local_palette_records=local_palette_records,
             write_ini=generate_ini,
-            filter_residual=filter_residual,
         )
     timings["runtime"] = time.perf_counter() - stage_start
     timings["total"] = time.perf_counter() - total_start
@@ -198,9 +194,6 @@ def _simple_runtime_manifest(runtime_plan: dict) -> dict:
         "textures": list(runtime_plan.get("textures", []) or []),
         "toggle_draw_sets": list(runtime_plan.get("toggle_draw_sets", []) or []),
         "texture_warnings": list(runtime_plan.get("texture_warnings", []) or []),
-        "visible_replay_excluded_filter_indices": list(
-            runtime_plan.get("visible_replay_excluded_filter_indices", []) or []
-        ),
     }
 
 
@@ -347,7 +340,6 @@ def regenerate_bonestore_runtime_files(
     local_palette_records: list[LocalPaletteRecord] | None = None,
     mapping_payload: dict | None = None,
     write_ini: bool = True,
-    filter_residual: bool | None = None,
 ) -> str:
     _ = mapping_payload
     manifest_path = os.path.abspath(capture_manifest_path or "") if capture_manifest_path else ""
@@ -370,9 +362,6 @@ def regenerate_bonestore_runtime_files(
         ]
     elif normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
         export_manifest = read_json(normalized_export_manifest_path)
-    if filter_residual is None:
-        export_options = dict(export_manifest.get("export_options", {}) or {}) if isinstance(export_manifest, dict) else {}
-        filter_residual = bool(export_options.get("filter_residual", True))
     geometry_records = list(export_manifest.get("geometry_buffers", []) or []) if isinstance(export_manifest, dict) else []
     texture_mark_payload = dict(export_manifest.get("texture_marks", {}) or {}) if isinstance(export_manifest, dict) else {}
     toggle_draw_sets = list(export_manifest.get("toggle_draw_sets", []) or []) if isinstance(export_manifest, dict) else []
@@ -383,7 +372,6 @@ def regenerate_bonestore_runtime_files(
         geometry_records,
         texture_mark_payload,
         toggle_draw_sets,
-        filter_residual=bool(filter_residual),
     )
     ini_file_name = _ini_file_name_from_export_manifest(export_manifest)
     runtime_plan["ini_file_name"] = ini_file_name
@@ -394,11 +382,12 @@ def regenerate_bonestore_runtime_files(
     if normalized_export_manifest_path and os.path.exists(normalized_export_manifest_path):
         export_manifest = read_json(normalized_export_manifest_path)
         export_manifest["runtime"] = {
-            "schema_version": int(runtime_plan.get("schema_version", 2)),
+            "schema_version": int(runtime_plan.get("schema_version", 3)),
+            "runtime_architecture": str(runtime_plan.get("runtime_architecture", "")),
             "namespace": str(runtime_plan.get("namespace", "")),
             "ini_file_name": ini_file_name,
             "global_bone_count": int(runtime_plan.get("global_bone_count", 0) or 0),
-            "filter_residual": bool(runtime_plan.get("filter_residual", True)),
+            "instance_pool_size": int(runtime_plan.get("instance_pool_size", 0) or 0),
             "capture_records": list(runtime_plan.get("capture_records", []) or []),
             "lod_capture_records": list(runtime_plan.get("lod_capture_records", []) or []),
             "lod_replay_links": list(runtime_plan.get("lod_replay_links", []) or []),
@@ -411,10 +400,6 @@ def regenerate_bonestore_runtime_files(
             "geometry": list(runtime_plan.get("geometry", []) or []),
             "textures": list(runtime_plan.get("textures", []) or []),
             "toggle_draw_sets": list(runtime_plan.get("toggle_draw_sets", []) or []),
-            "shader_filter_overrides": list(runtime_plan.get("shader_filter_overrides", []) or []),
-            "visible_replay_excluded_filter_indices": list(
-                runtime_plan.get("visible_replay_excluded_filter_indices", []) or []
-            ),
             "shadow_stage": dict(runtime_plan.get("shadow_stage", {}) or {}),
             "shadow_replay_plan": dict(runtime_plan.get("shadow_replay_plan", {}) or {}),
             "lod_shadow_replay_plan": dict(runtime_plan.get("lod_shadow_replay_plan", {}) or {}),

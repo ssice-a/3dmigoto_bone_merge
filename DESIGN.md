@@ -13,7 +13,7 @@ The plugin should optimize for runtime performance first. Reuse and cleanliness 
 
 The current INI/HLSL runtime constraints and multi-instance investigation notes
 are maintained in `docs/RUNTIME_INI_HLSL_CONSTRAINTS.md`. That document is the
-working contract for the next runtime rewrite.
+source of truth for the implemented schema v3 runtime.
 
 Generated runtime output uses one `BoneStore.ini`. HLSL may be split into
 reusable shader files, but generated INI control flow should stay mostly inline;
@@ -125,7 +125,7 @@ pair:
   y = target_global_bone
 ```
 
-At runtime, the `TextureOverride` hash and `if vs == ...` filter select the capture draw, and `x100` selects the compact capture record inside the static table.
+At runtime, the `TextureOverride` hash selects the source geometry and the EFMI Core ShaderRegex filter selects the compatible capture stage. Each generated capture branch binds the counted capture-map resource for that source directly; there is no runtime record selector.
 
 A capture record should be accepted only after matching several independent signals:
 
@@ -235,7 +235,6 @@ Each record represents one accepted native source palette. Records are sorted by
   "capture_meta_index": 0,
   "vs_t0_hash": "554904b3",
   "native_cb1_xy": [449614, 448066],
-  "redirect_cb1_xy": [0, 1024],
   "capture_vs_filter": 200,
   "capture_draw_indices": [211],
   "confidence": "exact_hash",
@@ -373,24 +372,24 @@ INI and buffer generation must stop when required validation fails.
 
 ## Runtime Pipeline
 
-Capture step:
+EFMI Core ShaderRegex classifies compatible character shaders as `200-203`.
+Generated mods do not own static character VS hash tables.
+
+Capture step (`vs == 200`, shader-visible CB is `b1`):
 
 ```ini
-run = CustomShader_ExtractCB1
-x100 = <capture_record_index>
-cs-t2 = ResourceMainCaptureBoneMap
+$bmc_hash_offset = $bmc_native_slot * 256
+$bmc_instance_uid = vs-cb1->HashRegion($bmc_hash_offset, 64)
+$bmc_capture_slot = #PoolBMCInstanceRegistry[$bmc_instance_uid]
+PoolBMCInstanceRegistry[$bmc_instance_uid] = copy vs-cb1
+ResourceCapturedCB = ref PoolBMCInstanceRegistry[$bmc_instance_uid]
+cs-t2 = ResourceCaptureBoneMap_<source>
 run = CustomShader_RecordBones
 ```
 
-Generated runtime may run capture outside `if vs == 200` so visible/effect
-draws can refresh the pool when the early shadow capture draw is absent. Safety
-therefore lives in `RecordBones`: it validates the current draw's
-shader-visible `cb1[5]` bone window, source bone count, `vs-t0` dimensions, and
-a nonzero sampled matrix before writing to the global bone pool. Invalid passes
-must leave the previous valid pool contents untouched.
-
-`RecordBones` reads the current draw's native `vs-t0` by reference and reads
-the current draw's shader-visible `cb1[5].x/y/z` from the extracted CB1 copy.
+The FIFO pool both assigns the capture slot and stores the visible CB needed by
+delayed shadow replay. `RecordBones` validates the copied bone window,
+`vs-t0` dimensions, and a nonzero sampled matrix before marking the slot valid.
 
 FrameAnalysis showed that the game binds a large native bone store in `vs-t0`. The native `cb1[5].x/y` values point into that large store and are not `0/1024`. Therefore capture must use:
 
@@ -408,6 +407,10 @@ previous: native_previous_base + 3 + localBone * 3 + row
 
 into the global capture store at `capture_store_base`.
 
+EFMI automatically applies `VSSetConstantBuffers1.FirstConstant` when copying
+or hashing a CB view. INI and HLSL offsets are relative to shader-visible row
+zero and must not add `FirstConstant` again.
+
 Capture-only overrides may suppress original drawing only for source draws that have exported replacement geometry in the current export collection. Skipping an original draw without issuing replacement draw calls will create missing model parts. Therefore draw suppression must live inside the guarded branch that also emits the replacement path for that exported source.
 
 The global store layout must always match this shader meaning:
@@ -420,29 +423,41 @@ capture_store_index = capture_store_base + localBone
 
 `capture_store_base` is measured in bones, not rows. `source_local_bone_count` is also measured in bones. Any frontend, manifest, or generator code that treats these values as rows is wrong.
 
-Consume pass:
+Visible consume pass (`vs == 201 || vs == 202 || vs == 203`, CB is `b2`):
 
 ```ini
-run = CustomShader_ExtractCB1
+ResourceCapturedCB = copy vs-cb2
+run = CustomShader_ClearInstanceMapping
+; Resolve each current root-matrix UID against captured slot metadata.
+if $bmc_mapping_valid == 1
+  handling = skip
 cs-t2 = ResourcePartLocalToGlobalBoneMap_<part>
 run = CustomShader_GatherLocalBones
 vs-t0 = ResourceLocalBonePool_SRV
-run = CustomShader_RedirectCB1
-vs-cb1 = ResourceFakeCB1
+run = CustomShader_RedirectCB
+vs-cb2 = ResourceFakeCB
+endif
 ```
 
 `PartLocalToGlobalBoneMap` is a counted buffer. `uint[0]` is the part local bone
 count and `uint[1..]` maps part-local bone indices to canonical global bones.
 The consume path must not emit `x101`; the map and its count are one resource.
 
-`RedirectCB1` is part of the default consume path. Once `ResourceLocalBonePool_SRV` is bound as `vs-t0`, the original native bone-window rows would point outside the local pool. `RedirectCB1` must preserve all current `cb1` values except shader-visible `cb1[slot * 16 + 5].x/y`, which are rewritten to the local palette bases:
+`RedirectCB` is part of the default consume path. Once
+`ResourceLocalBonePool_SRV` is bound as `vs-t0`, the original native
+bone-window rows would point outside the local pool. It preserves all copied CB
+values except shader-visible `cb[slot * 16 + 5].x/y`, which are rewritten to
+the local palette bases:
 
 ```text
-cb1[slot * 16 + 5].x = slot * LOCAL_SLOT_ROW_STRIDE
-cb1[slot * 16 + 5].y = slot * LOCAL_SLOT_ROW_STRIDE + LOCAL_PREVIOUS_ROW_OFFSET
+cb[slot * 16 + 5].x = slot * LOCAL_SLOT_ROW_STRIDE
+cb[slot * 16 + 5].y = slot * LOCAL_SLOT_ROW_STRIDE + LOCAL_PREVIOUS_ROW_OFFSET
 ```
 
-If a future design binds the full global capture store directly as `vs-t0`, then the cb1 bone-window rows must instead be redirected to that part's global current/previous offsets. Under the current small-buffer consume design, the correct redirect target is always the per-slot local pool window.
+Delayed shadow replay binds each saved pool CB and patches `b1` one instance at
+a time. Visible replay keeps the current instanced draw shape and patches `b2`
+for every successfully resolved native slot. If any visible UID is missing,
+the runtime leaves the native draw unskipped.
 
 ## Performance Direction
 
@@ -485,7 +500,7 @@ pair uint2:
   y = target_global_bone
 ```
 
-`x100` selects the record. `cs-t2` binds `ResourceMainCaptureBoneMap`. Main capture normally stores direct pairs such as `local 0 -> global_base + 0`, while LOD capture uses the same pair shape in a separate LOD file.
+Each generated capture branch binds its exact counted capture map to `cs-t2`. Main capture normally stores direct pairs such as `local 0 -> global_base + 0`, while LOD capture uses the same pair shape in its source-specific map. No INI scalar selects a record at runtime.
 
 ### PartLocalToGlobalBoneMap
 
@@ -1976,15 +1991,15 @@ This ordering belongs in the generated replay manifest, not in an ad hoc UI choi
 
 ## Implementation Readiness
 
-The core architecture is ready for implementation. Remaining items are verification gates, not blockers for starting the plugin.
+The schema v3 core architecture is implemented. Remaining items are in-game verification gates rather than unfinished generator or HLSL design work.
 
-Implementation should not be constrained by the old plugin architecture. The old Scan/BoneStore/preset code can be used as reference material, but the v2 path should be allowed to replace modules outright when the old shape conflicts with the new data contract. Compatibility is useful only when it does not compromise the main flow:
+Schema v3 has replaced the old Scan/BoneStore/preset runtime where it conflicted with the current data contract. The maintained main flow is:
 
 ```text
 Analyze Main -> Candidate IB List -> Import Selected -> Build Global Bone Pool -> Apply Global Bone Pool -> Export -> Generate INI
 ```
 
-Legacy panels/operators may remain temporarily while the v2 path is built, but they are not architectural requirements.
+The UI and operators expose this manifest-driven flow directly. CPU pre-skinned candidates may be imported for reference, but are marked `[CPU_SKINNED_UNSUPPORTED]` and rejected by replacement export.
 
 ### Verification Gates
 

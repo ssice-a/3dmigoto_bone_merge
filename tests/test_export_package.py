@@ -197,6 +197,18 @@ def collect_groups(mesh_obj):
 
 
 class ExportPackageTests(unittest.TestCase):
+    def test_cpu_pre_skinned_import_is_rejected_from_replacement_export(self):
+        mesh = FakeObject("face [CPU_SKINNED_UNSUPPORTED]", [0, 1])
+        mesh["bmc_replacement_supported"] = False
+        mesh["bmc_replacement_unsupported_reason"] = "cpu_pre_skinned_vertex_stream"
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("945c08a9-1698-0", objects=[mesh])],
+        )
+
+        with self.assertRaisesRegex(export_package.ExportPlanError, "CPU pre-skinned draw cannot be exported"):
+            export_package.build_export_plan(root, collect_groups)
+
     def test_implicit_region_part_builds_sorted_palette(self):
         mesh_a = FakeObject("body", [9, 0, 4])
         mesh_b = FakeObject("arm", [31, 4])
@@ -597,6 +609,9 @@ class ExportPackageTests(unittest.TestCase):
             self.assertEqual(Path(result["bonestore_ini_path"]).name, "Simple Export.ini")
             ini_text = Path(result["bonestore_ini_path"]).read_text(encoding="utf-8")
             self.assertIn("[TextureOverride_BMCSimple_640d1c0e_3_0]", ini_text)
+            self.assertIn("if vs == 201 || vs == 202 || vs == 203", ini_text)
+            self.assertNotIn("[ShaderOverride", ini_text)
+            self.assertNotIn("instance_count <= 8", ini_text)
             self.assertIn("vb2 = ResourcePart_640d1c0e_3_0_part00_Blend", ini_text)
             self.assertIn("drawindexedinstanced = 3,INSTANCE_COUNT,0,0,FIRST_INSTANCE", ini_text)
             self.assertNotIn("CustomShader_GatherLocalBones", ini_text)

@@ -10,11 +10,11 @@ from ..constants import HLSL_EXPORT_DIR_NAME
 
 _REQUIRED_HLSL_FILES = (
     "bone_store_common.hlsli",
-    "extract_cb1_vs.hlsl",
-    "extract_cb1_ps.hlsl",
     "record_bones_cs.hlsl",
+    "clear_instance_mapping_cs.hlsl",
+    "resolve_instance_mapping_cs.hlsl",
     "gather_local_bones_cs.hlsl",
-    "redirect_cb1_cs.hlsl",
+    "redirect_cb_cs.hlsl",
     "reset_runtime_state_cs.hlsl",
 )
 

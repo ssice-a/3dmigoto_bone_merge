@@ -21,7 +21,8 @@ The export root is the single source of truth. Child collections under the expor
 The generated runtime does two jobs:
 
 - Capture native current/previous bone matrices into the canonical global pool.
-- Gather each exported part's `PartLocalToGlobalBoneMap` into a small local pool before replay, bind that pool as `vs-t0`, and redirect `cb1`.
+- Use EFMI `HashRegion` plus a FIFO CB resource pool to keep same-character instances mapped across shadow and visible passes.
+- Gather each exported part's `PartLocalToGlobalBoneMap` into a small local pool before replay, bind that pool as `vs-t0`, and redirect shadow `b1` or visible `b2`.
 
 Main and LOD capture use the same semantic contract. LOD has its own capture map file because its IB hashes and local bone palettes can differ from the main model.
 
@@ -31,7 +32,9 @@ Main and LOD capture use the same semantic contract. LOD has its own capture map
 
 - Only exported region IBs are skipped.
 - `vs == 200` shadow draws for exported regions are delayed to the final compatible shadow host.
-- Visible replay lives under `if vs != 200`.
+- Visible replay is allowlisted under `if vs == 201 || vs == 202 || vs == 203`; unknown effect shaders keep their native draw.
+- Missing instance mappings and draws beyond the eight-slot runtime capacity keep their native draw.
+- CPU pre-skinned imports are named `[CPU_SKINNED_UNSUPPORTED]` and cannot enter replacement export.
 - LOD replay uses LOD texture overrides but replays the canonical exported geometry and part maps.
 - Export blocks if an actually used palette bone is unmatched by LOD until the user applies or accepts LOD fallback repair.
 

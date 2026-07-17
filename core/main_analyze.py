@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -85,6 +86,7 @@ class DrawState:
     ia_index_offset: int = -1
     ia_backing_hash: str = ""
     vs_cb1_first_constant: int = 0
+    vs_cb2_first_constant: int = 0
 
 
 @dataclass
@@ -616,7 +618,9 @@ def _build_candidate_entries(
             if _state_vs_hash(draw_states, dump_file) in shadow_vs_hashes
         ]
         import_state = draw_states.get(import_hit.draw_index)
-        position_stream = _build_position_stream_payload(files_by_draw, import_hit)
+        position_stream = _build_position_stream_payload(files_by_draw, import_hit, import_state)
+        skinning_mode = _classify_skinning_mode(position_stream)
+        replacement_supported = skinning_mode["kind"] != "cpu_pre_skinned"
         lod_match_excluded = _is_dynamic_vb0_position_stream(position_stream)
         lod_match_excluded_reason = (
             "dynamic_vb0_backing_hash_mismatch" if lod_match_excluded else ""
@@ -642,10 +646,19 @@ def _build_candidate_entries(
             "source_local_bone_count": int(source_local_bone_count),
             "local_bone_count": int(source_local_bone_count),
             "texture_region_key": f"{ib_hash}-{index_count}-{first_index}",
-            "status": _candidate_runtime_status(bool(key_shadow_hits), lod_match_excluded),
+            "status": _candidate_runtime_status(
+                bool(key_shadow_hits),
+                lod_match_excluded,
+                replacement_supported=replacement_supported,
+            ),
             "import_paths": _build_import_paths_payload(files_by_draw, ordered_hits),
             "skin_format": _build_skin_format_payload(files_by_draw, import_hit),
             "position_stream": position_stream,
+            "skinning_mode": skinning_mode,
+            "replacement_supported": replacement_supported,
+            "replacement_unsupported_reason": (
+                "cpu_pre_skinned_vertex_stream" if not replacement_supported else ""
+            ),
             "dynamic_vb0": lod_match_excluded,
             "lod_match_excluded": lod_match_excluded,
             "lod_match_excluded_reason": lod_match_excluded_reason,
@@ -667,6 +680,18 @@ def _build_candidate_entries(
             int(source_local_bone_count) if 0 < int(source_local_bone_count) <= 256 else 0,
             used_source_local_bone_count,
         )
+        if not replacement_supported:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "cpu_pre_skinned_replacement_unsupported",
+                    "message": (
+                        f"{candidate['display_name']} uses a CPU pre-skinned current/previous position stream; "
+                        "it can be imported for reference but cannot be exported as replacement geometry."
+                    ),
+                    "draw_indices": [int(import_hit.draw_index)],
+                }
+            )
         candidates.append(candidate)
     if skipped_no_import:
         warnings.append(
@@ -689,15 +714,120 @@ def _build_candidate_entries(
     return candidates
 
 
-def _build_position_stream_payload(files_by_draw: dict[int, list[DumpFile]], import_hit: DumpFile) -> dict:
+def _build_position_stream_payload(
+    files_by_draw: dict[int, list[DumpFile]],
+    import_hit: DumpFile,
+    draw_state: DrawState | None,
+) -> dict:
     draw_files = files_by_draw.get(import_hit.draw_index, [])
     vb0_file = _first_slot_file(draw_files, "vb0", "txt")
+    vb3_file = _first_slot_file(draw_files, "vb3", "txt")
+    layout_path = str(vb0_file.data_path or vb0_file.path) if vb0_file else ""
+    layout = _parse_buffer_header(layout_path)
+    texcoord4 = next(
+        (
+            element
+            for element in layout.elements
+            if element.semantic_name.upper() == "TEXCOORD" and int(element.semantic_index) == 4
+        ),
+        None,
+    )
+    cb2_first_constant = int(draw_state.vs_cb2_first_constant if draw_state else 0)
+    cb2_skinning_flags = _read_cb_uint32(
+        draw_files,
+        slot="vs-cb2",
+        first_constant=cb2_first_constant,
+        row=4,
+        component=3,
+    )
+    vb0_data_path = str(vb0_file.data_path or "") if vb0_file else ""
+    vb3_data_path = str(vb3_file.data_path or "") if vb3_file else ""
+    vb3_distinct = bool(
+        vb0_file
+        and vb3_file
+        and (
+            vb0_file.resource_hash != vb3_file.resource_hash
+            or (vb0_data_path and vb3_data_path and os.path.normcase(vb0_data_path) != os.path.normcase(vb3_data_path))
+        )
+    )
     return {
         "ib_hash": import_hit.resource_hash,
         "ib_backing_hash": import_hit.backing_hash,
         "vb0_hash": vb0_file.resource_hash if vb0_file else "",
         "vb0_backing_hash": vb0_file.backing_hash if vb0_file else "",
+        "vb3_hash": vb3_file.resource_hash if vb3_file else "",
+        "vb3_backing_hash": vb3_file.backing_hash if vb3_file else "",
+        "vb3_distinct": vb3_distinct,
+        "texcoord4_input_slot": int(texcoord4.input_slot) if texcoord4 else -1,
+        "texcoord4_format": str(texcoord4.fmt or "") if texcoord4 else "",
+        "cb2_first_constant": cb2_first_constant,
+        "cb2_skinning_flags": cb2_skinning_flags,
     }
+
+
+def _read_cb_uint32(
+    draw_files: list[DumpFile],
+    *,
+    slot: str,
+    first_constant: int,
+    row: int,
+    component: int,
+) -> int | None:
+    if row < 0 or component < 0 or component > 3:
+        return None
+    data_path = _binary_data_path_for_slot(draw_files, slot)
+    if not data_path or not os.path.exists(data_path):
+        return None
+    byte_offset = (max(0, int(first_constant)) + int(row)) * 16 + int(component) * 4
+    try:
+        with open(data_path, "rb") as file_handle:
+            file_handle.seek(byte_offset)
+            payload = file_handle.read(4)
+    except OSError:
+        return None
+    if len(payload) != 4:
+        return None
+    return int(struct.unpack("<I", payload)[0])
+
+
+def _classify_skinning_mode(position_stream: dict) -> dict:
+    dynamic_vb0 = _is_dynamic_vb0_position_stream(position_stream)
+    vb3_distinct = bool(position_stream.get("vb3_distinct", False))
+    texcoord4_slot = int(position_stream.get("texcoord4_input_slot", -1) or -1)
+    texcoord4_format = str(position_stream.get("texcoord4_format", "") or "").upper()
+    raw_flags = position_stream.get("cb2_skinning_flags")
+    flags = int(raw_flags) if raw_flags is not None else None
+    external_previous_position = flags is not None and _uses_external_previous_position(flags)
+    position_format = texcoord4_format in {"R32G32B32_FLOAT", "R32G32B32A32_FLOAT"}
+    cpu_pre_skinned = bool(
+        dynamic_vb0
+        and vb3_distinct
+        and texcoord4_slot == 3
+        and position_format
+        and external_previous_position
+    )
+    reasons: list[str] = []
+    if dynamic_vb0:
+        reasons.append("vb0_backing_differs_from_static_ib")
+    if vb3_distinct:
+        reasons.append("distinct_previous_position_stream")
+    if texcoord4_slot == 3 and position_format:
+        reasons.append("texcoord4_is_float_position_from_vb3")
+    if external_previous_position:
+        reasons.append("cb_flags_select_external_previous_position")
+    return {
+        "kind": "cpu_pre_skinned" if cpu_pre_skinned else ("dynamic_vertex_stream" if dynamic_vb0 else "shader_skinned"),
+        "confidence": "high" if cpu_pre_skinned else ("medium" if dynamic_vb0 else "normal"),
+        "cb_skinning_flags": flags,
+        "uses_external_previous_position": external_previous_position,
+        "evidence": reasons,
+    }
+
+
+def _uses_external_previous_position(flags: int) -> bool:
+    value = int(flags) & 0xFFFFFFFF
+    shader_skinning_enabled = bool(value & 0x20) and bool(value & ~0x30)
+    return not shader_skinning_enabled
 
 
 def _is_dynamic_vb0_position_stream(position_stream: dict) -> bool:
@@ -706,7 +836,14 @@ def _is_dynamic_vb0_position_stream(position_stream: dict) -> bool:
     return bool(ib_backing_hash and vb0_backing_hash and ib_backing_hash != vb0_backing_hash)
 
 
-def _candidate_runtime_status(shadow_capture_ready: bool, lod_match_excluded: bool) -> str:
+def _candidate_runtime_status(
+    shadow_capture_ready: bool,
+    lod_match_excluded: bool,
+    *,
+    replacement_supported: bool = True,
+) -> str:
+    if not replacement_supported:
+        return "cpu_pre_skinned_import_only"
     if lod_match_excluded:
         return "capture_ready_dynamic_vb0_lod_excluded" if shadow_capture_ready else "import_only_dynamic_vb0_lod_excluded"
     return "capture_ready" if shadow_capture_ready else "import_only_no_early_shadow"
@@ -865,6 +1002,7 @@ def _parse_draw_states(log_path: str) -> dict[int, DrawState]:
     current_ia_index_offset = -1
     current_ia_backing_hash = ""
     current_vs_cb1_first_constant = 0
+    current_vs_cb2_first_constant = 0
     pending_vs_cb_set = False
     draw_states: dict[int, DrawState] = {}
 
@@ -876,6 +1014,8 @@ def _parse_draw_states(log_path: str) -> dict[int, DrawState]:
                 if match:
                     if int(match.group("slot")) == 1:
                         current_vs_cb1_first_constant = int(match.group("first"))
+                    elif int(match.group("slot")) == 2:
+                        current_vs_cb2_first_constant = int(match.group("first"))
                     continue
                 pending_vs_cb_set = False
             match = _VS_SET_RE.match(line)
@@ -917,6 +1057,7 @@ def _parse_draw_states(log_path: str) -> dict[int, DrawState]:
                 ia_index_offset=current_ia_index_offset,
                 ia_backing_hash=current_ia_backing_hash,
                 vs_cb1_first_constant=current_vs_cb1_first_constant,
+                vs_cb2_first_constant=current_vs_cb2_first_constant,
             )
     return draw_states
 

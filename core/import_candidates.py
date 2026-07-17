@@ -22,6 +22,7 @@ _VERTEX_DATA_RE = re.compile(
     r"^vb(?P<slot>\d+)\[(?P<vertex>\d+)\]\+(?P<offset>\d+)\s+[^:]+:\s*(?P<values>.+)$"
 )
 DEFAULT_MIRROR_FLIP = True
+CPU_SKINNED_NAME_SUFFIX = " [CPU_SKINNED_UNSUPPORTED]"
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,9 @@ class LoadedCandidateGeometry:
     vertex_layout: dict
     blend_indices: list[tuple[int, int, int, int]]
     blend_weights: list[tuple[float, float, float, float]]
+    replacement_supported: bool = True
+    skinning_mode: str = "shader_skinned"
+    replacement_unsupported_reason: str = ""
     warnings: list[str] = field(default_factory=list)
 
 
@@ -198,6 +202,13 @@ def load_candidate_geometry(
     timings["layout"] = time.perf_counter() - stage_start
     timings["total"] = time.perf_counter() - total_start
 
+    replacement_supported = bool(candidate.get("replacement_supported", True))
+    skinning_mode_payload = dict(candidate.get("skinning_mode", {}) or {})
+    skinning_mode = str(skinning_mode_payload.get("kind", "") or "shader_skinned")
+    replacement_unsupported_reason = str(candidate.get("replacement_unsupported_reason", "") or "")
+    if not replacement_supported:
+        warnings.append("CPU pre-skinned draw: imported for reference only; replacement export is unsupported")
+
     geometry = LoadedCandidateGeometry(
         display_name=str(candidate.get("display_name", "") or _candidate_display_name(candidate)),
         ib_hash=str(candidate.get("ib_hash", "") or "").lower(),
@@ -217,6 +228,9 @@ def load_candidate_geometry(
         vertex_layout=vertex_layout,
         blend_indices=_row_tuple_array(blend_indices),
         blend_weights=_row_tuple_array(blend_weights),
+        replacement_supported=replacement_supported,
+        skinning_mode=skinning_mode,
+        replacement_unsupported_reason=replacement_unsupported_reason,
         warnings=warnings,
     )
     if performance is not None:
@@ -314,8 +328,9 @@ def create_blender_object_from_geometry(
     timings: dict[str, float] = {}
 
     stage_start = time.perf_counter()
-    mesh = bpy_module.data.meshes.new(geometry.display_name)
-    imported_object = bpy_module.data.objects.new(geometry.display_name, mesh)
+    object_name = _import_object_name(geometry.display_name, geometry.replacement_supported)
+    mesh = bpy_module.data.meshes.new(object_name)
+    imported_object = bpy_module.data.objects.new(object_name, mesh)
     target_collection.objects.link(imported_object)
     timings["setup"] = time.perf_counter() - stage_start
 
@@ -386,6 +401,9 @@ def create_blender_object_from_geometry(
     imported_object["bmc_uv_flip_v"] = bool(uv_flip_v)
     imported_object["bmc_uv0_present"] = geometry.uv0 is not None
     imported_object["bmc_uv1_present"] = geometry.uv1 is not None
+    imported_object["bmc_replacement_supported"] = bool(geometry.replacement_supported)
+    imported_object["bmc_skinning_mode"] = str(geometry.skinning_mode)
+    imported_object["bmc_replacement_unsupported_reason"] = str(geometry.replacement_unsupported_reason)
     imported_object["bmc_vertex_layout_json"] = json.dumps(
         geometry.vertex_layout,
         ensure_ascii=False,
@@ -404,6 +422,13 @@ def create_blender_object_from_geometry(
         performance.clear()
         performance.update(timings)
     return imported_object
+
+
+def _import_object_name(display_name: str, replacement_supported: bool) -> str:
+    name = str(display_name or "")
+    if replacement_supported or name.endswith(CPU_SKINNED_NAME_SUFFIX):
+        return name
+    return name + CPU_SKINNED_NAME_SUFFIX
 
 
 def _mirror_x_vector(vector: tuple[float, float, float]) -> tuple[float, float, float]:

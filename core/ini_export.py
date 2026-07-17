@@ -8,7 +8,6 @@ import struct
 from pathlib import Path
 
 from ..constants import BONESTORE_INI_FILE_NAME, BUFFER_EXPORT_DIR_NAME
-from .data_types import get_runtime_shader_filters
 from .export_names import ini_filename_from_collection_name
 from .io import ensure_directory, write_counted_uint32_buffer, write_uint32_buffer
 from .models import LocalPaletteRecord
@@ -18,7 +17,6 @@ from .toggle_draw_sets import normalize_toggle_draw_sets
 
 
 _SAFE_SUFFIX_RE = re.compile(r"[^0-9A-Za-z_]+")
-_SHADER_HASH_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 
 _WHITE_SHADOW_TEXTURE_FILE = "Texture/white.dds"
 _CAPTURE_BONE_MAP_HEADER_UINTS = 4
@@ -27,11 +25,17 @@ _CAPTURE_FLAG_MAIN = 0
 _CAPTURE_FLAG_LOD = 1
 _CAPTURE_FLAG_MAIN_LOD = 2
 _LEGACY_CAPTURE_BONE_MAP_FILES = ("MainCaptureBoneMap.buf", "LodCaptureBoneMap.buf")
-_MAX_INSTANCE_SLOTS = 4
-_GLOBAL_BONE_POOL_ROWS_PER_SLOT = 200000
-_LOCAL_BONE_POOL_ROWS_PER_SLOT = 2048
-_CB1_ROWS = 4096
-_RUNTIME_STATE_ROWS = 64
+_MAX_INSTANCE_SLOTS = 8
+_MAX_GLOBAL_BONES = 4096
+_MAX_LOCAL_BONES = 256
+_BONE_RESERVED_ROWS = 3
+_BONE_ROWS = 3
+_GLOBAL_PREVIOUS_ROW_OFFSET = _BONE_RESERVED_ROWS + _MAX_GLOBAL_BONES * _BONE_ROWS
+_GLOBAL_BONE_POOL_ROWS_PER_SLOT = _GLOBAL_PREVIOUS_ROW_OFFSET * 2
+_LOCAL_PREVIOUS_ROW_OFFSET = _BONE_RESERVED_ROWS + _MAX_LOCAL_BONES * _BONE_ROWS
+_LOCAL_BONE_POOL_ROWS_PER_SLOT = _LOCAL_PREVIOUS_ROW_OFFSET * 2
+_CB_ROWS = 4096
+_RUNTIME_STATE_ROWS = 1 + _MAX_INSTANCE_SLOTS
 _LOD_SHADOW_CHAIN_GAP = 12
 
 
@@ -42,7 +46,6 @@ def materialize_bonestore_runtime(
     geometry_records: list[dict] | None = None,
     texture_mark_payload: dict | None = None,
     toggle_draw_sets: list[dict] | None = None,
-    filter_residual: bool = True,
 ) -> dict:
     """Write static runtime buffers and return the normalized runtime plan."""
 
@@ -79,10 +82,6 @@ def materialize_bonestore_runtime(
         lod_records,
     )
     texture_records, texture_warnings = _materialize_texture_records(normalized_output_dir, texture_mark_payload or {})
-    shader_filter_overrides = _runtime_shader_filter_overrides(
-        capture_manifest,
-        filter_residual=filter_residual,
-    )
     lod_key_annotations = _build_lod_key_annotations(capture_manifest, geometry_payloads)
     shadow_replay_plan = _build_shadow_replay_plan(capture_manifest, geometry_payloads)
     lod_profile_chains = _build_lod_profile_chains(capture_manifest, lod_records)
@@ -106,14 +105,19 @@ def materialize_bonestore_runtime(
         "capture_bone_maps": capture_bone_map_resources,
     }
 
+    global_bone_count = _global_bone_count(capture_manifest)
+    if global_bone_count > _MAX_GLOBAL_BONES:
+        raise ValueError(
+            f"Runtime requires {global_bone_count} canonical bones; EFMI keyed runtime supports at most {_MAX_GLOBAL_BONES}"
+        )
+
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "runtime_architecture": "efmi_hashregion_fifo_cb_pool_v1",
         "namespace": "",
-        "global_bone_count": _global_bone_count(capture_manifest),
+        "global_bone_count": global_bone_count,
+        "instance_pool_size": _MAX_INSTANCE_SLOTS,
         "shadow_vs_hashes": _runtime_shadow_vs_hashes(capture_manifest),
-        "filter_residual": bool(filter_residual),
-        "shader_filter_overrides": shader_filter_overrides,
-        "visible_replay_excluded_filter_indices": _visible_replay_excluded_filter_indices(shader_filter_overrides),
         "capture_records": capture_records,
         "lod_capture_records": lod_records,
         "lod_replay_links": lod_replay_links,
@@ -158,19 +162,14 @@ def materialize_simple_override_runtime(
     texture_mark_payload: dict | None = None,
     toggle_draw_sets: list[dict] | None = None,
 ) -> dict:
-    normalized_output_dir = ensure_directory(output_directory)
-    geometry_payloads = _normalize_geometry_records(normalized_output_dir, geometry_records or [])
-    texture_records, texture_warnings = _materialize_texture_records(normalized_output_dir, texture_mark_payload or {})
-    return {
-        "schema_version": 1,
-        "mode": "simple_override",
-        "namespace": "",
-        "geometry": geometry_payloads,
-        "textures": texture_records,
-        "toggle_draw_sets": normalize_toggle_draw_sets(toggle_draw_sets or []),
-        "texture_warnings": texture_warnings,
-        "visible_replay_excluded_filter_indices": [204],
-    }
+    from .simple_override_adapter import materialize_simple_override_runtime as materialize_adapter_runtime
+
+    return materialize_adapter_runtime(
+        output_directory,
+        geometry_records,
+        texture_mark_payload,
+        toggle_draw_sets,
+    )
 
 
 def write_simple_override_ini(
@@ -197,36 +196,15 @@ def write_simple_override_ini_from_runtime(
     *,
     ini_file_name: str | None = None,
 ) -> str:
-    os.makedirs(output_directory, exist_ok=True)
-    runtime_plan = dict(runtime_plan or {})
-    runtime_plan["ini_file_name"] = ini_file_name or runtime_plan.get("ini_file_name", "") or ""
-    file_name = ini_filename_from_collection_name(runtime_plan.get("ini_file_name", "") or BONESTORE_INI_FILE_NAME)
-    ini_path = os.path.join(output_directory, file_name)
-    with open(ini_path, "w", encoding="utf-8", newline="\n") as file_handle:
-        file_handle.write(build_simple_override_ini_content(runtime_plan))
-    return ini_path
+    from .simple_override_adapter import write_simple_override_ini_from_runtime as write_adapter_ini
+
+    return write_adapter_ini(output_directory, runtime_plan, ini_file_name=ini_file_name)
 
 
 def build_simple_override_ini_content(runtime_plan: dict) -> str:
-    lines: list[str] = [
-        "; Auto-generated by Bone Merge Capture",
-        "; Runtime schema: simple layout-faithful TextureOverride",
-        "",
-    ]
-    lines.extend(_geometry_resource_sections(runtime_plan))
-    if lines and lines[-1] != "":
-        lines.append("")
-    lines.extend(_texture_resource_sections(runtime_plan))
-    if runtime_plan.get("textures"):
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.extend(_texture_hash_override_sections(runtime_plan))
-        if lines and lines[-1] != "":
-            lines.append("")
-    lines.extend(_simple_texture_override_sections(runtime_plan))
-    while lines and lines[-1] == "":
-        lines.pop()
-    return "\n".join(lines) + "\n"
+    from .simple_override_adapter import build_simple_override_ini_content as build_adapter_ini
+
+    return build_adapter_ini(runtime_plan)
 
 
 def build_bonestore_ini_content(runtime_plan: dict) -> str:
@@ -235,10 +213,10 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
     lines.extend(
         [
             "; Auto-generated by Bone Merge Capture",
-            "; Runtime schema v2:",
-            ";   capture:      per-IB CaptureBoneMap resource",
-            ";   consume:      part local bone -> canonical global BoneStore pool",
-            ";   runtime:      one INI, inline TextureOverride flow, shared HLSL algorithms",
+            "; Runtime schema v3: EFMI HashRegion + FIFO keyed instances",
+            ";   capture:      VS200 b1 view -> canonical global current/previous bone pool",
+            ";   consume:      native instance -> keyed capture instance -> part-local pool",
+            ";   replay:       original game VS with only cb[instance * 16 + 5].xy redirected",
             "",
         ]
     )
@@ -246,9 +224,6 @@ def build_bonestore_ini_content(runtime_plan: dict) -> str:
     if lines and lines[-1] != "":
         lines.append("")
     lines.extend(_toggle_control_sections(runtime_plan))
-    if lines and lines[-1] != "":
-        lines.append("")
-    lines.extend(_shader_override_sections(runtime_plan))
     if lines and lines[-1] != "":
         lines.append("")
     lines.extend(_resource_sections(runtime_plan))
@@ -1799,15 +1774,23 @@ def _capture_unavailable_source_details(unavailable_by_global: dict[int, dict], 
 
 def _constants_sections(runtime_plan: dict) -> list[str]:
     toggle_groups = _runtime_toggle_draw_sets(runtime_plan)
-    if not toggle_groups:
-        return []
-    lines = ["[Constants]"]
+    lines = [
+        "[Constants]",
+        "global $bmc_instance_uid = -1",
+        "global $bmc_capture_slot = -1",
+        "global $bmc_native_slot = -1",
+        "global $bmc_hash_offset = 0",
+        "global $bmc_mapping_valid = 0",
+    ]
+    for slot in range(_MAX_INSTANCE_SLOTS):
+        lines.append(f"global $bmc_slot_uid_{slot} = -1")
+        lines.append(f"global $bmc_slot_native_{slot} = -1")
     for group in toggle_groups:
         variable = str(group.get("variable", "") or "")
         if not variable:
             continue
         lines.append(f"global persist {variable} = {int(group.get('default_value', 0) or 0)}")
-    return lines if len(lines) > 1 else []
+    return lines
 
 
 def _toggle_control_sections(runtime_plan: dict) -> list[str]:
@@ -1848,60 +1831,6 @@ def _runtime_toggle_draw_sets(runtime_plan: dict) -> list[dict]:
     return normalize_toggle_draw_sets(runtime_plan.get("toggle_draw_sets", []) or [])
 
 
-def _shader_override_sections(runtime_plan: dict) -> list[str]:
-    lines: list[str] = []
-    seen_sections: set[str] = set()
-    seen_filter_keys: set[tuple[str, int]] = set()
-    for vs_hash in runtime_plan.get("shadow_vs_hashes", []) or []:
-        safe_hash = str(vs_hash).lower()
-        if not safe_hash:
-            continue
-        section_name = f"ShaderOverrideBoneStoreVS_{safe_hash}"
-        if section_name in seen_sections:
-            continue
-        seen_sections.add(section_name)
-        seen_filter_keys.add((safe_hash, 200))
-        lines.extend(
-            [
-                f"[{section_name}]",
-                f"hash = {safe_hash}",
-                "filter_index = 200",
-                "allow_duplicate_hash = overrule",
-                "",
-            ]
-        )
-    for rule in runtime_plan.get("shader_filter_overrides", []) or []:
-        safe_hash = str(rule.get("hash", "") or "").lower()
-        if not safe_hash:
-            continue
-        filter_index = int(rule.get("filter_index", -1) or -1)
-        if filter_index < 0:
-            continue
-        if (safe_hash, filter_index) in seen_filter_keys:
-            continue
-        seen_filter_keys.add((safe_hash, filter_index))
-        section_name = str(rule.get("section_name", "") or "").strip()
-        if not section_name:
-            section_prefix = str(rule.get("section_prefix", "") or "ShaderOverrideBMCFilter")
-            section_name = f"{_safe_suffix(section_prefix)}_{safe_hash}"
-        section_name = _safe_suffix(section_name)
-        if section_name in seen_sections:
-            continue
-        seen_sections.add(section_name)
-        lines.extend(
-            [
-                f"[{section_name}]",
-                f"hash = {safe_hash}",
-                f"filter_index = {filter_index}",
-                f"allow_duplicate_hash = {rule.get('allow_duplicate_hash', 'overrule')}",
-                "",
-            ]
-        )
-    if lines and lines[-1] == "":
-        lines.pop()
-    return lines
-
-
 def _resource_sections(runtime_plan: dict) -> list[str]:
     buffers = dict(runtime_plan.get("buffers", {}) or {})
     global_pool_rows = _GLOBAL_BONE_POOL_ROWS_PER_SLOT * _MAX_INSTANCE_SLOTS
@@ -1926,29 +1855,38 @@ def _resource_sections(runtime_plan: dict) -> list[str]:
         [
             "",
             "; -------------------------------------------------",
-            "; Shared runtime buffers",
+            "; EFMI keyed instance registry",
             "; -------------------------------------------------",
-            "[ResourceDumpedCB1_UAV]",
-            "type = RWStructuredBuffer",
-            "stride = 16",
-            f"array = {_CB1_ROWS}",
-            "",
-            "[ResourceDumpedCB1_SRV]",
+            "[PoolBMCInstanceRegistry]",
+            f"pool_size = {_MAX_INSTANCE_SLOTS}",
+            "pool_index_type = fifo",
+            "pool_lazy_init = false",
             "type = Buffer",
-            "stride = 16",
-            f"array = {_CB1_ROWS}",
+            "format = R32G32B32A32_UINT",
+            f"array = {_CB_ROWS}",
             "",
-            "[ResourceFakeCB1_UAV]",
+            "; -------------------------------------------------",
+            "; Direct shader-visible CB views",
+            "; -------------------------------------------------",
+            "[ResourceCapturedCB]",
+            "type = Buffer",
+            "format = R32G32B32A32_UINT",
+            f"array = {_CB_ROWS}",
+            "",
+            "[ResourceFakeCB_UAV]",
             "type = RWStructuredBuffer",
             "stride = 16",
-            f"array = {_CB1_ROWS}",
+            f"array = {_CB_ROWS}",
             "",
-            "[ResourceFakeCB1]",
+            "[ResourceFakeCB]",
             "type = Buffer",
             "stride = 16",
             "format = R32G32B32A32_UINT",
-            f"array = {_CB1_ROWS}",
+            f"array = {_CB_ROWS}",
             "",
+            "; -------------------------------------------------",
+            "; Canonical and native-slot bone pools",
+            "; -------------------------------------------------",
             "[ResourceGlobalBonePool_UAV]",
             "type = RWStructuredBuffer",
             "stride = 16",
@@ -1968,6 +1906,16 @@ def _resource_sections(runtime_plan: dict) -> list[str]:
             "type = StructuredBuffer",
             "stride = 16",
             f"array = {local_pool_rows}",
+            "",
+            "[ResourceInstanceMapping_UAV]",
+            "type = RWStructuredBuffer",
+            "stride = 16",
+            f"array = {_MAX_INSTANCE_SLOTS}",
+            "",
+            "[ResourceInstanceMapping_SRV]",
+            "type = StructuredBuffer",
+            "stride = 16",
+            f"array = {_MAX_INSTANCE_SLOTS}",
             "",
             "[ResourceRuntimeState_UAV]",
             "type = RWStructuredBuffer",
@@ -1998,25 +1946,44 @@ def _custom_shader_sections(runtime_plan: dict) -> list[str]:
     _ = runtime_plan
     return [
         "; -------------------------------------------------",
-        "; Shaders",
+        "; EFMI keyed-instance shaders",
         "; -------------------------------------------------",
-        "[CustomShader_ExtractCB1]",
-        "vs = hlsl\\extract_cb1_vs.hlsl",
-        "ps = hlsl\\extract_cb1_ps.hlsl",
-        "ps-u7 = ResourceDumpedCB1_UAV",
-        "depth_enable = false",
-        "blend = ADD SRC_ALPHA INV_SRC_ALPHA",
-        "cull = none",
-        "topology = point_list",
-        "draw = 4096, 0",
-        "ps-u7 = null",
-        "ResourceDumpedCB1_SRV = copy ResourceDumpedCB1_UAV",
-        "",
         "[CustomShader_RecordBones]",
         "cs = hlsl\\record_bones_cs.hlsl",
         "cs-t0 = vs-t0",
-        "cs-t1 = ResourceDumpedCB1_SRV",
+        "cs-t1 = ResourceCapturedCB",
         "cs-u1 = ResourceGlobalBonePool_UAV",
+        "cs-u2 = ResourceRuntimeState_UAV",
+        "cs-u3 = ResourceInstanceMapping_UAV",
+        "dispatch = 1, 1, 1",
+        "cs-u1 = null",
+        "cs-u2 = null",
+        "cs-u3 = null",
+        "cs-t0 = null",
+        "cs-t1 = null",
+        "cs-t2 = null",
+        "ResourceGlobalBonePool_SRV = ref ResourceGlobalBonePool_UAV",
+        "ResourceInstanceMapping_SRV = ref ResourceInstanceMapping_UAV",
+        "",
+        "[CustomShader_ClearInstanceMapping]",
+        "cs = hlsl\\clear_instance_mapping_cs.hlsl",
+        "cs-u3 = ResourceInstanceMapping_UAV",
+        "dispatch = 1, 1, 1",
+        "cs-u3 = null",
+        "ResourceInstanceMapping_SRV = ref ResourceInstanceMapping_UAV",
+        "",
+        "[CustomShader_ResolveInstanceMapping]",
+        "cs = hlsl\\resolve_instance_mapping_cs.hlsl",
+        "cs-u3 = ResourceInstanceMapping_UAV",
+        "dispatch = 1, 1, 1",
+        "cs-u3 = null",
+        "ResourceInstanceMapping_SRV = ref ResourceInstanceMapping_UAV",
+        "",
+        "[CustomShader_GatherLocalBones]",
+        "cs = hlsl\\gather_local_bones_cs.hlsl",
+        "cs-t0 = ResourceGlobalBonePool_SRV",
+        "cs-t1 = ResourceInstanceMapping_SRV",
+        "cs-u1 = ResourceLocalBonePool_UAV",
         "cs-u2 = ResourceRuntimeState_UAV",
         "dispatch = 1, 1, 1",
         "cs-u1 = null",
@@ -2024,36 +1991,26 @@ def _custom_shader_sections(runtime_plan: dict) -> list[str]:
         "cs-t0 = null",
         "cs-t1 = null",
         "cs-t2 = null",
-        "ResourceGlobalBonePool_SRV = copy ResourceGlobalBonePool_UAV",
+        "ResourceLocalBonePool_SRV = ref ResourceLocalBonePool_UAV",
         "",
-        "[CustomShader_GatherLocalBones]",
-        "cs = hlsl\\gather_local_bones_cs.hlsl",
-        "cs-t0 = ResourceGlobalBonePool_SRV",
-        "cs-u1 = ResourceLocalBonePool_UAV",
-        "cs-u2 = ResourceRuntimeState_UAV",
-        "dispatch = 1, 1, 1",
-        "cs-u1 = null",
-        "cs-u2 = null",
-        "cs-t0 = null",
-        "cs-t2 = null",
-        "ResourceLocalBonePool_SRV = copy ResourceLocalBonePool_UAV",
-        "",
-        "[CustomShader_RedirectCB1]",
-        "cs = hlsl\\redirect_cb1_cs.hlsl",
-        "cs-t0 = ResourceDumpedCB1_SRV",
-        "cs-u0 = ResourceFakeCB1_UAV",
-        "cs-u2 = ResourceRuntimeState_UAV",
+        "[CustomShader_RedirectCB]",
+        "cs = hlsl\\redirect_cb_cs.hlsl",
+        "cs-t0 = ResourceCapturedCB",
+        "cs-t1 = ResourceInstanceMapping_SRV",
+        "cs-u0 = ResourceFakeCB_UAV",
         "dispatch = 1, 1, 1",
         "cs-u0 = null",
-        "cs-u2 = null",
         "cs-t0 = null",
-        "ResourceFakeCB1 = copy ResourceFakeCB1_UAV",
+        "cs-t1 = null",
+        "ResourceFakeCB = copy ResourceFakeCB_UAV",
         "",
         "[CustomShader_ResetRuntimeState]",
         "cs = hlsl\\reset_runtime_state_cs.hlsl",
         "cs-u2 = ResourceRuntimeState_UAV",
+        "cs-u3 = ResourceInstanceMapping_UAV",
         "dispatch = 1, 1, 1",
         "cs-u2 = null",
+        "cs-u3 = null",
     ]
 
 
@@ -2168,64 +2125,6 @@ def _texture_hash_override_sections(runtime_plan: dict) -> list[str]:
         )
     if lines and lines[-1] == "":
         lines.pop()
-    return lines
-
-
-def _simple_texture_override_sections(runtime_plan: dict) -> list[str]:
-    geometry_by_key = _geometry_records_by_key(list(runtime_plan.get("geometry", []) or []))
-    if not geometry_by_key:
-        return []
-    lines: list[str] = [
-        "; -------------------------------------------------",
-        "; Simple TextureOverrides",
-        "; -------------------------------------------------",
-    ]
-    for key in sorted(geometry_by_key):
-        ib_hash, match_first_index, match_index_count = key
-        suffix = _safe_suffix(f"{ib_hash}_{match_index_count}_{match_first_index}")
-        lines.extend(
-            [
-                f"[TextureOverride_BMCSimple_{suffix}]",
-                f"hash = {ib_hash}",
-                f"match_index_count = {match_index_count}",
-                _visible_replay_condition(runtime_plan),
-                "  handling = skip",
-            ]
-        )
-        for record in geometry_by_key[key]:
-            lines.extend(_simple_replay_part_lines(record, indent="  "))
-        lines.extend(["endif", ""])
-    if lines and lines[-1] == "":
-        lines.pop()
-    return lines
-
-
-def _simple_replay_part_lines(record: dict, *, indent: str) -> list[str]:
-    suffix = str(record.get("resource_suffix", "") or "")
-    lines = [
-        f"{indent}; replay {suffix}",
-        f"{indent}ib = {record.get('index_resource_name')}",
-    ]
-    vertex_buffers = dict(record.get("vertex_buffers", {}) or {})
-    for slot_name, vertex_buffer in sorted(vertex_buffers.items(), key=lambda item: _slot_sort_key(item[0])):
-        lines.append(f"{indent}{slot_name} = {dict(vertex_buffer).get('resource_name')}")
-    vb0 = vertex_buffers.get("vb0")
-    if vb0 and "vb3" not in vertex_buffers:
-        lines.append(f"{indent}vb3 = {dict(vb0).get('resource_name')}")
-    draw_ranges = _draw_ranges_for_record(record)
-    index = 0
-    while index < len(draw_ranges):
-        draw = draw_ranges[index]
-        condition = _draw_toggle_condition(draw)
-        if condition:
-            lines.append(f"{indent}if {condition}")
-            while index < len(draw_ranges) and _draw_toggle_condition(draw_ranges[index]) == condition:
-                lines.extend(_drawindexed_lines(draw_ranges[index], record, indent=f"{indent}  "))
-                index += 1
-            lines.append(f"{indent}endif")
-            continue
-        lines.extend(_drawindexed_lines(draw, record, indent=indent))
-        index += 1
     return lines
 
 
@@ -2416,10 +2315,16 @@ def _shadow_lines_for_profile(
 ) -> list[str]:
     lines: list[str] = []
     host_has_toggle_replay = any(_shadow_plan_has_toggle_replay(plan, parts_by_suffix) for plan in host_plans or [])
+    needs_runtime_override = key in skip_keys or host_has_toggle_replay or bool(host_plans)
+    if not needs_runtime_override:
+        return lines
+    lines.append(f"{indent}if first_instance + instance_count <= {_MAX_INSTANCE_SLOTS}")
+    inner_indent = f"{indent}  "
     if key in skip_keys or host_has_toggle_replay:
-        lines.append(f"{indent}handling = skip")
+        lines.append(f"{inner_indent}handling = skip")
     for plan in host_plans or []:
-        lines.extend(_shadow_host_replay_lines(plan, parts_by_suffix, indent=indent))
+        lines.extend(_shadow_host_replay_lines(plan, parts_by_suffix, indent=inner_indent))
+    lines.append(f"{indent}endif")
     return lines
 
 
@@ -2502,11 +2407,17 @@ def _hash_label(key: tuple[str, int, int]) -> str:
 def _visible_replay_lines(geometry_records: list[dict], runtime_plan: dict) -> list[str]:
     lines = [
         _visible_replay_condition(runtime_plan),
-        "  handling = skip",
-        "  run = CustomShader_ExtractCB1",
     ]
+    lines.extend(_prepare_replay_instance_lines(cb_slot=2, indent="  "))
+    lines.extend(
+        [
+            "  if $bmc_mapping_valid == 1",
+            "    handling = skip",
+        ]
+    )
     for record in geometry_records:
-        lines.extend(_replay_part_lines(record, indent="  "))
+        lines.extend(_replay_part_lines(record, indent="    ", cb_slot=2))
+    lines.append("  endif")
     lines.append("endif")
     return lines
 
@@ -2520,33 +2431,129 @@ def _capture_record_lines(
     main_records = list(grouped_records.get("main", []) or [])
     lod_records = list(grouped_records.get("lod", []) or [])
     seen_resources: set[str] = set()
+    resource_names: list[str] = []
     for record in [*main_records, *lod_records]:
         resource_name = str(dict(record).get("capture_resource_name", "") or "")
         if not resource_name or resource_name in seen_resources:
             continue
         seen_resources.add(resource_name)
-        lines.extend(_capture_record_command_lines(resource_name, indent=indent))
+        resource_names.append(resource_name)
+    for resource_name in resource_names:
+        lines.extend(_capture_record_command_lines(resource_name, indent=indent, cb_slot=1))
     return lines
 
 
-def _capture_record_command_lines(capture_map_resource: str, *, indent: str) -> list[str]:
-    return [
-        f"{indent}run = CustomShader_ExtractCB1",
-        f"{indent}cs-t2 = {capture_map_resource}",
-        f"{indent}run = CustomShader_RecordBones",
+def _capture_record_command_lines(capture_map_resource: str, *, indent: str, cb_slot: int) -> list[str]:
+    return _capture_instance_lines(
+        cb_slot=cb_slot,
+        indent=indent,
+        capture_map_resource=capture_map_resource,
+    )
+
+
+def _prepare_replay_instance_lines(*, cb_slot: int, indent: str) -> list[str]:
+    lines = [
+        f"{indent}$bmc_mapping_valid = 1",
+        f"{indent}ResourceCapturedCB = copy vs-cb{cb_slot}",
+        f"{indent}run = CustomShader_ClearInstanceMapping",
     ]
+    lines.extend(_resolve_visible_instance_lines(cb_slot=cb_slot, indent=indent))
+    return lines
+
+
+def _capture_instance_lines(
+    *,
+    cb_slot: int,
+    indent: str,
+    capture_map_resource: str,
+) -> list[str]:
+    if cb_slot not in (1, 2):
+        raise ValueError(f"Unsupported capture CB slot: b{cb_slot}")
+    lines: list[str] = []
+    for instance_offset in range(_MAX_INSTANCE_SLOTS):
+        lines.extend(
+            [
+                f"{indent}if instance_count > {instance_offset} && first_instance + {instance_offset} < {_MAX_INSTANCE_SLOTS}",
+                f"{indent}  $bmc_native_slot = first_instance + {instance_offset}",
+                f"{indent}  $bmc_hash_offset = $bmc_native_slot * 256",
+                f"{indent}  $bmc_instance_uid = vs-cb{cb_slot}->HashRegion($bmc_hash_offset, 64)",
+                f"{indent}  if $bmc_instance_uid > 0",
+                f"{indent}    $bmc_capture_slot = #PoolBMCInstanceRegistry[$bmc_instance_uid]",
+                f"{indent}    if $bmc_capture_slot >= 0 && $bmc_capture_slot < {_MAX_INSTANCE_SLOTS}",
+                f"{indent}      PoolBMCInstanceRegistry[$bmc_instance_uid] = copy vs-cb{cb_slot}",
+                f"{indent}      ResourceCapturedCB = ref PoolBMCInstanceRegistry[$bmc_instance_uid]",
+            ]
+        )
+        lines.extend(_remember_capture_slot_lines(indent=f"{indent}      "))
+        lines.extend(
+            [
+                f"{indent}      x = $bmc_capture_slot",
+                f"{indent}      y = $bmc_native_slot",
+                f"{indent}      cs-t2 = {capture_map_resource}",
+                f"{indent}      run = CustomShader_RecordBones",
+                f"{indent}    endif",
+                f"{indent}  endif",
+                f"{indent}endif",
+            ]
+        )
+    return lines
+
+
+def _remember_capture_slot_lines(*, indent: str) -> list[str]:
+    lines: list[str] = []
+    for slot in range(_MAX_INSTANCE_SLOTS):
+        lines.extend(
+            [
+                f"{indent}if $bmc_capture_slot == {slot}",
+                f"{indent}  $bmc_slot_uid_{slot} = $bmc_instance_uid",
+                f"{indent}  $bmc_slot_native_{slot} = $bmc_native_slot",
+                f"{indent}endif",
+            ]
+        )
+    return lines
+
+
+def _resolve_visible_instance_lines(*, cb_slot: int, indent: str) -> list[str]:
+    if cb_slot not in (1, 2):
+        raise ValueError(f"Unsupported visible replay CB slot: b{cb_slot}")
+    lines: list[str] = []
+    for instance_offset in range(_MAX_INSTANCE_SLOTS):
+        lines.extend(
+            [
+                f"{indent}if instance_count > {instance_offset} && first_instance + {instance_offset} < {_MAX_INSTANCE_SLOTS}",
+                f"{indent}  $bmc_native_slot = first_instance + {instance_offset}",
+                f"{indent}  $bmc_hash_offset = $bmc_native_slot * 256",
+                f"{indent}  $bmc_instance_uid = vs-cb{cb_slot}->HashRegion($bmc_hash_offset, 64)",
+                f"{indent}  $bmc_capture_slot = -1",
+            ]
+        )
+        for slot in range(_MAX_INSTANCE_SLOTS):
+            lines.extend(
+                [
+                    f"{indent}  if $bmc_instance_uid > 0 && $bmc_instance_uid == $bmc_slot_uid_{slot}",
+                    f"{indent}    $bmc_capture_slot = {slot}",
+                    f"{indent}  endif",
+                ]
+            )
+        lines.extend(
+            [
+                f"{indent}  if $bmc_capture_slot >= 0",
+                f"{indent}    x = $bmc_capture_slot",
+                f"{indent}    y = $bmc_native_slot",
+                f"{indent}    run = CustomShader_ResolveInstanceMapping",
+                f"{indent}  endif",
+                f"{indent}  if $bmc_capture_slot < 0",
+                f"{indent}    $bmc_mapping_valid = 0",
+                f"{indent}  endif",
+                f"{indent}endif",
+            ]
+        )
+    return lines
 
 
 def _visible_replay_condition(runtime_plan: dict) -> str:
-    excluded_indices = [200]
-    for value in runtime_plan.get("visible_replay_excluded_filter_indices", []) or []:
-        try:
-            filter_index = int(value)
-        except (TypeError, ValueError):
-            continue
-        if filter_index not in excluded_indices:
-            excluded_indices.append(filter_index)
-    return "if " + " && ".join(f"vs != {filter_index}" for filter_index in excluded_indices)
+    _ = runtime_plan
+    return f"if (vs == 201 || vs == 202 || vs == 203) && first_instance + instance_count <= {_MAX_INSTANCE_SLOTS}"
 
 
 def _shadow_host_replay_lines(shadow_plan: dict, parts_by_suffix: dict[str, dict], *, indent: str) -> list[str]:
@@ -2567,13 +2574,40 @@ def _shadow_host_replay_lines(shadow_plan: dict, parts_by_suffix: dict[str, dict
         lines.append(f"{indent}draw = from_caller")
     if transparent_parts:
         lines.append(f"{indent}; delayed transparent shadow replay")
-        for record in transparent_parts:
-            lines.extend(_replay_part_lines(record, indent=indent))
+        lines.extend(_shadow_role_replay_lines(transparent_parts, indent=indent))
     if normal_parts:
         lines.append(f"{indent}ps-t0 = {shadow_plan.get('white_shadow_resource', 'ResourceBMCWhiteShadow')}")
         lines.append(f"{indent}; delayed normal shadow replay")
-        for record in normal_parts:
-            lines.extend(_replay_part_lines(record, indent=indent))
+        lines.extend(_shadow_role_replay_lines(normal_parts, indent=indent))
+    return lines
+
+
+def _shadow_role_replay_lines(parts: list[dict], *, indent: str) -> list[str]:
+    lines: list[str] = []
+    for capture_slot in range(_MAX_INSTANCE_SLOTS):
+        uid_variable = f"$bmc_slot_uid_{capture_slot}"
+        native_variable = f"$bmc_slot_native_{capture_slot}"
+        lines.extend(
+            [
+                f"{indent}if {uid_variable} > 0 && {native_variable} >= 0 && {native_variable} < {_MAX_INSTANCE_SLOTS}",
+                f"{indent}  ResourceCapturedCB = ref PoolBMCInstanceRegistry[{uid_variable}]",
+                f"{indent}  run = CustomShader_ClearInstanceMapping",
+                f"{indent}  x = {capture_slot}",
+                f"{indent}  y = {native_variable}",
+                f"{indent}  run = CustomShader_ResolveInstanceMapping",
+            ]
+        )
+        for record in parts:
+            lines.extend(
+                _replay_part_lines(
+                    record,
+                    indent=f"{indent}  ",
+                    cb_slot=1,
+                    instance_count_expr="1",
+                    first_instance_expr=native_variable,
+                )
+            )
+        lines.append(f"{indent}endif")
     return lines
 
 
@@ -2601,24 +2635,33 @@ def _shadow_plan_has_toggle_replay(shadow_plan: dict, parts_by_suffix: dict[str,
     return _shadow_replay_has_toggle_draws(transparent_parts, normal_parts)
 
 
-def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
+def _replay_part_lines(
+    record: dict,
+    *,
+    indent: str,
+    cb_slot: int,
+    instance_count_expr: str = "INSTANCE_COUNT",
+    first_instance_expr: str = "FIRST_INSTANCE",
+) -> list[str]:
+    if cb_slot not in (1, 2):
+        raise ValueError(f"Unsupported replay constant-buffer slot: b{cb_slot}")
     suffix = str(record.get("resource_suffix", "") or "")
     lines = [
         f"{indent}; replay {suffix}",
         f"{indent}cs-t2 = ResourcePartLocalToGlobalBoneMap_{suffix}",
         f"{indent}run = CustomShader_GatherLocalBones",
         f"{indent}vs-t0 = ResourceLocalBonePool_SRV",
-        f"{indent}run = CustomShader_RedirectCB1",
-        f"{indent}vs-cb1 = ResourceFakeCB1",
+        f"{indent}run = CustomShader_RedirectCB",
+        f"{indent}vs-cb{cb_slot} = ResourceFakeCB",
         f"{indent}ib = {record.get('index_resource_name')}",
     ]
     vertex_buffers = dict(record.get("vertex_buffers", {}) or {})
-    for slot_name in ("vb0", "vb1", "vb2"):
+    for slot_name in sorted(vertex_buffers, key=_slot_sort_key):
         vertex_buffer = vertex_buffers.get(slot_name)
-        if vertex_buffer:
+        if vertex_buffer and str(slot_name).lower().startswith("vb"):
             lines.append(f"{indent}{slot_name} = {vertex_buffer.get('resource_name')}")
     vb0 = vertex_buffers.get("vb0")
-    if vb0:
+    if vb0 and not vertex_buffers.get("vb3"):
         lines.append(f"{indent}vb3 = {vb0.get('resource_name')}")
     draw_ranges = _draw_ranges_for_record(record)
     index = 0
@@ -2628,16 +2671,39 @@ def _replay_part_lines(record: dict, *, indent: str) -> list[str]:
         if condition:
             lines.append(f"{indent}if {condition}")
             while index < len(draw_ranges) and _draw_toggle_condition(draw_ranges[index]) == condition:
-                lines.extend(_drawindexed_lines(draw_ranges[index], record, indent=f"{indent}  "))
+                lines.extend(
+                    _drawindexed_lines(
+                        draw_ranges[index],
+                        record,
+                        indent=f"{indent}  ",
+                        instance_count_expr=instance_count_expr,
+                        first_instance_expr=first_instance_expr,
+                    )
+                )
                 index += 1
             lines.append(f"{indent}endif")
             continue
-        lines.extend(_drawindexed_lines(draw, record, indent=indent))
+        lines.extend(
+            _drawindexed_lines(
+                draw,
+                record,
+                indent=indent,
+                instance_count_expr=instance_count_expr,
+                first_instance_expr=first_instance_expr,
+            )
+        )
         index += 1
     return lines
 
 
-def _drawindexed_lines(draw: dict, record: dict, *, indent: str) -> list[str]:
+def _drawindexed_lines(
+    draw: dict,
+    record: dict,
+    *,
+    indent: str,
+    instance_count_expr: str = "INSTANCE_COUNT",
+    first_instance_expr: str = "FIRST_INSTANCE",
+) -> list[str]:
     lines: list[str] = []
     object_comment = _draw_object_comment(draw, record)
     if object_comment:
@@ -2645,7 +2711,9 @@ def _drawindexed_lines(draw: dict, record: dict, *, indent: str) -> list[str]:
     index_count = int(draw.get("index_count", 0) or 0)
     start_index = int(draw.get("start_index", 0) or 0)
     base_vertex = int(draw.get("base_vertex", 0) or 0)
-    lines.append(f"{indent}drawindexedinstanced = {index_count},INSTANCE_COUNT,{start_index},{base_vertex},FIRST_INSTANCE")
+    lines.append(
+        f"{indent}drawindexedinstanced = {index_count},{instance_count_expr},{start_index},{base_vertex},{first_instance_expr}"
+    )
     return lines
 
 
@@ -2784,7 +2852,7 @@ def _write_white_shadow_texture(path: str) -> str:
 
 
 def _frame_lifecycle_sections(runtime_plan: dict) -> list[str]:
-    return [
+    lines = [
         "; -------------------------------------------------",
         "; Frame lifecycle",
         "; -------------------------------------------------",
@@ -2792,8 +2860,13 @@ def _frame_lifecycle_sections(runtime_plan: dict) -> list[str]:
         "run = CommandList_BMC_FrameEndReset",
         "",
         "[CommandList_BMC_FrameEndReset]",
+        "PoolBMCInstanceRegistry = null",
         "run = CustomShader_ResetRuntimeState",
     ]
+    for slot in range(_MAX_INSTANCE_SLOTS):
+        lines.append(f"$bmc_slot_uid_{slot} = -1")
+        lines.append(f"$bmc_slot_native_{slot} = -1")
+    return lines
 
 
 def _buffer_resource(name: str, payload: dict) -> list[str]:
@@ -2840,113 +2913,6 @@ def _runtime_shadow_vs_hashes(capture_manifest: dict) -> list[str]:
     add_many(lod_shadow_stage.get("shadow_vs_hashes", []))
     add_many([lod_shadow_stage.get("normal_vs_hash", ""), lod_shadow_stage.get("transparent_vs_hash", "")])
     return hashes
-
-
-def _runtime_shader_filter_overrides(capture_manifest: dict, *, filter_residual: bool) -> list[dict]:
-    rules: list[dict] = []
-    seen: set[tuple[str, int]] = set()
-
-    for payload in _manifest_shader_filter_payloads(capture_manifest):
-        rule = _normalize_shader_filter_rule(payload, source="manifest")
-        if not rule:
-            continue
-        key = (str(rule["hash"]), int(rule["filter_index"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        rules.append(rule)
-
-    for payload in get_runtime_shader_filters():
-        if not _shader_filter_rule_enabled(payload, filter_residual=filter_residual):
-            continue
-        rule = _normalize_shader_filter_rule(payload, source="runtime_shader_filters.json")
-        if not rule:
-            continue
-        key = (str(rule["hash"]), int(rule["filter_index"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        rules.append(rule)
-
-    return rules
-
-
-def _manifest_shader_filter_payloads(capture_manifest: dict) -> list[dict]:
-    payloads: list[dict] = []
-
-    def add_many(values) -> None:
-        if isinstance(values, dict):
-            if values.get("hash") or values.get("vs_hash"):
-                payloads.append(dict(values))
-                return
-            values = values.get("shader_overrides", []) or values.get("filters", [])
-        for value in values or []:
-            if isinstance(value, dict):
-                payloads.append(dict(value))
-
-    for key in ("shader_filter_overrides", "runtime_shader_filters", "shader_overrides"):
-        add_many(capture_manifest.get(key, []))
-    runtime_stage = capture_manifest.get("runtime_stage", {})
-    if isinstance(runtime_stage, dict):
-        for key in ("shader_filter_overrides", "runtime_shader_filters", "shader_overrides"):
-            add_many(runtime_stage.get(key, []))
-    return payloads
-
-
-def _normalize_shader_filter_rule(payload: dict, *, source: str) -> dict:
-    safe_hash = str(payload.get("hash", "") or payload.get("vs_hash", "") or "").strip().lower()
-    if not _SHADER_HASH_RE.fullmatch(safe_hash):
-        return {}
-    try:
-        filter_index = int(payload.get("filter_index", -1))
-    except (TypeError, ValueError):
-        return {}
-    if filter_index < 0:
-        return {}
-
-    section_prefix = str(payload.get("section_prefix", "") or "ShaderOverrideBMCFilter")
-    section_name = str(payload.get("section_name", "") or "").strip()
-    if not section_name:
-        section_name = f"{_safe_suffix(section_prefix)}_{safe_hash}"
-
-    return {
-        "id": str(payload.get("id", "") or ""),
-        "hash": safe_hash,
-        "filter_index": filter_index,
-        "section_prefix": _safe_suffix(section_prefix),
-        "section_name": _safe_suffix(section_name),
-        "allow_duplicate_hash": str(payload.get("allow_duplicate_hash", "") or "overrule"),
-        "exclude_from_visible_replay": _truthy(payload.get("exclude_from_visible_replay", False)),
-        "source": source,
-    }
-
-
-def _shader_filter_rule_enabled(payload: dict, *, filter_residual: bool) -> bool:
-    if "enabled" in payload and not _truthy(payload.get("enabled")):
-        return False
-    enabled_by = str(payload.get("enabled_by", "") or "").strip()
-    if not enabled_by:
-        return True
-    if enabled_by == "filter_residual":
-        return bool(filter_residual)
-    return True
-
-
-def _visible_replay_excluded_filter_indices(shader_filter_overrides: list[dict]) -> list[int]:
-    indices: list[int] = []
-    for rule in shader_filter_overrides:
-        if not bool(rule.get("exclude_from_visible_replay", False)):
-            continue
-        filter_index = int(rule.get("filter_index", -1) or -1)
-        if filter_index >= 0 and filter_index not in indices:
-            indices.append(filter_index)
-    return indices
-
-
-def _truthy(value) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() not in {"", "0", "false", "no", "off"}
-    return bool(value)
 
 
 def _global_bone_count(capture_manifest: dict) -> int:

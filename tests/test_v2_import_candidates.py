@@ -21,9 +21,49 @@ uv_transform = importlib.import_module(f"{PACKAGE_DIR.name}.core.uv_transform")
 
 SAMPLE_FRAMEANALYSIS = Path(r"E:\XXMI\EFMI\FrameAnalysis-2026-05-05-225007")
 MAIN_FRAMEANALYSIS = Path(r"E:\XXMI\EFMI\FrameAnalysis-2026-05-05-222451")
+CPU_SKIN_FRAMEANALYSIS = Path(r"E:\XXMI\EFMI\FrameAnalysis-2026-07-17-141635")
 
 
 class SyntheticCandidateImportTests(unittest.TestCase):
+    def test_cpu_pre_skinned_mode_requires_all_independent_previous_position_evidence(self):
+        payload = {
+            "ib_backing_hash": "9a09f1f0",
+            "vb0_backing_hash": "1d6a6186",
+            "vb3_distinct": True,
+            "texcoord4_input_slot": 3,
+            "texcoord4_format": "R32G32B32_FLOAT",
+            "cb2_skinning_flags": 0x10,
+        }
+
+        result = main_analyze._classify_skinning_mode(payload)
+
+        self.assertEqual(result["kind"], "cpu_pre_skinned")
+        self.assertEqual(result["confidence"], "high")
+        self.assertTrue(result["uses_external_previous_position"])
+
+    def test_dynamic_vertex_stream_without_external_previous_position_is_not_cpu_pre_skinned(self):
+        payload = {
+            "ib_backing_hash": "9a09f1f0",
+            "vb0_backing_hash": "1d6a6186",
+            "vb3_distinct": True,
+            "texcoord4_input_slot": 3,
+            "texcoord4_format": "R32G32B32_FLOAT",
+            "cb2_skinning_flags": 0x31,
+        }
+
+        result = main_analyze._classify_skinning_mode(payload)
+
+        self.assertEqual(result["kind"], "dynamic_vertex_stream")
+        self.assertFalse(result["uses_external_previous_position"])
+
+    def test_cpu_skinned_import_name_is_explicit_and_idempotent(self):
+        base_name = "945c08a9-1698-0"
+        marked = import_candidates._import_object_name(base_name, False)
+
+        self.assertEqual(marked, "945c08a9-1698-0 [CPU_SKINNED_UNSUPPORTED]")
+        self.assertEqual(import_candidates._import_object_name(marked, False), marked)
+        self.assertEqual(import_candidates._import_object_name(base_name, True), base_name)
+
     def test_uv_v_transform_is_symmetric_between_import_and_export(self):
         game_uv = (0.125, 0.75)
         blender_uv = uv_transform.game_uv_to_blender(game_uv)
@@ -514,6 +554,26 @@ class MainFrameAnalysisAnalyzeTests(unittest.TestCase):
             if candidate.get("display_name") == display_name:
                 return candidate
         self.fail(f"candidate not found: {display_name}")
+
+
+@unittest.skipUnless(CPU_SKIN_FRAMEANALYSIS.exists(), "CPU skin FrameAnalysis folder is not available")
+class CpuSkinFrameAnalysisTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = main_analyze.analyze_main_frameanalysis(str(CPU_SKIN_FRAMEANALYSIS))
+
+    def test_draw_45_is_reference_only_cpu_pre_skinned_geometry(self):
+        candidate = next(
+            item for item in self.manifest["candidate_ibs"] if item.get("display_name") == "945c08a9-1698-0"
+        )
+
+        self.assertEqual(candidate["import_draw_index"], 45)
+        self.assertEqual(candidate["position_stream"]["cb2_first_constant"], 14944)
+        self.assertEqual(candidate["position_stream"]["cb2_skinning_flags"], 0x10)
+        self.assertTrue(candidate["position_stream"]["vb3_distinct"])
+        self.assertEqual(candidate["skinning_mode"]["kind"], "cpu_pre_skinned")
+        self.assertFalse(candidate["replacement_supported"])
+        self.assertEqual(candidate["status"], "cpu_pre_skinned_import_only")
 
 
 if __name__ == "__main__":

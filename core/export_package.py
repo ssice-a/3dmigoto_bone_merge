@@ -386,6 +386,13 @@ def _collection_has_meshes_recursive(collection) -> bool:
 def _build_object_usages(source: _PartSource, collect_used_groups) -> tuple[ExportObjectUsage, ...]:
     usages: list[ExportObjectUsage] = []
     for mesh_obj in source.mesh_objects:
+        object_get = getattr(mesh_obj, "get", None)
+        if callable(object_get) and object_get("bmc_replacement_supported", True) is False:
+            reason = str(object_get("bmc_replacement_unsupported_reason", "") or "cpu_pre_skinned_vertex_stream")
+            raise ExportPlanError(
+                f"{source.region.collection_name}/{source.source_part_name}/{mesh_obj.name}: "
+                f"CPU pre-skinned draw cannot be exported as replacement geometry ({reason})"
+            )
         used_groups = tuple(sorted({int(value) for value in collect_used_groups(mesh_obj) if int(value) >= 0}))
         if not used_groups:
             raise ExportPlanError(f"{source.region.collection_name}/{source.source_part_name}/{mesh_obj.name}: no weighted numeric vertex groups found")

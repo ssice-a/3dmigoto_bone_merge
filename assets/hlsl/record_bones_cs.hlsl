@@ -1,48 +1,35 @@
 // Capture native bones into the canonical global bone pool.
 //
 // t0 = native game vs-t0
-// t1 = dumped shader-visible cb1
+// t1 = directly copied shader-visible capture CB
 // t2 = per-IB CaptureBoneMap
 // u1 = GlobalBonePool
 // u2 = RuntimeState
+// u3 = native-slot to capture-slot mapping
+// IniParams[0].xy = capture slot, native instance slot
 
 #include "bone_store_common.hlsli"
 
 StructuredBuffer<uint4> NativeT0 : register(t0);
-StructuredBuffer<uint4> DumpedCB1 : register(t1);
+StructuredBuffer<uint4> CapturedCB : register(t1);
 Buffer<uint> CaptureBoneMap : register(t2);
 
 RWStructuredBuffer<uint4> GlobalBonePool_UAV : register(u1);
 RWStructuredBuffer<uint4> RuntimeState_UAV : register(u2);
+RWStructuredBuffer<uint4> InstanceMapping_UAV : register(u3);
+Texture1D<float4> IniParams : register(t120);
 
 bool IsZero4(uint4 value)
 {
     return all(value == uint4(0, 0, 0, 0));
 }
 
-void EnsureCaptureSlot()
-{
-    uint4 header = RuntimeState_UAV[BMC_STATE_HEADER];
-    if (header.y == BMC_INVALID_SLOT || header.z == 0)
-    {
-        header.y = 0;
-        header.z = max(header.z, 1);
-        RuntimeState_UAV[BMC_STATE_HEADER] = header;
-        RuntimeState_UAV[BMC_STATE_SLOT_BASE] = uint4(0, header.x, 0, 0);
-    }
-}
-
 [numthreads(32, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    if (tid.x == 0)
-    {
-        EnsureCaptureSlot();
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    uint slot = RuntimeState_UAV[BMC_STATE_HEADER].y;
-    if (slot == BMC_INVALID_SLOT || slot >= BMC_MAX_INSTANCE_SLOTS)
+    uint capture_slot = (uint)IniParams[0].x;
+    uint native_slot = (uint)IniParams[0].y;
+    if (capture_slot >= BMC_MAX_INSTANCE_SLOTS || native_slot >= BMC_MAX_INSTANCE_SLOTS)
     {
         return;
     }
@@ -50,11 +37,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     uint pair_count = CaptureBoneMap[0];
     uint rows_to_copy = pair_count * BMC_BONE_ROWS;
 
-    uint native_slot = 0;
-    uint native_cb1_bone_row = native_slot * BMC_CB1_INSTANCE_STRIDE + BMC_CB1_BONE_BASE_ROW;
-    uint dst_slot_base = slot * BMC_GLOBAL_SLOT_ROW_STRIDE;
+    uint native_cb_bone_row = native_slot * BMC_CB_INSTANCE_STRIDE + BMC_CB_BONE_BASE_ROW;
+    uint dst_slot_base = capture_slot * BMC_GLOBAL_SLOT_ROW_STRIDE;
 
-    uint4 bone_window = DumpedCB1[native_cb1_bone_row];
+    uint4 bone_window = CapturedCB[native_cb_bone_row];
     uint src_current_base = bone_window.x;
     uint src_previous_base = bone_window.y;
     uint capture_valid = 0;
@@ -120,6 +106,8 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     if (tid.x == 0 && capture_valid != 0)
     {
-        RuntimeState_UAV[BMC_STATE_SLOT_BASE + slot] = uint4(1, RuntimeState_UAV[BMC_STATE_HEADER].x, 0, 0);
+        uint frame_id = RuntimeState_UAV[BMC_STATE_HEADER].x;
+        RuntimeState_UAV[BMC_STATE_SLOT_BASE + capture_slot] = uint4(1, frame_id, 0, 0);
+        InstanceMapping_UAV[native_slot] = uint4(capture_slot, 1, 0, 0);
     }
 }

@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Bone Merge Capture",
     "author": "OpenAI Codex",
-    "version": (0, 3, 0),
+    "version": (0, 3, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Bone Merge Capture",
     "description": "Analyze FrameAnalysis captures, import candidate IBs, and build global bone pools for Bone Merge workflows.",

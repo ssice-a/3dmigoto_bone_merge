@@ -1,395 +1,200 @@
 # BMC LOD Recognition Constraints
 
-This document records the LOD recognition rules only. Runtime INI emission,
-shadow replay layout, and export draw ordering are intentionally left to the
-runtime/export constraints document.
+This document records offline LOD recognition rules. Runtime resource and
+replay semantics are defined in `RUNTIME_INI_HLSL_CONSTRAINTS.md`.
 
 ## Core Rule
 
-An IB hash is only a draw-match entry point. It is not a stable identity for a
-bone layout, a palette, or a main/LOD relationship.
+An IB hash is a draw-match entry point, not a stable bone-layout identity.
+Recognition must keep these relationships explicit and separate:
 
-LOD recognition must build explicit relationships between:
-
-- LOD draw chains
-- LOD IB keys
-- main IB keys
-- LOD capture records
+- LOD draw chain
+- LOD override key
+- main override key
+- LOD capture map
 - canonical global bone slots
+- final chain shadow host
 
-These relationships must be kept separate. A correct LOD-to-main hash link does
-not prove that the LOD capture palette covers every global bone needed by replay.
+A correct LOD-to-main geometry link does not prove capture coverage.
 
 ## Runtime Stages
 
-BMC runtime behavior has three conceptual stages. LOD and main/control draws use
-the same stages; only the capture profile and chain data differ.
+Main and LOD use the same schema v3 stages.
 
-### 1. Record Stage
+### Record
 
-The record stage captures bone matrices from the currently bound game resources
-and writes them into the canonical `GlobalBonePool`.
-
-This stage is **profile-sensitive**.
-
-The active capture profile decides which capture map interprets the current
-draw's local bone indices:
+VS200 capture hashes the shader-visible root matrix in `b1`, stores the visible
+CB in the FIFO instance pool, and scatters native `vs-t0` rows through the
+selected capture map:
 
 ```ini
-run = CustomShader_ExtractCB1
-x100 = ...
-cs-t2 = ResourceMainCaptureBoneMap ; or ResourceLodCaptureBoneMap
+$uid = vs-cb1->HashRegion($native_slot * 256, 64)
+$capture_slot = #PoolBMCInstanceRegistry[$uid]
+PoolBMCInstanceRegistry[$uid] = copy vs-cb1
+cs-t2 = ResourceCaptureBoneMap_<main_or_lod_source>
 run = CustomShader_RecordBones
 ```
 
-`x100` is a record index inside the bound capture map. It is not a global bone
-base. The actual writes are defined by the map's pairs:
+The concrete capture map, rather than an INI record index, defines:
 
 ```text
 source_local_bone -> canonical_global_bone
 ```
 
-The same override key may need different record logic when it can execute in
-different profiles. In that case the capture map must be selected by a profile
-flag or an equivalent profile discriminator.
+If one override key is present in both main and LOD contexts, all required
+capture maps may run for that key. They scatter into the same canonical pool;
+runtime does not guess a profile from IB hash alone.
 
-### 2. Delayed Shadow Replay Stage
+### Delayed Shadow Replay
 
-The delayed shadow replay stage runs at the final host draw of a recognized
-shadow/capture chain. Its purpose is to wait until the chain has captured enough
-bone data, then replay exported parts in the shadow pass.
+Each recognized chain owns its final shadow host. Source shadows for exported
+parts are delayed until that host so the canonical pool has complete coverage.
+The FIFO CB pool replays each captured UID independently.
 
-This stage is **chain/host-sensitive**.
+The host decision controls:
 
-It decides:
+- which source shadows are skipped
+- whether the host needs `draw = from_caller`
+- transparent versus normal replay order
+- which exported main geometry represents the LOD key
 
-- which source shadow draws are skipped
-- which host receives delayed replay
-- whether the host's original draw must be preserved with `draw = from_caller`
-- which exported parts are replayed on the host
+### Visible Replay
 
-It does not decide how local bone indices are interpreted. That is record-stage
-work.
+VS201-203 use `b2`, resolve the current root-matrix UID against captured slot
+metadata, gather the exported part palette, and replay canonical exported
+geometry. LOD does not have a second visible HLSL path.
 
-### 3. Main Visible Replay Stage
-
-The visible replay stage runs during normal visible rendering. It skips the
-source draw, gathers the exported part's local palette from `GlobalBonePool`,
-redirects cb1 to the local pool, binds exported IB/VB resources, and draws.
-
-This stage is **part/replay-sensitive**.
-
-```ini
-cs-t2 = ResourcePartLocalToGlobalBoneMap_...
-run = CustomShader_GatherLocalBones
-vs-t0 = ResourceLocalBonePool_SRV
-run = CustomShader_RedirectCB1
-vs-cb1 = ResourceFakeCB1
-drawindexedinstanced = ...
-```
-
-The visible replay stage uses the exported part's
-`PartLocalToGlobalBoneMap`. It does not branch on main/LOD profile. Both main
-and LOD replay consume the same canonical global bone pool.
-
-## Profile Discrimination
-
-Profile discrimination primarily belongs to the record stage.
-
-If an override key can only appear in one capture profile, it can use a direct
-record block:
-
-```ini
-x100 = MAIN_RECORD
-cs-t2 = ResourceMainCaptureBoneMap
-run = CustomShader_RecordBones
-```
-
-or:
-
-```ini
-x100 = LOD_RECORD
-cs-t2 = ResourceLodCaptureBoneMap
-run = CustomShader_RecordBones
-```
-
-If an override key or host section can execute in multiple capture profiles,
-recording must branch on an explicit context flag, such as:
-
-```ini
-[Constants]
-global $bmc_profile_lod = 0
-
-; At the first draw of a recognized LOD capture chain:
-if vs == 200
-  $bmc_profile_lod = 1
-endif
-
-if $bmc_profile_lod == 1
-  run = CustomShader_ExtractCB1
-  x100 = LOD_RECORD
-  cs-t2 = ResourceLodCaptureBoneMap
-  run = CustomShader_RecordBones
-else
-  run = CustomShader_ExtractCB1
-  x100 = MAIN_RECORD
-  cs-t2 = ResourceMainCaptureBoneMap
-  run = CustomShader_RecordBones
-endif
-
-; At the final host of that same LOD capture chain:
-if vs == 200
-  $bmc_profile_lod = 0
-endif
-```
-
-The flag chooses how to write bones into `GlobalBonePool`. If one generated
-`TextureOverride` section is shared by main and LOD shadow contexts, the same
-flag may also guard which already-planned shadow skip/replay block runs in that
-section. It must not dynamically choose replay parts; replay ownership still
-comes from the offline main/LOD matching and shadow-chain plan.
-
-Emit this flag when an override key can be reached by both main and LOD record
-profiles, or when a single override section would otherwise contain both main
-and LOD shadow actions. Keys that exist in only one profile keep direct capture
-and shadow blocks.
+If a visible instance has no captured UID, the native draw is preserved.
 
 ## Terms
 
 - **Override key**: `(ib_hash, match_first_index, match_index_count)`.
-- **Main key**: an override key from the main/control capture.
-- **LOD key**: an override key from the LOD frame analysis.
-- **LOD chain**: a contiguous LOD pass group in the frame analysis, usually a
-  consecutive `vs == 200` shadow/capture sequence for the same character.
-- **LOD host**: the last effective draw in an LOD chain where delayed replay
-  should be attached.
-- **Capture profile**: the concrete bone layout currently bound by a draw. The
-  same IB hash may have different capture profiles in main and LOD contexts.
+- **Main key**: an override key from the main/control frame.
+- **LOD key**: an override key from the LOD frame.
+- **LOD chain**: a contiguous compatible VS200 capture sequence.
+- **LOD host**: the last effective draw in one LOD chain.
+- **Capture provider**: a draw whose palette can populate canonical bones.
+- **Replay link**: an offline LOD key -> exported main key relationship.
 
 ## Recognition Pipeline
 
-1. Parse the LOD frame analysis into draw records.
-2. Identify LOD `vs == 200` chains before doing main/LOD matching.
-3. For each chain, collect all candidate LOD keys in draw order.
-4. Select the chain host from the chain itself, not from a global singleton.
-5. Match main keys only against LOD keys that belong to the relevant chain.
-6. Build LOD capture records independently from the main/LOD hash links.
-7. Validate that the chain can write every canonical global bone required by
-   exported replay parts.
+1. Parse LOD draws and their exact IB region keys.
+2. Build compatible VS200 chains before main/LOD matching.
+3. Select one host per chain from that chain's draw order.
+4. Match LOD keys to main keys with layout and bone evidence.
+5. Build capture pairs independently from replay links.
+6. Determine which canonical bones exported replay actually requires.
+7. Add same-chain capture providers for missing bones.
+8. Enable shadow skipping only after full coverage validation.
 
-Runtime export may produce more than one LOD shadow replay plan. Each plan is
-keyed by the final host of its own recognized capture chain. A global
-`lod_manifest_snapshot.shadow_stage.host_*` value is diagnostic context only; it
-must not be treated as the sole replay host when the frame contains several LOD
-capture chains or a later composite draw.
-
-The analyzer must carry recognized chains forward as explicit data. At minimum
-a chain records:
-
-```text
-chain_index
-draw_start / draw_end
-start_lod_record_key / start_key
-host_lod_record_key / host_key
-lod_record_keys
-```
-
-Runtime generation uses this data for profile markers and delayed shadow host
-selection.
-
-Profile markers and delayed shadow host selection must be built from the raw
-recognized LOD chain data, not only from the filtered `LodCaptureBoneMap`
-records. A host draw can be valid even when that host does not write any
-currently required canonical global bone. Filtering it out of the capture map
-must not remove the `$bmc_profile_lod = 0` reset point or the delayed replay
-host.
+Runtime export may emit multiple LOD shadow replay plans. A global singleton
+host is invalid when a frame contains multiple character chains.
 
 ## Chain Detection
 
-LOD chain detection must be based on draw order and pass state. A chain should
-only include draws that are part of the same LOD capture/shadow pass.
+Chain detection uses compatible capture draws, ordering, and local continuity.
+It must not merge unrelated characters merely because they share VS hashes or
+the same backing `vs-t0` resource.
 
-Useful signals include:
+Useful boundaries include:
 
-- `vs == 200` after shader override filtering
-- the bone-store VS hash family
-- compatible pixel shader/pass role
-- consecutive draw order before the render pipeline changes
-- matching character/resource context when available
+- transition out of the VS200 capture stage
+- large draw-index gaps
+- incompatible CB or `vs-t0` contracts
+- a new recognized character cluster
+- a completed final host followed by another capture sequence
 
-Do not select a fixed global LOD shadow host such as `82254888` or `ef95f8f2`.
-Different frames and render paths can end on different hosts. For example, one
-frame may end on `ef95f8f2`, while another valid LOD chain may end on
-`df4b620c`.
+The configured chain-gap threshold is a conservative fallback, not identity.
 
-## LOD-to-Main Matching
+## LOD-To-Main Matching
 
-LOD-to-main matching answers one question only:
+Preferred evidence, strongest first:
 
-> Which exported main part should be replayed when this LOD key is encountered?
+1. Exact compatible vertex-layout and weighted bone signature.
+2. Point-cloud/bone-cloud correspondence from decoded geometry.
+3. Stable per-slot blend signatures.
+4. Same-part donors already established in the chain.
 
-The matcher should be chain-scoped:
+IB hash equality alone is insufficient. Dynamic VB0 identity is also
+insufficient because the same allocation may be reused.
 
-```text
-main exported part -> LOD source within one recognized LOD chain
-```
-
-Do not collapse replay links only by LOD key. If the same LOD key appears in
-two chains, each chain keeps its own `lod_chain_index` and geometry list. The
-coverage proof for chain A must not include geometry that belongs only to chain
-B, or it can incorrectly fail as "missing bones" and suppress a valid shadow
-replay.
-
-- A main key may only match LOD keys present in the same recognized LOD chain.
-- Matching all main records against all LOD records globally is too broad.
-- `vb2` slot count can be a fast first pass, but it is not authoritative.
-- `vb2` slot-signature matching is one-to-one. One LOD key must not be claimed
-  by several unrelated main keys just because their slot counts are close.
-- When there are several recognized chains, matching is executed separately per
-  chain. A main key may therefore produce several LOD links, but each emitted
-  link contains one concrete LOD source and its chain metadata.
-- Geometry center/bounds/diag are supporting evidence.
-- Vertex-group point-cloud matching is the source of truth for one-to-many
-  relationships. Small vertex-group clouds that fail direct matching may be
-  merged into a larger compatible group when the spatial evidence supports that
-  relationship.
-
-If two LOD candidates are both plausible, prefer the one in the same chain and
-with stronger geometry/slot affinity. Do not let a LOD key be claimed by
-multiple unrelated main keys without an explicit multi-source reason.
+One LOD local bone may scatter to multiple canonical globals when evidence
+proves a one-to-many relationship. Conversely, conflicting candidates must not
+be collapsed only to satisfy coverage.
 
 ## Palette And Capture Separation
 
-LOD-to-main matching is independent from bone capture.
+Replay geometry always uses the exported main part's
+`PartLocalToGlobalBoneMap`. LOD capture maps only decide where native LOD rows
+land in the canonical pool.
 
-The replay part uses its exported `PartLocalToGlobalBoneMap` and therefore reads
-from canonical global bone slots. The LOD capture record must write the correct
-native LOD local bones into those canonical global slots.
+```text
+LOD source local palette -> canonical global pool -> exported main local palette
+```
 
-This means:
-
-- LOD links decide replay ownership.
-- LOD capture records decide bone data placement.
-- The same LOD key can be the correct replay host but still fail if its capture
-  record does not cover the required global bones.
+Do not bind a LOD capture map as an exported part palette, and do not use an
+exported part map to interpret native LOD source-local indices.
 
 ## Capture Provider Selection
 
-Capture provider selection must start from exported geometry, not from a fixed
-main/LOD IB count.
+A replay-linked LOD key may not expose every required bone. Missing bones can
+be inherited only from compatible providers in the same recognized chain.
 
-For every exported part, build its actual bone demand from the vertex weights of
-the objects inside that part:
+Provider selection must record:
 
-```text
-part -> required canonical_global_bones
-```
+- provider override key
+- source local bone
+- target canonical global bone
+- evidence type
+- chain ownership
 
-If a collection contains objects from another body region, that is not a special
-case. The part still owns those exported vertices, so its required global bones
-must include every weighted vertex group used by those objects. Collection names
-and object names must not be used to trim the part palette.
-
-For each capture profile, gather the union of all globals needed by the replay
-parts that can be drawn in that profile:
-
-```text
-MainNeededGlobals = union(all exported main replay part required globals)
-LodNeededGlobals  = union(geometry suffixes referenced by LOD replay links)
-```
-
-Then find provider draws independently for each profile:
-
-```text
-MainProviders = main capture records that write MainNeededGlobals
-LodProviders  = LOD capture records that write LodNeededGlobals
-```
-
-A draw participates in capture only if its bound capture map can write at least
-one currently needed canonical global bone. If it only writes unused globals, it
-should not be required by the replay plan.
-
-This applies to visible-stage refresh as well as shadow-stage capture. Visible
-record is not a blanket operation over every BMC override. The exporter must
-first know which canonical global bones are used by exported geometry, then
-record only the matching provider overrides that can write those globals.
-
-Main and LOD provider counts are allowed to differ. For example, a main replay
-set may need four provider IBs, while the corresponding LOD replay set may need
-three or five. The counts must not be inherited between profiles; both profiles
-share the canonical global bone pool, but their source-local bone layouts and
-provider draws are selected separately.
-
-If exported main geometry has no LOD replay link, that geometry must not broaden
-`LodNeededGlobals`. If there is no exported geometry at all, capture maps may
-remain unfiltered for diagnostic/import-only workflows.
-
-When multiple export collections contain objects, compute each part palette
-first, then union those palettes only for provider selection. Replay still uses
-the individual part's `PartLocalToGlobalBoneMap`.
+Sparse/noisy candidates that broaden relationships without geometry or blend
+support must be rejected.
 
 ## Same Hash, Different Layout
 
-If a hash appears in both main and LOD contexts, or appears in multiple LOD
-profiles, do not assume it uses the same bone layout.
-
-The selector must distinguish the capture profile by context, such as:
-
-- containing LOD chain
-- pass role
-- VS/filter index
-- bound `vb0/vb1/vb2` resource signature
-- `vs-t0`/CB bone-window signature when available
-
-The generated runtime plan must be able to express separate main and LOD capture
-records for the same IB hash when their layouts differ.
-
-For same-key profile conflicts, the profile flag is a chain context marker, not
-a new draw identity. The start key of the recognized LOD chain sets it, the
-final host key resets it, and frame end resets it defensively.
+The same IB hash may appear with different first-index regions, layouts, or
+capture palettes. All lookup tables must use the full override key. A fallback
+from `(hash, first_index, count)` to hash-only matching is unsafe.
 
 ## Coverage Validation
 
-Before runtime INI generation, every LOD chain that will replay exported parts
-must be checked:
+Before enabling delayed LOD shadow replacement, prove:
 
-1. Collect all `canonical_global_bone` values required by the replay parts.
-2. Collect all canonical global bones written by capture records in that chain
-   before the selected host.
-3. Report missing bones.
-4. If missing bones are used by exported geometry, the plan is unsafe.
+```text
+required canonical globals for replay
+    subset of
+canonical globals written by all accepted capture providers in this chain
+```
 
-Unsafe plans must not be silently emitted as if they are correct. By default,
-export should be blocked and the diagnostic output must report the missing
-globals, affected profile, chain, host, and replay part. An advanced
-"allow incomplete export" escape hatch may exist later, but it must not be the
-default path.
+If proof fails:
+
+- keep native shadow draws
+- report missing canonical globals and candidate providers
+- allow explicit fallback repair in Blender
+- do not emit a partial replacement shadow
+
+Unused unmatched groups do not block export. Only bones actually referenced by
+exported weighted vertices contribute to required coverage.
 
 ## Expected Debug Output
 
-LOD analysis should print enough information to diagnose wrong links quickly:
+Analysis diagnostics should include:
 
-```text
-[BMC LOD] chain=0 draws=32-37 host=df4b620c:0:23364 keys=6
-[BMC LOD] link df4b620c:0:23364 -> 614a8c60:0:45003 method=slot_signature score=...
-[BMC LOD] coverage chain=0 required=230 captured=230 missing=0
-```
-
-If coverage is incomplete:
-
-```text
-[BMC LOD] coverage chain=0 required=230 captured=219 missing=11
-[BMC LOD] missing globals: 85,86,92,155,...
-```
+- chain id and draw range
+- selected host key and draw index
+- each LOD -> main replay link with evidence
+- every capture pair and provider
+- required, covered, and missing canonical bones
+- rejected ambiguous/noisy candidates
+- whether shadow replay is enabled or kept native
 
 ## Non-Goals
 
-This document does not define:
+LOD recognition does not:
 
-- final INI replay block placement
-- `draw = from_caller` rules
-- main shadow replay rules
-- part splitting rules
-- runtime HLSL implementation details
-
-Those rules belong in the export/runtime constraint document.
+- classify character shaders; EFMI Core ShaderRegex owns that
+- distinguish byte-identical root-matrix instances
+- replace CPU pre-skinned draws
+- choose different replacement geometry per instance
+- infer missing capture coverage at runtime

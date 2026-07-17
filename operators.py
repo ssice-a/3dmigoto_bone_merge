@@ -351,6 +351,8 @@ def _replace_candidate_items_from_manifest(scene, manifest: dict) -> None:
         item.shadow_capture_ready = bool(candidate.get("shadow_capture_ready", bool(candidate.get("shadow_draw_indices"))))
         item.lod_match_excluded = bool(candidate.get("lod_match_excluded", False))
         item.lod_match_excluded_reason = str(candidate.get("lod_match_excluded_reason", "") or "")
+        item.replacement_supported = bool(candidate.get("replacement_supported", True))
+        item.skinning_mode = str(dict(candidate.get("skinning_mode", {}) or {}).get("kind", "") or "shader_skinned")
         item.status = str(candidate.get("status", "") or ("capture_ready" if item.shadow_capture_ready else "import_only_no_early_shadow"))
         item.manual = False
     scene.bmc_candidate_index = min(scene.bmc_candidate_index, max(0, len(scene.bmc_candidate_items) - 1))
@@ -401,6 +403,8 @@ def _apply_candidate_payload_to_item(item, candidate: dict, *, manual: bool = Fa
     item.shadow_capture_ready = bool(candidate.get("shadow_capture_ready", bool(candidate.get("shadow_draw_indices"))))
     item.lod_match_excluded = bool(candidate.get("lod_match_excluded", False))
     item.lod_match_excluded_reason = str(candidate.get("lod_match_excluded_reason", "") or "")
+    item.replacement_supported = bool(candidate.get("replacement_supported", True))
+    item.skinning_mode = str(dict(candidate.get("skinning_mode", {}) or {}).get("kind", "") or "shader_skinned")
     item.status = str(candidate.get("status", "") or ("capture_ready" if item.shadow_capture_ready else "manual_or_import_only"))
     item.manual = bool(manual)
 
@@ -1903,7 +1907,6 @@ class BMC_OT_prepare_export_collection(bpy.types.Operator):
                 capture_manifest_path=scene.bmc_manifest_path,
                 generate_ini=generate_ini,
                 simple_override=simple_override,
-                filter_residual=bool(getattr(scene, "bmc_filter_residual", True)),
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Export failed: {exc}")

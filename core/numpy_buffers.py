@@ -6,36 +6,22 @@ import os
 
 import numpy as np
 
-
-def normalize_dxgi_format(fmt: str) -> str:
-    normalized = str(fmt or "").upper()
-    if normalized.startswith("DXGI_FORMAT_"):
-        normalized = normalized[len("DXGI_FORMAT_"):]
-    return normalized
+from .vertex_layout_codec import (
+    dxgi_format_size as _codec_format_size,
+    dxgi_format_spec as _codec_format_spec,
+    normalize_dxgi_format,
+)
 
 
 def dxgi_format_size(fmt: str) -> int:
-    spec = dxgi_format_spec(fmt)
-    if spec is None:
-        return 0
-    dtype_name, component_count, _conversion = spec
-    return int(np.dtype(dtype_name).itemsize) * int(component_count)
+    return _codec_format_size(fmt)
 
 
 def dxgi_format_spec(fmt: str):
-    normalized = normalize_dxgi_format(fmt)
-    return {
-        "R32_FLOAT": ("<f4", 1, None),
-        "R32_UINT": ("<u4", 1, None),
-        "R32G32_FLOAT": ("<f4", 2, None),
-        "R32G32B32_FLOAT": ("<f4", 3, None),
-        "R32G32B32A32_FLOAT": ("<f4", 4, None),
-        "R32G32B32A32_UINT": ("<u4", 4, None),
-        "R16G16B16A16_UNORM": ("<u2", 4, "unorm16"),
-        "R8G8B8A8_UINT": ("u1", 4, None),
-        "R8G8B8A8_SNORM": ("u1", 4, "snorm8"),
-        "R8G8B8A8_UNORM": ("u1", 4, "unorm8"),
-    }.get(normalized)
+    spec = _codec_format_spec(fmt)
+    if spec is None:
+        return None
+    return spec.dtype, int(spec.component_count), spec.conversion
 
 
 def index_format_spec(fmt: str):
@@ -91,11 +77,14 @@ def read_interleaved_field(
         return values
     if conversion == "unorm16":
         return values.astype(np.float64) / 65535.0
+    if conversion == "snorm16":
+        return np.maximum(values.astype(np.float64) / 32767.0, -1.0)
     if conversion == "unorm8":
         return values.astype(np.float64) / 255.0
     if conversion == "snorm8":
         signed = values.astype(np.int16)
-        return np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
+        converted_values = np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
+        return np.maximum(converted_values, -1.0)
     if values.dtype.kind in {"u", "i"}:
         return values.copy()
     with np.errstate(invalid="ignore", over="ignore"):
@@ -145,11 +134,14 @@ def read_interleaved_fields(
 def _convert_interleaved_values(values, conversion):
     if conversion == "unorm16":
         return values.astype(np.float64) / 65535.0
+    if conversion == "snorm16":
+        return np.maximum(values.astype(np.float64) / 32767.0, -1.0)
     if conversion == "unorm8":
         return values.astype(np.float64) / 255.0
     if conversion == "snorm8":
         signed = values.astype(np.int16)
-        return np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
+        converted_values = np.where(signed >= 128, signed - 256, signed).astype(np.float64) / 127.0
+        return np.maximum(converted_values, -1.0)
     if conversion is None:
         return values.copy()
     if values.dtype.kind in {"u", "i"}:

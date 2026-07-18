@@ -1488,26 +1488,6 @@ def _merge_lod_shadow_plans_by_host(plans: list[dict]) -> list[dict]:
             order.append(host_key)
             continue
         bucket = merged_by_host[host_key]
-        conflicting_parts = any(
-            set(bucket.get(field, []) or []) != set(plan.get(field, []) or [])
-            for field in ("transparent_parts", "normal_parts")
-        )
-        if conflicting_parts:
-            bucket.update(
-                {
-                    "enabled": False,
-                    "reason": "ambiguous_lod_host_instance_groups",
-                    "transparent_parts": [],
-                    "normal_parts": [],
-                    "skip_keys": [],
-                }
-            )
-            chain_index = _int_default(plan.get("chain_index"), -1)
-            if chain_index not in bucket.setdefault("chain_indices", []):
-                bucket["chain_indices"].append(chain_index)
-            continue
-        if not bool(bucket.get("enabled", False)):
-            continue
         for field in ("transparent_parts", "normal_parts"):
             for suffix in plan.get(field, []) or []:
                 if suffix not in bucket[field]:

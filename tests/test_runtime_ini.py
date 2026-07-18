@@ -90,6 +90,7 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("drawindexedinstanced = 3,1,0,0,$bmc_slot_native_1", ini_text)
         visible_section = ini_text[ini_text.index("if (vs == 201 || vs == 202 || vs == 203)") :]
         self.assertNotIn("#PoolBMCInstanceRegistry", visible_section)
+        self.assertNotIn("PoolBMCInstanceRegistry = null", ini_text)
         self.assertIn("if $bmc_mapping_valid == 1\n    handling = skip", visible_section)
         self.assertIn("StructuredBuffer<uint4> CapturedCB", record_shader)
         self.assertIn("StructuredBuffer<uint4> CapturedCB", redirect_shader)
@@ -1263,6 +1264,7 @@ class RuntimeIniTests(unittest.TestCase):
                     "lod_match_first_index": 0,
                     "lod_match_index_count": 20,
                     "lod_capture_draw_indices": [31],
+                    "lod_capture_instance_signatures": {"31": ["instance_a"]},
                     "lod_local_bone_count": 1,
                     "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
                 },
@@ -1272,6 +1274,7 @@ class RuntimeIniTests(unittest.TestCase):
                     "lod_match_first_index": 0,
                     "lod_match_index_count": 30,
                     "lod_capture_draw_indices": [39],
+                    "lod_capture_instance_signatures": {"39": ["instance_a"]},
                     "lod_local_bone_count": 1,
                     "scatter_pairs": [{"lod_local_bone": 0, "canonical_global_bone": 0}],
                 },
@@ -1344,8 +1347,79 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("  draw = from_caller", host_section)
         self.assertIn("; delayed normal shadow replay", host_section)
         self.assertIn("; replay aaaaaaaa_10_0_part00", host_section)
+        self.assertIn("$bmc_instance_uid == $bmc_slot_uid_0", host_section)
+        self.assertNotIn(
+            "if $bmc_slot_uid_0 > 0 && $bmc_slot_native_0 >= 0 && $bmc_slot_native_0 < 8",
+            host_section,
+        )
         self.assertIn("  handling = skip", exported_lod_section)
         self.assertNotIn("; delayed normal shadow replay", exported_lod_section)
+
+    def test_lod_shadow_coverage_is_scoped_to_root_instance_signature(self):
+        records = [
+            {
+                "record_index": 0,
+                "lod_profile_id": "lod1",
+                "ib_hash": "aaaaaaaa",
+                "match_first_index": 0,
+                "match_index_count": 10,
+                "capture_draw_indices": [10],
+                "capture_instance_signatures": {"10": "instance_a"},
+                "canonical_global_bones": [0],
+            },
+            {
+                "record_index": 1,
+                "lod_profile_id": "lod1",
+                "ib_hash": "bbbbbbbb",
+                "match_first_index": 0,
+                "match_index_count": 20,
+                "capture_draw_indices": [11],
+                "capture_instance_signatures": {"11": "instance_b"},
+                "canonical_global_bones": [1],
+            },
+        ]
+
+        available, coverage = ini_export._lod_shadow_available_globals_for_chain(
+            records,
+            lod_profile_id="lod1",
+            instance_signature="instance_a",
+            host_draw_index=12,
+            stage_draw_start=10,
+            stage_draw_end=12,
+        )
+
+        self.assertEqual({0}, available)
+        self.assertEqual([0], [record["record_index"] for record in coverage])
+
+    def test_same_lod_host_with_different_instance_parts_falls_back_to_native_shadow(self):
+        host = {"ib_hash": "aaaaaaaa", "match_first_index": 0, "match_index_count": 10}
+        plans = [
+            {
+                "enabled": True,
+                "host_key": host,
+                "chain_index": 0,
+                "instance_signature": "instance_a",
+                "transparent_parts": [],
+                "normal_parts": ["part_a"],
+                "skip_keys": [host],
+            },
+            {
+                "enabled": True,
+                "host_key": host,
+                "chain_index": 1,
+                "instance_signature": "instance_b",
+                "transparent_parts": [],
+                "normal_parts": ["part_b"],
+                "skip_keys": [host],
+            },
+        ]
+
+        merged = ini_export._merge_lod_shadow_plans_by_host(plans)
+
+        self.assertEqual(1, len(merged))
+        self.assertFalse(merged[0]["enabled"])
+        self.assertEqual("ambiguous_lod_host_instance_groups", merged[0]["reason"])
+        self.assertEqual([], merged[0]["skip_keys"])
 
     def test_lod_shadow_replay_links_remain_chain_scoped_for_repeated_lod_key(self):
         manifest = {
@@ -1549,6 +1623,15 @@ class RuntimeIniTests(unittest.TestCase):
         self.assertIn("ResourceRuntimeState_UAV", ini_text)
         self.assertNotIn("ResourceFakeT0", ini_text)
         self.assertNotIn("ResourceLocalFakeT0", ini_text)
+        self.assertNotIn("PoolBMCInstanceRegistry = null", ini_text)
+        for resource_name in (
+            "ResourceGlobalBonePool_UAV",
+            "ResourceLocalBonePool_UAV",
+            "ResourceInstanceMapping_UAV",
+        ):
+            section = ini_text[ini_text.index(f"[{resource_name}]") :]
+            section = section[: section.index("\n\n")]
+            self.assertIn("bind_flags = shader_resource unordered_access", section)
 
     def test_visible_replay_is_inlined_with_export_geometry(self):
         manifest = {

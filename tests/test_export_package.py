@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import numpy as np
 import struct
 import sys
 import tempfile
@@ -18,6 +19,7 @@ export_package = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_packag
 export_buffers = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_buffers")
 export_prepare = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_prepare")
 vertex_format = importlib.import_module(f"{PACKAGE_DIR.name}.core.vertex_format")
+vertex_layout_codec = importlib.import_module(f"{PACKAGE_DIR.name}.core.vertex_layout_codec")
 
 
 class FakeObject:
@@ -141,6 +143,12 @@ class FakeColorValue:
         self.color = tuple(color)
 
 
+class FakeSrgbColorValue(FakeColorValue):
+    def __init__(self, color, color_srgb):
+        super().__init__(color)
+        self.color_srgb = tuple(color_srgb)
+
+
 class FakeColorAttribute:
     def __init__(self, values, *, domain="POINT"):
         self.data = FakeDataList(FakeColorValue(value) for value in values)
@@ -197,6 +205,158 @@ def collect_groups(mesh_obj):
 
 
 class ExportPackageTests(unittest.TestCase):
+    def test_raw_equivalence_preserves_rounding_but_real_uv_edit_reencodes(self):
+        source_values = np.asarray([[0.25, 0.75]], dtype=np.float32)
+        raw = source_values.view(np.uint8).reshape(1, 8).copy()
+        target = raw.copy()
+        vertex_indices = np.asarray([0], dtype=np.intp)
+
+        one_ulp = np.nextafter(source_values, np.float32(1.0))
+        export_buffers._assign_numeric_preserving_equivalent(
+            target,
+            0,
+            one_ulp,
+            raw,
+            vertex_indices,
+            "R32G32_FLOAT",
+        )
+        self.assertEqual(target.tobytes(), raw.tobytes())
+
+        edited = np.asarray([[0.5, 0.75]], dtype=np.float32)
+        export_buffers._assign_numeric_preserving_equivalent(
+            target,
+            0,
+            edited,
+            raw,
+            vertex_indices,
+            "R32G32_FLOAT",
+        )
+        self.assertEqual(target.tobytes(), edited.tobytes())
+
+    def test_raw_packed_normal_is_reencoded_after_semantic_edit(self):
+        source = vertex_format.encode_game_packed_tangent_frame(
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+            1.0,
+        )
+        edited = vertex_format.encode_game_packed_tangent_frame(
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            1.0,
+        )
+        raw = np.asarray([source], dtype=np.uint32).view(np.uint8).reshape(1, 4).copy()
+        target = raw.copy()
+
+        export_buffers._assign_packed_normal_preserving_equivalent(
+            target,
+            0,
+            np.asarray([edited], dtype=np.uint32),
+            raw,
+            np.asarray([0], dtype=np.intp),
+        )
+
+        self.assertEqual(struct.unpack("<I", target.tobytes())[0], edited)
+
+    def test_byte_color_export_reads_stored_srgb_bytes(self):
+        attribute = FakeColorAttribute([])
+        attribute.data = FakeDataList(
+            [
+                FakeSrgbColorValue(
+                    (0.25, 0.25, 0.25, 1.0),
+                    (1.0 / 255.0, 64.0 / 255.0, 128.0 / 255.0, 1.0),
+                )
+            ]
+        )
+
+        values = export_buffers._color_attribute_numpy_array(attribute)
+
+        self.assertEqual(values.tolist(), [[1, 64, 128, 255]])
+
+    def test_unknown_vertex_field_and_padding_round_trip_from_raw_carrier(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        raw_records = (
+            b"\x01\x02\x03\x04\xa1",
+            b"\x11\x12\x13\x14\xb2",
+            b"\x21\x22\x23\x24\xc3",
+        )
+        padded = [record + b"\0\0\0" for record in raw_records]
+        for word_index in range(2):
+            signed_words = [
+                struct.unpack_from("<i", record, word_index * 4)[0]
+                for record in padded
+            ]
+            target.data.attributes[
+                vertex_layout_codec.raw_word_attribute_name("vb1", word_index)
+            ] = FakeAttribute(signed_words)
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 5,
+                        "elements": [
+                            {
+                                "semantic_name": "COLOR",
+                                "semantic_index": 0,
+                                "format": "R10G10B10A2_UNORM",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
+            output = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            self.assertEqual(output.read_bytes(), b"".join(raw_records))
+
+    def test_unknown_vertex_field_without_raw_carrier_blocks_export(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 4,
+                        "elements": [
+                            {
+                                "semantic_name": "COLOR",
+                                "semantic_index": 0,
+                                "format": "R10G10B10A2_UNORM",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "lossless raw carrier is missing"):
+                export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
+
     def test_cpu_pre_skinned_import_is_rejected_from_replacement_export(self):
         mesh = FakeObject("face [CPU_SKINNED_UNSUPPORTED]", [0, 1])
         mesh["bmc_replacement_supported"] = False
@@ -756,7 +916,7 @@ class ExportPackageTests(unittest.TestCase):
             self.assertIn("capture_valid", record_bones_shader)
             self.assertIn("NativeT0.GetDimensions", record_bones_shader)
 
-    def test_texcoord4_missing_on_export_mesh_ignores_source_ib_object_and_uses_default(self):
+    def test_texcoord4_missing_on_export_mesh_is_not_borrowed_from_source_object(self):
         source = FakeObject(
             "640d1c0e-3-0-source",
             [0],
@@ -801,15 +961,14 @@ class ExportPackageTests(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            export_buffers.write_part_geometry_buffers(
-                tmpdir,
-                plan.parts,
-                layout,
-            )
-            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
-            self.assertEqual(texcoord_path.read_bytes(), bytes([0] * 12))
+            with self.assertRaisesRegex(ValueError, "missing required vb1 TEXCOORD4"):
+                export_buffers.write_part_geometry_buffers(
+                    tmpdir,
+                    plan.parts,
+                    layout,
+                )
 
-    def test_texcoord4_missing_without_source_uses_neutral_packed_default(self):
+    def test_texcoord4_missing_without_raw_carrier_blocks_export(self):
         target = FakeObject(
             "Body.001",
             [0],
@@ -841,15 +1000,14 @@ class ExportPackageTests(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            export_buffers.write_part_geometry_buffers(
-                tmpdir,
-                plan.parts,
-                layout,
-            )
-            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
-            self.assertEqual(texcoord_path.read_bytes(), bytes([0] * 12))
+            with self.assertRaisesRegex(ValueError, "missing required vb1 TEXCOORD4"):
+                export_buffers.write_part_geometry_buffers(
+                    tmpdir,
+                    plan.parts,
+                    layout,
+                )
 
-    def test_texcoord4_raw_point_attributes_are_not_reused_without_color(self):
+    def test_legacy_texcoord_component_attributes_do_not_replace_byte_color(self):
         target = FakeObject(
             "Body.001",
             [0],
@@ -883,9 +1041,8 @@ class ExportPackageTests(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
-            texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
-            self.assertEqual(texcoord_path.read_bytes(), bytes([0] * 12))
+            with self.assertRaisesRegex(ValueError, "missing required vb1 TEXCOORD4"):
+                export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
 
     def test_texcoord4_color_attribute_is_encoded(self):
         target = FakeObject(
@@ -929,6 +1086,99 @@ class ExportPackageTests(unittest.TestCase):
             export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
             texcoord_path = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
             self.assertEqual(texcoord_path.read_bytes(), bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]))
+
+    def test_texcoord2_and_texcoord4_alias_is_written_once_from_primary_carrier(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        target.data.attributes["bmc_vb1_texcoord4_color"] = FakeColorAttribute(
+            [
+                (1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 4.0 / 255.0),
+                (5.0 / 255.0, 6.0 / 255.0, 7.0 / 255.0, 8.0 / 255.0),
+                (9.0 / 255.0, 10.0 / 255.0, 11.0 / 255.0, 12.0 / 255.0),
+            ]
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 4,
+                        "elements": [
+                            {
+                                "semantic_name": "TEXCOORD",
+                                "semantic_index": semantic_index,
+                                "format": "R8G8B8A8_SNORM",
+                                "aligned_byte_offset": 0,
+                            }
+                            for semantic_index in (2, 4)
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
+            output = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            self.assertEqual(
+                output.read_bytes(),
+                bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            )
+
+    def test_color0_byte_attribute_uses_generic_semantic_adapter(self):
+        target = FakeObject(
+            "Body.001",
+            [0],
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        target.data.attributes["bmc_vb1_color0_color"] = FakeColorAttribute(
+            [
+                (1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 4.0 / 255.0),
+                (5.0 / 255.0, 6.0 / 255.0, 7.0 / 255.0, 8.0 / 255.0),
+                (9.0 / 255.0, 10.0 / 255.0, 11.0 / 255.0, 12.0 / 255.0),
+            ]
+        )
+        root = FakeCollection(
+            "ExportRoot",
+            children=[FakeCollection("640d1c0e-3-0", objects=[target])],
+        )
+        plan = export_package.build_export_plan(root, collect_groups)
+        layout = {
+            "640d1c0e-3-0": {
+                "buffers": {
+                    "vb1": {
+                        "slot": "vb1",
+                        "stride": 4,
+                        "elements": [
+                            {
+                                "semantic_name": "COLOR",
+                                "semantic_index": 0,
+                                "format": "R8G8B8A8_UNORM",
+                                "aligned_byte_offset": 0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_buffers.write_part_geometry_buffers(tmpdir, plan.parts, layout)
+            output = Path(tmpdir) / "640d1c0e-3-0_part00-Texcoord.buf"
+            self.assertEqual(
+                output.read_bytes(),
+                bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            )
 
     def test_packed_normal_export_requires_tangent_frame(self):
         target = FakeObject(

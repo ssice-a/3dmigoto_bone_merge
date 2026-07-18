@@ -1,8 +1,9 @@
 """Shared helpers for editable non-UV TEXCOORD attribute storage.
 
 The game can bind packed auxiliary data as TEXCOORD semantics.  R8G8B8A8_SNORM
-payloads are edited through color attributes and exported from the current
-mesh state; missing color attributes intentionally encode as zero.
+payloads are edited through color attributes. Imported meshes also retain a
+lossless raw carrier; external meshes without either representation are
+rejected instead of silently encoding zero.
 """
 
 from __future__ import annotations

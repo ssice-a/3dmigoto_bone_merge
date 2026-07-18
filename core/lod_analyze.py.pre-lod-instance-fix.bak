@@ -124,8 +124,7 @@ def analyze_lod_for_manifest(
         ignored_global_bones=ignored_global_bones,
     )
     global_candidates = _mapping_global_candidates(mapping)
-    detected_lod_chains = _build_lod_record_chains(lod_records)
-    lod_chains, lod_identity = _select_target_lod_chains(main_records, detected_lod_chains)
+    lod_chains = _build_lod_record_chains(lod_records)
     links = _build_lod_links(main_records, lod_records, global_candidates, lod_chains=lod_chains)
     capture_records = _build_lod_capture_records(
         lod_records,
@@ -150,7 +149,6 @@ def analyze_lod_for_manifest(
         }
         for entry in lod_manifest.get("validation", []) or []
     )
-    validation.extend(_lod_identity_validation(lod_identity))
 
     return {
         "lod_frameanalysis": [
@@ -168,7 +166,6 @@ def analyze_lod_for_manifest(
                 "matched_vertex_count": int(mapping["matched_vertex_count"]),
                 "lod_vertex_count": int(len(lod_points)),
                 "lod_chain_count": int(len(lod_chains)),
-                "detected_lod_chain_count": int(len(detected_lod_chains)),
                 "skipped_main_hash_lod_candidate_count": int(skipped_main_hash_count),
                 "canonical_match_point_count": int(mapping["canonical_match_point_count"]),
                 "lod_match_point_count": int(mapping["lod_match_point_count"]),
@@ -178,7 +175,6 @@ def analyze_lod_for_manifest(
         ],
         "lod_links": links,
         "lod_chains": lod_chains,
-        "lod_identity": lod_identity,
         "lod_capture_records": capture_records,
         "lod_mapping": final_mapping["mapping_entries"],
         "lod_review": review,
@@ -207,8 +203,7 @@ def _try_analyze_lod_by_signatures(
     if not main_records or not lod_records:
         return None
 
-    detected_lod_chains = _build_lod_record_chains(lod_records)
-    lod_chains, lod_identity = _select_target_lod_chains(main_records, detected_lod_chains)
+    lod_chains = _build_lod_record_chains(lod_records)
     links = _build_lod_links(main_records, lod_records, {}, lod_chains=lod_chains)
     if not _signature_links_are_unambiguous(main_records, lod_records, links):
         return None
@@ -240,7 +235,6 @@ def _try_analyze_lod_by_signatures(
         }
         for entry in lod_manifest.get("validation", []) or []
     )
-    validation.extend(_lod_identity_validation(lod_identity))
 
     variant_id = _build_lod_variant_id(frameanalysis_dir, capture_records)
     generated_at = datetime.now(timezone.utc).isoformat()
@@ -260,7 +254,6 @@ def _try_analyze_lod_by_signatures(
                 "matched_vertex_count": 0,
                 "lod_vertex_count": 0,
                 "lod_chain_count": int(len(lod_chains)),
-                "detected_lod_chain_count": int(len(detected_lod_chains)),
                 "skipped_main_hash_lod_candidate_count": int(skipped_main_hash_count),
                 "canonical_match_point_count": 0,
                 "lod_match_point_count": 0,
@@ -271,7 +264,6 @@ def _try_analyze_lod_by_signatures(
         ],
         "lod_links": links,
         "lod_chains": lod_chains,
-        "lod_identity": lod_identity,
         "lod_capture_records": capture_records,
         "lod_mapping": mapping["mapping_entries"],
         "lod_review": review,
@@ -2014,153 +2006,6 @@ def _build_lod_record_chains(lod_records: dict[str, dict]) -> list[dict]:
             }
         )
     return chains
-
-
-def _select_target_lod_chains(main_records: list[dict], lod_chains: list[dict]) -> tuple[list[dict], dict]:
-    """Keep LOD chains that have a defensible identity link to the target character.
-
-    Root-matrix signatures distinguish runtime instances, but do not identify a
-    character model. A mixed scene can contain several humanoids with similar
-    bone-slot layouts, so point-cloud or slot-signature matches are not enough
-    to decide which instance group owns this LOD profile.
-    """
-
-    chains = [dict(chain or {}) for chain in lod_chains or []]
-    main_by_key = {
-        str(record.get("source_key", "") or "").lower(): dict(record or {})
-        for record in main_records or []
-        if str(record.get("source_key", "") or "")
-    }
-    grouped: dict[str, list[dict]] = {}
-    for chain in chains:
-        signature = str(chain.get("instance_signature", "") or "").strip().lower()
-        grouped.setdefault(signature, []).append(chain)
-
-    if not chains:
-        return [], {
-            "selection_method": "no_lod_chains",
-            "selected_instance_signatures": [],
-            "excluded_instance_signatures": [],
-            "exact_main_anchor_keys": [],
-            "groups": [],
-        }
-
-    nonempty_signatures = sorted(signature for signature in grouped if signature)
-    if not nonempty_signatures:
-        return chains, {
-            "selection_method": "legacy_draw_order",
-            "selected_instance_signatures": [],
-            "excluded_instance_signatures": [],
-            "exact_main_anchor_keys": [],
-            "groups": [_lod_identity_group_payload("", grouped.get("", []), main_by_key, selected=True)],
-        }
-
-    group_payloads = [
-        _lod_identity_group_payload(signature, grouped[signature], main_by_key, selected=False)
-        for signature in nonempty_signatures
-    ]
-    anchored_keys = {
-        anchor_key
-        for group in group_payloads
-        for anchor_key in group["exact_main_anchor_keys"]
-    }
-    selection_method = ""
-    selected_signatures: list[str] = []
-    selected_anchor_keys: list[str] = []
-    if anchored_keys:
-        strongest_anchor = max(
-            anchored_keys,
-            key=lambda key: _main_identity_anchor_rank(main_by_key.get(key, {}), key),
-        )
-        selected_signatures = sorted(
-            group["instance_signature"]
-            for group in group_payloads
-            if strongest_anchor in group["exact_main_anchor_keys"]
-        )
-        selected_anchor_keys = [strongest_anchor]
-        selection_method = "exact_main_ib_anchor"
-    elif len(nonempty_signatures) == 1:
-        selected_signatures = list(nonempty_signatures)
-        selection_method = "single_instance_signature"
-    else:
-        shown = ", ".join(signature[:8] for signature in nonempty_signatures[:8])
-        raise ValueError(
-            "LOD FrameAnalysis contains multiple character identities "
-            f"({shown}) but none has an exact main IB anchor. "
-            "Capture a frame where the target has at least one unchanged part, "
-            "or use a frame containing only the target character."
-        )
-
-    selected_set = set(selected_signatures)
-    selected_chains = [
-        chain
-        for chain in chains
-        if str(chain.get("instance_signature", "") or "").strip().lower() in selected_set
-    ]
-    for group in group_payloads:
-        group["selected"] = group["instance_signature"] in selected_set
-    excluded_signatures = sorted(signature for signature in nonempty_signatures if signature not in selected_set)
-    return selected_chains, {
-        "selection_method": selection_method,
-        "selected_instance_signatures": selected_signatures,
-        "excluded_instance_signatures": excluded_signatures,
-        "exact_main_anchor_keys": selected_anchor_keys,
-        "groups": group_payloads,
-    }
-
-
-def _lod_identity_group_payload(
-    signature: str,
-    chains: list[dict],
-    main_by_key: dict[str, dict],
-    *,
-    selected: bool,
-) -> dict:
-    record_keys = sorted(
-        {
-            str(record_key or "").lower()
-            for chain in chains
-            for record_key in chain.get("lod_record_keys", []) or []
-            if str(record_key or "")
-        }
-    )
-    return {
-        "instance_signature": str(signature or ""),
-        "chain_indices": sorted(int(chain.get("chain_index", -1)) for chain in chains),
-        "lod_record_keys": record_keys,
-        "exact_main_anchor_keys": sorted(key for key in record_keys if key in main_by_key),
-        "selected": bool(selected),
-    }
-
-
-def _main_identity_anchor_rank(record: dict, source_key: str) -> tuple[int, int, str]:
-    return (
-        int(record.get("match_index_count", 0) or 0),
-        int(record.get("local_bone_count", 0) or 0),
-        str(source_key or ""),
-    )
-
-
-def _lod_identity_validation(identity: dict) -> list[dict]:
-    selected = list(identity.get("selected_instance_signatures", []) or [])
-    excluded = list(identity.get("excluded_instance_signatures", []) or [])
-    if not selected:
-        return []
-    method = str(identity.get("selection_method", "") or "")
-    anchor_keys = list(identity.get("exact_main_anchor_keys", []) or [])
-    message = f"Selected {len(selected)} target LOD instance group(s) by {method}."
-    if anchor_keys:
-        message += f" Exact main anchor: {anchor_keys[0]}."
-    if excluded:
-        message += f" Excluded {len(excluded)} other character group(s)."
-    return [
-        {
-            "severity": "info",
-            "code": "lod_character_identity_selected",
-            "message": message,
-            "draw_indices": [],
-        }
-    ]
 
 
 def _capture_instance_signatures_by_draw(record: dict) -> dict[int, list[str]]:

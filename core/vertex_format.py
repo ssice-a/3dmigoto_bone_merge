@@ -6,31 +6,56 @@ import math
 import struct
 from typing import Iterable
 
+from .vertex_layout_codec import dxgi_format_size, dxgi_format_spec
+
+
+_STRUCT_CODES = {
+    "u1": "B",
+    "i1": "b",
+    "<u2": "H",
+    "<i2": "h",
+    "<f2": "e",
+    "<u4": "I",
+    "<i4": "i",
+    "<f4": "f",
+}
+
+_INTEGER_LIMITS = {
+    "u1": (0, 0xFF),
+    "i1": (-0x80, 0x7F),
+    "<u2": (0, 0xFFFF),
+    "<i2": (-0x8000, 0x7FFF),
+    "<u4": (0, 0xFFFFFFFF),
+    "<i4": (-0x80000000, 0x7FFFFFFF),
+}
+
 
 def pack_vertex_format(fmt: str, values: Iterable[float | int]) -> bytes:
     """Pack one vertex element according to a DXGI-like FrameAnalysis format."""
 
-    normalized_fmt = _normalize_format(fmt)
+    spec = dxgi_format_spec(fmt)
+    if spec is None:
+        raise ValueError(f"Unsupported vertex format: {fmt}")
     items = list(values)
-    if normalized_fmt == "R32_FLOAT":
-        return struct.pack("<f", float(_component(items, 0)))
-    if normalized_fmt == "R32G32_FLOAT":
-        return struct.pack("<2f", *_float_components(items, 2))
-    if normalized_fmt == "R32G32B32_FLOAT":
-        return struct.pack("<3f", *_float_components(items, 3))
-    if normalized_fmt == "R32G32B32A32_FLOAT":
-        return struct.pack("<4f", *_float_components(items, 4))
-    if normalized_fmt == "R32G32B32A32_UINT":
-        return struct.pack("<4I", *_uint_components(items, 4, 0, 0xFFFFFFFF))
-    if normalized_fmt == "R16G16B16A16_UNORM":
-        return struct.pack("<4H", *[_unorm_to_int(value, 65535) for value in _float_components(items, 4)])
-    if normalized_fmt == "R8G8B8A8_UINT":
-        return struct.pack("<4B", *_uint_components(items, 4, 0, 0xFF))
-    if normalized_fmt == "R8G8B8A8_SNORM":
-        return struct.pack("<4B", *[_signed_byte_to_storage(_snorm_to_int(value, 127)) for value in _float_components(items, 4)])
-    if normalized_fmt == "R8G8B8A8_UNORM":
-        return struct.pack("<4B", *[_unorm_to_int(value, 255) for value in _float_components(items, 4)])
-    raise ValueError(f"Unsupported vertex format: {fmt}")
+    component_count = int(spec.component_count)
+    components = [_component(items, index) for index in range(component_count)]
+    if spec.conversion == "unorm8":
+        packed_values = [_unorm_to_int(value, 0xFF) for value in components]
+    elif spec.conversion == "unorm16":
+        packed_values = [_unorm_to_int(value, 0xFFFF) for value in components]
+    elif spec.conversion == "snorm8":
+        packed_values = [_snorm_to_int(value, 0x7F) for value in components]
+    elif spec.conversion == "snorm16":
+        packed_values = [_snorm_to_int(value, 0x7FFF) for value in components]
+    elif spec.dtype in _INTEGER_LIMITS:
+        minimum, maximum = _INTEGER_LIMITS[spec.dtype]
+        packed_values = _uint_components(components, component_count, minimum, maximum)
+    else:
+        packed_values = [float(value) for value in components]
+    return struct.pack(
+        f"<{component_count}{_STRUCT_CODES[spec.dtype]}",
+        *packed_values,
+    )
 
 
 def pack_into_vertex_format(buffer: bytearray, offset: int, fmt: str, values: Iterable[float | int]) -> None:
@@ -44,44 +69,30 @@ def pack_into_vertex_format(buffer: bytearray, offset: int, fmt: str, values: It
 def unpack_vertex_format(fmt: str, data: bytes | bytearray | memoryview, offset: int = 0) -> tuple[float, ...]:
     """Unpack one vertex element according to a DXGI-like FrameAnalysis format."""
 
-    normalized_fmt = _normalize_format(fmt)
-    if normalized_fmt == "R32_FLOAT":
-        return (float(struct.unpack_from("<f", data, offset)[0]),)
-    if normalized_fmt == "R32G32_FLOAT":
-        return tuple(float(value) for value in struct.unpack_from("<2f", data, offset))
-    if normalized_fmt == "R32G32B32_FLOAT":
-        return tuple(float(value) for value in struct.unpack_from("<3f", data, offset))
-    if normalized_fmt == "R32G32B32A32_FLOAT":
-        return tuple(float(value) for value in struct.unpack_from("<4f", data, offset))
-    if normalized_fmt == "R32G32B32A32_UINT":
-        return tuple(float(value) for value in struct.unpack_from("<4I", data, offset))
-    if normalized_fmt == "R16G16B16A16_UNORM":
-        return tuple(float(value) / 65535.0 for value in struct.unpack_from("<4H", data, offset))
-    if normalized_fmt == "R8G8B8A8_UINT":
-        return tuple(float(value) for value in struct.unpack_from("<4B", data, offset))
-    if normalized_fmt == "R8G8B8A8_SNORM":
-        return tuple(float(_storage_to_signed_byte(value)) / 127.0 for value in struct.unpack_from("<4B", data, offset))
-    if normalized_fmt == "R8G8B8A8_UNORM":
-        return tuple(float(value) / 255.0 for value in struct.unpack_from("<4B", data, offset))
-    raise ValueError(f"Unsupported vertex format: {fmt}")
+    spec = dxgi_format_spec(fmt)
+    if spec is None:
+        raise ValueError(f"Unsupported vertex format: {fmt}")
+    raw_values = struct.unpack_from(
+        f"<{int(spec.component_count)}{_STRUCT_CODES[spec.dtype]}",
+        data,
+        offset,
+    )
+    if spec.conversion == "unorm8":
+        return tuple(float(value) / 255.0 for value in raw_values)
+    if spec.conversion == "unorm16":
+        return tuple(float(value) / 65535.0 for value in raw_values)
+    if spec.conversion == "snorm8":
+        return tuple(max(float(value) / 127.0, -1.0) for value in raw_values)
+    if spec.conversion == "snorm16":
+        return tuple(max(float(value) / 32767.0, -1.0) for value in raw_values)
+    return tuple(float(value) for value in raw_values)
 
 
 def format_size(fmt: str) -> int:
-    normalized_fmt = _normalize_format(fmt)
-    sizes = {
-        "R32_FLOAT": 4,
-        "R32G32_FLOAT": 8,
-        "R32G32B32_FLOAT": 12,
-        "R32G32B32A32_FLOAT": 16,
-        "R32G32B32A32_UINT": 16,
-        "R16G16B16A16_UNORM": 8,
-        "R8G8B8A8_UINT": 4,
-        "R8G8B8A8_SNORM": 4,
-        "R8G8B8A8_UNORM": 4,
-    }
-    if normalized_fmt not in sizes:
+    size = dxgi_format_size(fmt)
+    if size <= 0:
         raise ValueError(f"Unsupported vertex format: {fmt}")
-    return sizes[normalized_fmt]
+    return int(size)
 
 
 def encode_game_packed_normal(normal: tuple[float, float, float]) -> int:
@@ -229,17 +240,6 @@ def _length3(value: tuple[float, float, float]) -> float:
     return math.sqrt(float(value[0]) * float(value[0]) + float(value[1]) * float(value[1]) + float(value[2]) * float(value[2]))
 
 
-def _normalize_format(fmt: str) -> str:
-    normalized = str(fmt or "").upper()
-    if normalized.startswith("DXGI_FORMAT_"):
-        normalized = normalized[len("DXGI_FORMAT_"):]
-    return normalized
-
-
-def _float_components(values: list[float | int], count: int) -> list[float]:
-    return [float(_component(values, index)) for index in range(count)]
-
-
 def _uint_components(values: list[float | int], count: int, min_value: int, max_value: int) -> list[int]:
     return [_clamp_int(round(float(_component(values, index))), min_value, max_value) for index in range(count)]
 
@@ -256,14 +256,6 @@ def _unorm_to_int(value: float, max_value: int) -> int:
 
 def _snorm_to_int(value: float, max_abs: int) -> int:
     return _clamp_int(round(_clamp_float(float(value), -1.0, 1.0) * int(max_abs)), -int(max_abs), int(max_abs))
-
-
-def _signed_byte_to_storage(value: int) -> int:
-    return int(value) & 0xFF
-
-
-def _storage_to_signed_byte(value: int) -> int:
-    return int(value) - 256 if int(value) >= 128 else int(value)
 
 
 def _signed10_storage(value: int) -> int:

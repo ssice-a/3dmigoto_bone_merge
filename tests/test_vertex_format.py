@@ -16,6 +16,7 @@ if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
 vertex_format = importlib.import_module(f"{PACKAGE_DIR.name}.core.vertex_format")
+vertex_layout_codec = importlib.import_module(f"{PACKAGE_DIR.name}.core.vertex_layout_codec")
 import_candidates = importlib.import_module(f"{PACKAGE_DIR.name}.core.import_candidates")
 export_buffers = importlib.import_module(f"{PACKAGE_DIR.name}.core.export_buffers")
 
@@ -47,6 +48,27 @@ class VertexFormatTests(unittest.TestCase):
         self.assertEqual(
             vertex_format.pack_vertex_format("R8G8B8A8_SNORM", [-1.0, 0.0, 1.0, -0.5]),
             bytes([129, 0, 127, 192]),
+        )
+
+    def test_every_registered_format_uses_the_shared_codec(self):
+        for name, spec in vertex_layout_codec.DXGI_FORMATS.items():
+            if spec.conversion and spec.conversion.startswith("unorm"):
+                source = [0.0, 0.25, 0.5, 1.0]
+            elif spec.conversion and spec.conversion.startswith("snorm"):
+                source = [-1.0, -0.5, 0.0, 1.0]
+            elif spec.dtype.startswith("<f"):
+                source = [-1.0, -0.5, 0.25, 1.0]
+            else:
+                source = [1, 2, 3, 4]
+            packed = vertex_format.pack_vertex_format(name, source)
+            unpacked = vertex_format.unpack_vertex_format(name, packed)
+            self.assertEqual(len(packed), spec.byte_size, name)
+            self.assertEqual(len(unpacked), spec.component_count, name)
+
+    def test_unpack_snorm_minimum_is_clamped(self):
+        self.assertEqual(
+            vertex_format.unpack_vertex_format("R8G8B8A8_SNORM", bytes([128, 129, 0, 127])),
+            (-1.0, -1.0, 0.0, 1.0),
         )
 
     def test_pack_into_rejects_out_of_bounds_write(self):

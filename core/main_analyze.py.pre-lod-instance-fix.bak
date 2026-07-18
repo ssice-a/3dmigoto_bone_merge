@@ -60,7 +60,7 @@ _CB1_RE = re.compile(r"^cb1\[(?P<row>\d+)\]\.(?P<component>[xyzw]):\s*(?P<value>
 _VERTEX_DATA_RE = re.compile(
     r"^vb(?P<slot>\d+)\[(?P<vertex>\d+)\]\+(?P<offset>\d+)\s+[^:]+:\s*(?P<values>.+)$"
 )
-ANALYZER_VERSION = 4
+ANALYZER_VERSION = 3
 
 
 @dataclass(frozen=True)

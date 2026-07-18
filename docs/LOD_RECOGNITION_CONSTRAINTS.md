@@ -79,13 +79,14 @@ If a visible instance has no captured UID, the native draw is preserved.
 ## Recognition Pipeline
 
 1. Parse LOD draws and their exact IB region keys.
-2. Build compatible VS200 chains before main/LOD matching.
-3. Select one host per chain from that chain's draw order.
-4. Match LOD keys to main keys with layout and bone evidence.
-5. Build capture pairs independently from replay links.
-6. Determine which canonical bones exported replay actually requires.
-7. Add same-chain capture providers for missing bones.
-8. Enable shadow skipping only after full coverage validation.
+2. Partition VS200 draws by root-matrix instance signature.
+3. Group those instances by character identity and select the target group.
+4. Build compatible chains and one host per selected target instance.
+5. Match selected LOD keys to main keys with layout and bone evidence.
+6. Build capture pairs independently from replay links.
+7. Determine which canonical bones exported replay actually requires.
+8. Add same-chain capture providers for missing bones.
+9. Enable shadow skipping only after identity and coverage validation.
 
 Runtime export may emit multiple LOD shadow replay plans. A global singleton
 host is invalid when a frame contains multiple character chains.
@@ -115,11 +116,44 @@ If two enabled profiles use the same override key and map one canonical target
 from different source-local bones, export must stop. INI runtime identity cannot
 distinguish those profile states safely.
 
+## Character Identity Selection
+
+A root-matrix signature identifies one runtime instance in the captured frame;
+it does not identify which character model owns that instance. Different
+humanoid characters can have nearly identical bone counts, slot signatures,
+and point clouds. Those similarities are valid bone-mapping evidence only
+after the target character identity has been selected.
+
+The analyzer groups chains by root-matrix signature, then looks for an exact
+main override key inside each group. The strongest exact main IB region is the
+automatic identity anchor. Every instance group containing that same anchor is
+selected, which keeps same-character multi-instance captures while excluding
+other characters in the scene.
+
+When a frame has one root-matrix signature, that sole group is unambiguous. If
+a frame has multiple signatures and none contains an exact main identity
+anchor, analysis must stop. Bone-cloud similarity must never choose a character
+identity. Capture a frame with one unchanged target part or isolate the target
+instead of exporting a guess.
+
+The result records selected and excluded signatures in `lod_identity`. Only
+selected chains are copied into `lod_chains`, `lod_links`, capture records, and
+runtime shadow plans. Analyzer results from before this identity partition are
+stale.
+
 ## Chain Detection
 
-Chain detection uses compatible capture draws, ordering, and local continuity.
-It must not merge unrelated characters merely because they share VS hashes or
-the same backing `vs-t0` resource.
+Chain detection first hashes the four shader-visible root-matrix rows from each
+VS200 `b1` view. The byte offset is:
+
+```text
+(FirstConstant + (FirstInstance + instance_offset) * 16) * 16
+```
+
+Draws with different root-matrix signatures belong to different logical
+instances even when they are adjacent and share the same backing CB or
+`vs-t0`. Ordering and local continuity are applied only after instance
+partitioning and target character selection.
 
 Useful boundaries include:
 
@@ -130,6 +164,8 @@ Useful boundaries include:
 - a completed final host followed by another capture sequence
 
 The configured chain-gap threshold is a conservative fallback, not identity.
+Stored LOD results from analyzers that predate root-matrix identity are stale
+and must be analyzed again before export.
 
 ## LOD-To-Main Matching
 
@@ -192,12 +228,21 @@ required canonical globals for replay
 canonical globals written by all accepted capture providers in this chain
 ```
 
+The provider union is scoped to the chain's root-matrix signature. Coverage
+from another instance cannot make the current chain appear complete.
+
 If proof fails:
 
 - keep native shadow draws
 - report missing canonical globals and candidate providers
 - allow explicit fallback repair in Blender
 - do not emit a partial replacement shadow
+
+At runtime an LOD host hashes its current `b1` root matrix and replays only the
+capture slot with the same UID. It never enumerates every occupied global slot.
+If two instance chains share one static host key but require different exported
+part sets, delayed replacement for that host is disabled and native shadows are
+kept.
 
 Unused unmatched groups do not block export. Only bones actually referenced by
 exported weighted vertices contribute to required coverage.

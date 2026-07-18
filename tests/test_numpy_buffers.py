@@ -40,6 +40,17 @@ class NumpyBuffersTests(unittest.TestCase):
         self.assertAlmostEqual(float(values[0][0]), 1.0)
         self.assertAlmostEqual(float(values[1][2]), 1.0)
 
+    def test_read_interleaved_field_clamps_snorm_minimum(self):
+        values = numpy_buffers.read_interleaved_field(
+            bytes([128, 129, 0, 127]),
+            [0],
+            stride=4,
+            offset=0,
+            fmt="R8G8B8A8_SNORM",
+            vertex_count=1,
+        )
+        self.assertEqual(values.tolist(), [[-1.0, -1.0, 0.0, 1.0]])
+
     def test_assign_bytes_handles_2d_vectors(self):
         np = draw_arrays.require_numpy()
         target = np.zeros((2, 16), dtype=np.uint8)

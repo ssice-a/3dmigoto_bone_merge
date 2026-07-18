@@ -2,6 +2,9 @@
 
 This document is the source of truth for the generated schema v3 runtime.
 
+The minimum supported runtime is the official `XXMI-Libs` v0.9.4 release.
+v0.9.2 supports FIFO resource pools but does not support `HashRegion`.
+
 ## Scope
 
 The runtime has two responsibilities:
@@ -100,6 +103,11 @@ $bmc_slot_native_N
 Visible replay resolves UIDs only against these recorded values. It must not use
 `#Pool[...]` for lookup, because looking up an unknown UID allocates a FIFO slot
 and may evict a valid captured instance.
+
+Every structured buffer that is written through a UAV and later consumed as an
+SRV explicitly declares `bind_flags = shader_resource unordered_access` on the
+source resource. Do not rely on a later `ResourceSRV = ref ResourceUAV`
+operation to propagate SRV flags backwards through INI parse order.
 
 ## FirstConstant Contract
 
@@ -220,6 +228,11 @@ Transparent shadow batches run before the white shadow texture is bound. Normal
 shadow batches run afterward. A non-replaced final host is preserved once with
 `draw = from_caller`.
 
+LOD hosts are instance-scoped. For every native instance in the host draw they
+hash the current `b1` root matrix, compare that UID with `$bmc_slot_uid_*`, and
+replay only the matching capture slot. Main non-LOD delayed replay may still
+flush all occupied slots at its global host.
+
 The per-draw capacity guard is:
 
 ```ini
@@ -285,11 +298,15 @@ separate runtime path.
 `[Present]` performs one reset command list:
 
 ```ini
-PoolBMCInstanceRegistry = null
 run = CustomShader_ResetRuntimeState
 $bmc_slot_uid_N = -1
 $bmc_slot_native_N = -1
 ```
+
+The FIFO pool itself is intentionally not cleared. v0.9.4 does not support
+whole-pool assignment, and stale pool contents are unreachable after the
+per-frame UID/native-slot globals are reset. A reused UID is copied again
+before it is exposed to capture or replay.
 
 Matrix buffers are not cleared every frame. Runtime validity flags prevent stale
 rows from being consumed, which avoids unnecessary large GPU clears.

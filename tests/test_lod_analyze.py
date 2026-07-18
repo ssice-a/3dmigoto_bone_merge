@@ -560,6 +560,136 @@ class LodAnalyzeTests(unittest.TestCase):
         self.assertEqual([0, 1], [link["lod_sources"][0]["lod_chain_index"] for link in links])
         self.assertTrue(all(len(link["lod_sources"]) == 1 for link in links))
 
+    def test_lod_chains_split_interleaved_root_instance_signatures(self):
+        lod_records = {
+            "part_a-10-0": {
+                "lod_record_key": "part_a-10-0",
+                "lod_ib_hash": "part_a",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 10,
+                "lod_capture_draw_indices": [10, 30],
+                "lod_capture_instance_signatures": {"10": "instance_a", "30": "instance_a"},
+            },
+            "part_b-20-0": {
+                "lod_record_key": "part_b-20-0",
+                "lod_ib_hash": "part_b",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 20,
+                "lod_capture_draw_indices": [11, 31],
+                "lod_capture_instance_signatures": {"11": "instance_b", "31": "instance_b"},
+            },
+            "host_a-30-0": {
+                "lod_record_key": "host_a-30-0",
+                "lod_ib_hash": "host_a",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 30,
+                "lod_capture_draw_indices": [12, 32],
+                "lod_capture_instance_signatures": {"12": "instance_a", "32": "instance_a"},
+            },
+            "host_b-40-0": {
+                "lod_record_key": "host_b-40-0",
+                "lod_ib_hash": "host_b",
+                "lod_match_first_index": 0,
+                "lod_match_index_count": 40,
+                "lod_capture_draw_indices": [13, 33],
+                "lod_capture_instance_signatures": {"13": "instance_b", "33": "instance_b"},
+            },
+        }
+
+        chains = lod_analyze._build_lod_record_chains(lod_records)
+
+        self.assertEqual(4, len(chains))
+        self.assertEqual(
+            [
+                ("instance_a", 10, 12, "host_a"),
+                ("instance_b", 11, 13, "host_b"),
+                ("instance_a", 30, 32, "host_a"),
+                ("instance_b", 31, 33, "host_b"),
+            ],
+            [
+                (
+                    chain["instance_signature"],
+                    chain["draw_start"],
+                    chain["draw_end"],
+                    chain["host_key"]["ib_hash"],
+                )
+                for chain in chains
+            ],
+        )
+
+    def test_lod_identity_selection_excludes_other_characters_in_mixed_frame(self):
+        main_records = [
+            {
+                "source_key": "main_anchor-100-0",
+                "ib_hash": "main_anchor",
+                "match_first_index": 0,
+                "match_index_count": 100,
+            },
+            {
+                "source_key": "main_body-200-0",
+                "ib_hash": "main_body",
+                "match_first_index": 0,
+                "match_index_count": 200,
+            },
+        ]
+        chains = [
+            {
+                "chain_index": 0,
+                "instance_signature": "target_instance",
+                "lod_record_keys": ["main_anchor-100-0", "target_lod-80-0"],
+            },
+            {
+                "chain_index": 1,
+                "instance_signature": "other_character_a",
+                "lod_record_keys": ["other_a-80-0", "other_a_host-300-0"],
+            },
+            {
+                "chain_index": 2,
+                "instance_signature": "other_character_b",
+                "lod_record_keys": ["other_b-82-0", "other_b_host-320-0"],
+            },
+            {
+                "chain_index": 3,
+                "instance_signature": "target_instance",
+                "lod_record_keys": ["main_anchor-100-0", "target_lod_far-60-0"],
+            },
+        ]
+
+        selected, identity = lod_analyze._select_target_lod_chains(main_records, chains)
+
+        self.assertEqual([0, 3], [chain["chain_index"] for chain in selected])
+        self.assertEqual(["target_instance"], identity["selected_instance_signatures"])
+        self.assertEqual(
+            ["other_character_a", "other_character_b"],
+            identity["excluded_instance_signatures"],
+        )
+        self.assertEqual("exact_main_ib_anchor", identity["selection_method"])
+
+    def test_lod_identity_selection_rejects_ambiguous_multi_character_frame(self):
+        main_records = [
+            {
+                "source_key": "main_body-200-0",
+                "ib_hash": "main_body",
+                "match_first_index": 0,
+                "match_index_count": 200,
+            }
+        ]
+        chains = [
+            {
+                "chain_index": 0,
+                "instance_signature": "unknown_a",
+                "lod_record_keys": ["lod_a-80-0"],
+            },
+            {
+                "chain_index": 1,
+                "instance_signature": "unknown_b",
+                "lod_record_keys": ["lod_b-82-0"],
+            },
+        ]
+
+        with self.assertRaisesRegex(ValueError, "multiple character identities"):
+            lod_analyze._select_target_lod_chains(main_records, chains)
+
     def test_bone_cloud_mapping_keeps_multiple_lod_candidates_for_one_global(self):
         canonical_points = [
             lod_analyze.WeightedPoint((0.0, 0.0, 0.0), ((200, 1.0),)),

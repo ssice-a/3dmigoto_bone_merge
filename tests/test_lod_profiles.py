@@ -51,6 +51,7 @@ def _result(profile_hash: str, source_local: int, *, runtime_safe: bool = True) 
         },
         "validation": [],
         "lod_manifest_snapshot": {
+            "analyzer_version": lod_profiles.ANALYZER_VERSION,
             "frameanalysis_dir": f"X:/{profile_hash}",
             "candidate_ibs": [{"ib_hash": profile_hash}],
         },
@@ -58,6 +59,29 @@ def _result(profile_hash: str, source_local: int, *, runtime_safe: bool = True) 
 
 
 class LodProfileTests(unittest.TestCase):
+    def test_profile_preserves_lod_character_identity_selection(self):
+        manifest = {"global_pool_generation": "pool-a", "lod_profiles": []}
+        result = _result("aaaaaaaa", 2)
+        result["lod_identity"] = {
+            "selection_method": "exact_main_ib_anchor",
+            "selected_instance_signatures": ["target_instance"],
+            "excluded_instance_signatures": ["other_character"],
+            "exact_main_anchor_keys": ["main-30-0"],
+        }
+
+        profile = lod_profiles.upsert_lod_profile(
+            manifest,
+            profile_id="lod1",
+            label="LOD 1",
+            lod_level=1,
+            frameanalysis_dir="X:/lod1",
+            enabled=True,
+            result=result,
+        )
+
+        self.assertEqual("target_instance", profile["result"]["lod_identity"]["selected_instance_signatures"][0])
+        self.assertEqual("target_instance", manifest["lod_identities"][0]["selected_instance_signatures"][0])
+
     def test_profiles_aggregate_without_overwriting_results(self):
         manifest = {"global_pool_generation": "pool-a", "lod_profiles": []}
         lod_profiles.upsert_lod_profile(
@@ -128,6 +152,18 @@ class LodProfileTests(unittest.TestCase):
             "global_pool_generation": "",
             "result": _result("aaaaaaaa", 2),
         }
+
+        self.assertTrue(lod_profiles.lod_profile_is_stale(profile, "pool-a"))
+
+    def test_old_lod_analyzer_result_is_stale(self):
+        profile = {
+            "profile_id": "lod1",
+            "enabled": True,
+            "stale": False,
+            "global_pool_generation": "pool-a",
+            "result": _result("aaaaaaaa", 2),
+        }
+        profile["result"]["lod_manifest_snapshot"]["analyzer_version"] = 2
 
         self.assertTrue(lod_profiles.lod_profile_is_stale(profile, "pool-a"))
 

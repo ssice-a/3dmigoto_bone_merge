@@ -25,8 +25,7 @@
 
 - `core/export_buffers.py::_collect_part_loop_vertices`
 - `core/export_buffers.py::_collect_mesh_loop_vertices_fast`
-- `core/export_buffers.py::_write_numpy_position_slot`
-- `core/export_buffers.py::_write_numpy_blend_slot`
+- `core/export_buffers.py::_write_generic_vertex_slot`
 - `core/export_buffers.py::_loop_vertex_mesh_range_arrays`
 - `core/export_buffers.py::_local_top4_vertex_arrays`
 

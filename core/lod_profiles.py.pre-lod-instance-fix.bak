@@ -23,7 +23,6 @@ _LEGACY_CLEAR_FIELDS = (
     *_RESULT_LIST_FIELDS,
     "lod_validation",
     "lod_manifest_snapshots",
-    "lod_identities",
     "lod_profile_conflicts",
 )
 
@@ -210,15 +209,6 @@ def rebuild_lod_aggregate(manifest: dict) -> dict:
             lod_level=lod_level,
         )
         manifest["lod_manifest_snapshots"].append(snapshot)
-        raw_identity = dict(result.get("lod_identity", {}) or {})
-        if raw_identity:
-            manifest["lod_identities"].append(
-                _annotate_payload(
-                    raw_identity,
-                    profile_id=profile_id,
-                    lod_level=lod_level,
-                )
-            )
         manifest["lod_validation"].extend(
             _annotate_payloads(
                 list(result.get("validation", []) or []),
@@ -340,7 +330,6 @@ def _has_legacy_lod_result(manifest: dict) -> bool:
 def _legacy_result(manifest: dict) -> dict:
     return {
         **{field: copy.deepcopy(list(manifest.get(field, []) or [])) for field in _RESULT_LIST_FIELDS},
-        "lod_identity": copy.deepcopy(dict(manifest.get("lod_identity", {}) or {})),
         "lod_review": copy.deepcopy(dict(manifest.get("lod_review", {}) or {})),
         "validation": copy.deepcopy(list(manifest.get("lod_validation", []) or [])),
         "lod_manifest_snapshot": copy.deepcopy(dict(manifest.get("lod_manifest_snapshot", {}) or {})),
@@ -353,7 +342,6 @@ def _normalize_result(result: dict) -> dict:
         for field in _RESULT_LIST_FIELDS
     }
     normalized["lod_review"] = copy.deepcopy(dict(result.get("lod_review", {}) or {}))
-    normalized["lod_identity"] = copy.deepcopy(dict(result.get("lod_identity", {}) or {}))
     normalized["validation"] = copy.deepcopy(
         list(result.get("validation", result.get("lod_validation", [])) or [])
     )

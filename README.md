@@ -18,6 +18,9 @@ The export root is the single source of truth. Child collections under the expor
 
 ## Runtime Shape
 
+Bone-merge INI output requires the official `XXMI-Libs` v0.9.4 runtime or
+newer. v0.9.2 has FIFO resource pools but cannot parse `HashRegion`.
+
 The generated runtime does two jobs:
 
 - Capture native current/previous bone matrices into the canonical global pool.
@@ -26,7 +29,10 @@ The generated runtime does two jobs:
 
 Main and LOD capture use the same semantic contract. LOD has its own capture map file because its IB hashes and local bone palettes can differ from the main model.
 
-`vb0` is normally Position, `vb1` is Texcoord, and `vb2` is Blend. Runtime aliases `vb3` to `vb0` only when the source layout does not contain an independent `vb3` stream.
+`vb0` is normally Position, `vb1` is Texcoord, and `vb2` is Blend. Runtime aliases `vb3` to `vb0` only when their captured resource identities match; equal layouts alone do not prove an alias.
+
+Vertex import/export follows the physical-field and lossless-carrier contract
+in [docs/VERTEX_LAYOUT_ROUNDTRIP.md](docs/VERTEX_LAYOUT_ROUNDTRIP.md).
 
 ## Safety Notes
 
@@ -35,6 +41,9 @@ Main and LOD capture use the same semantic contract. LOD has its own capture map
 - Visible replay is allowlisted under `if vs == 201 || vs == 202 || vs == 203`; unknown effect shaders keep their native draw.
 - Missing instance mappings and draws beyond the eight-slot runtime capacity keep their native draw.
 - CPU pre-skinned imports are named `[CPU_SKINNED_UNSUPPORTED]`; they remain reference-only and do not enter the global bone pool or replacement export.
+- Required vertex fields are never silently filled with zero. Imported raw
+  carriers preserve unknown formats and padding; external meshes without a
+  reconstructible field are rejected with a field-specific export error.
 - LOD replay uses LOD texture overrides but replays the canonical exported geometry and part maps.
 - Export blocks if an actually used palette bone is unmatched by LOD until the user applies or accepts LOD fallback repair.
 - Rebuilding a changed global pool invalidates every analyzed LOD Profile because canonical `Gxx` positions may have moved.

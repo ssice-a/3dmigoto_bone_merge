@@ -238,11 +238,110 @@ class SyntheticCandidateImportTests(unittest.TestCase):
             self.assertEqual(geometry.texcoord4_raw[0], (-1, 2, -3, 4))
             self.assertEqual(geometry.blend_indices[0], (1, 2, 5, 0))
             self.assertAlmostEqual(geometry.blend_weights[0][1], 32768 / 65535.0, places=6)
+            self.assertEqual(set(geometry.raw_vertex_streams), {"vb0", "vb1", "vb2"})
+            self.assertEqual(
+                bytes(geometry.raw_vertex_streams["vb1"][0]),
+                struct.pack("<4f4B", 0.1, 0.2, 0.3, 0.4, 255, 2, 253, 4),
+            )
 
     def test_decode_game_packed_normal_returns_unit_vector(self):
         normal = import_candidates.decode_game_packed_normal(0x40000000)
         self.assertAlmostEqual(math.sqrt(sum(component * component for component in normal)), 1.0, places=6)
         self.assertGreater(normal[2], 0.99)
+
+    def test_byte_color_import_writes_srgb_channel_before_linear_fallback(self):
+        class RecordingData:
+            def __init__(self):
+                self.calls = []
+
+            def foreach_set(self, attribute_name, values):
+                self.calls.append((attribute_name, tuple(values)))
+
+        class Attribute:
+            def __init__(self):
+                self.data = RecordingData()
+
+        class ColorAttributes:
+            def __init__(self):
+                self.attribute = None
+
+            def get(self, _name):
+                return self.attribute
+
+            def new(self, **_kwargs):
+                self.attribute = Attribute()
+                return self.attribute
+
+        class Mesh:
+            def __init__(self):
+                self.color_attributes = ColorAttributes()
+
+        mesh = Mesh()
+        import_candidates._store_snorm_byte_color_attribute(mesh, "raw", [(-1, 2, -3, 4)])
+
+        call = mesh.color_attributes.attribute.data.calls[0]
+        self.assertEqual(call[0], "color_srgb")
+        self.assertEqual(
+            [round(value * 255) for value in call[1]],
+            [255, 2, 253, 4],
+        )
+
+    def test_color0_semantic_is_loaded_by_generic_vertex_adapter(self):
+        element = main_analyze.HeaderElement(
+            semantic_name="COLOR",
+            semantic_index=0,
+            fmt="R8G8B8A8_UNORM",
+            input_slot=1,
+            aligned_byte_offset=0,
+        )
+        slot = import_candidates._SlotSlice(
+            slot_name="vb1",
+            slot_index=1,
+            buf_path="",
+            header=main_analyze.BufferHeader(
+                stride=4,
+                vertex_count=2,
+                elements=[element],
+            ),
+            elements={("COLOR", 0): element},
+            base_offset=0,
+            data=bytes([1, 2, 3, 4, 255, 128, 64, 0]),
+        )
+
+        records = import_candidates._read_vertex_semantics([slot], [0, 1])
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["semantic_name"], "COLOR")
+        self.assertEqual(records[0]["storage"], "uint8_raw")
+        self.assertEqual(records[0]["values"].tolist(), [[1, 2, 3, 4], [255, 128, 64, 0]])
+
+    def test_float_color0_is_not_misclassified_as_uv(self):
+        element = main_analyze.HeaderElement(
+            semantic_name="COLOR",
+            semantic_index=0,
+            fmt="R32G32_FLOAT",
+            input_slot=1,
+            aligned_byte_offset=0,
+        )
+        slot = import_candidates._SlotSlice(
+            slot_name="vb1",
+            slot_index=1,
+            buf_path="",
+            header=main_analyze.BufferHeader(
+                stride=8,
+                vertex_count=1,
+                elements=[element],
+            ),
+            elements={("COLOR", 0): element},
+            base_offset=0,
+            data=struct.pack("<2f", 0.25, 0.75),
+        )
+
+        records = import_candidates._read_vertex_semantics([slot], [0])
+
+        self.assertEqual(records[0]["semantic_name"], "COLOR")
+        self.assertEqual(records[0]["storage"], "float")
+        self.assertEqual(records[0]["values"].tolist(), [[0.25, 0.75]])
 
     def _write_ib_fixture(self, root: Path) -> tuple[Path, Path]:
         txt_path = root / "000001-ib=aaaaaaaa-vs=1-ps=2.txt"
